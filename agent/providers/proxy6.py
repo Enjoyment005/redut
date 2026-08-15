@@ -177,7 +177,9 @@ class Proxy6(Provider):
         last = None
         for host in order:
             try:
-                data = http_get_json("https://" + host + suffix, host_label=host)
+                # mutating уходит и в транспорт: повтор через канал узла (tun0) допустим для денег
+                # только если запрос заведомо не был доставлен (providers/base._request_json).
+                data = http_get_json("https://" + host + suffix, host_label=host, mutating=mutating)
             except ProviderError as e:
                 if e.network:
                     last = e

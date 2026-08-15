@@ -53,6 +53,15 @@ class TestFormatting(unittest.TestCase):
         self.assertIn("proxy6:40", body)
         self.assertIn("node1", subj)          # метка сервера в теме
 
+    def test_rotated_cold_start_names_first_channel(self):
+        # холодный старт: прежнего канала не было — тема и тело говорят это словами, а не пустотой
+        a = _mk()
+        a.rotated(old_ip="", new_ip="2.2.2.2", uid="proxyline:1", egress="2.2.2.2", cc="mx", tg_code="200")
+        subj, body = a.sent[0]
+        self.assertIn("Первый канал: 2.2.2.2", subj)
+        self.assertNotIn(":  ->", subj)
+        self.assertIn("канала не было", body)
+
     def test_retuned_shows_modes(self):
         a = _mk()
         a.retuned(host="5.5.5.5", old_mode="SOCKS5 :1080", new_mode="HTTP :8080", uid="proxy6:7")

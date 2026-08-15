@@ -83,7 +83,8 @@ class ProxyLine(Provider):
             raise ProviderError("ProxyLine.prolong: period=%d вне 1..365 дней" % period)
         self._throttle()
         r = http_post_form(API_BASE + "/renew/", {"proxies": proxies, "period": period},
-                           headers={"API-KEY": self.api_key}, host_label=HOST_LABEL) or {}
+                           headers={"API-KEY": self.api_key}, host_label=HOST_LABEL,
+                           mutating=True) or {}     # деньги: повтор другим транспортом — только если запрос не ушёл
         return {"proxies": proxies, "period": period,
                 "price": r.get("price") or r.get("amount") or r.get("cost"),
                 "balance": r.get("balance"),

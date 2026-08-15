@@ -177,28 +177,35 @@ socks = int(os.environ["UP_SOCKS"] or 0); http = int(os.environ["UP_HTTP"] or 0)
 # Раньше конфиг всегда пересобирался по params.sh, и переустановка откатывала канал,
 # выбранный панелью/автоматикой, на дефолт из профиля: узел «обновили» — и выход
 # внезапно поехал через старый адрес. Явно заданный канал (UP_FORCE=1) имеет приоритет.
+#
+# УТОЧНЕНО 15.08 (снос №4): переносим ЖИВЫЕ outbounds и route ЦЕЛИКОМ, а не только адрес/порты.
+# Раньше типы outbound'ов брались из шаблона (socks-out=socks, http-tg=http), а порты — из
+# живого конфига. Если агент перевёл канал в HTTP-режим (RETUNE §7.3: оба outbound'а http +
+# правило reject UDP443), переустановка ставила тип socks на http-порт — канал ломался
+# ровно на «обновлении». Теперь секции, которыми владеет агент (outbounds, route), не
+# пересобираются: из шаблона идут только inbounds/dns/log; результат проверяет sing-box check.
+kept = False
 if os.environ.get("UP_FORCE") != "1" and os.path.isfile(dst):
     try:
         with open(dst, encoding="utf-8") as f:
             live = json.load(f)
         cur = {o.get("tag"): o for o in live.get("outbounds", [])}
         so = cur.get("socks-out") or {}
-        if so.get("server"):
-            host = so["server"]
-            socks = int(so.get("server_port") or socks)
-            user = so.get("username", user)
-            pw = so.get("password", pw)
-            ht = cur.get("http-tg") or {}
-            http = int(ht.get("server_port") or http)
-            print("[install]   сохраняю текущий исходящий канал %s (переустановка его не меняет)" % host)
+        if so.get("server") and isinstance(live.get("route"), dict):
+            c["outbounds"] = live["outbounds"]
+            c["route"] = live["route"]
+            kept = True
+            print("[install]   сохраняю текущий исходящий канал %s (переустановка его не меняет; "
+                  "outbounds/route — из живого конфига)" % so["server"])
     except (ValueError, OSError, TypeError):
         pass          # битый конфиг — соберём заново из параметров
 
-for o in c.get("outbounds", []):
-    if o.get("tag") == "socks-out":
-        o.update(server=host, server_port=socks, username=user, password=pw)
-    elif o.get("tag") == "http-tg":
-        o.update(server=host, server_port=http, username=user, password=pw)
+if not kept:
+    for o in c.get("outbounds", []):
+        if o.get("tag") == "socks-out":
+            o.update(server=host, server_port=socks, username=user, password=pw)
+        elif o.get("tag") == "http-tg":
+            o.update(server=host, server_port=http, username=user, password=pw)
 with open(dst, "w", encoding="utf-8") as f:
     json.dump(c, f, ensure_ascii=False, indent=2)
 PY

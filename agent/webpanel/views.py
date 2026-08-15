@@ -726,7 +726,9 @@ _SETUP_HTML = """
       <b>PROXY6 — основной</b>: у него панель умеет покупать, продлевать и удалять, цены в рублях.
       Учти: <b>удаление денег не возвращает</b> (проверено живым экспериментом), поэтому оплаченный
       прокси выгоднее додержать до конца срока. Ключ проверяется сразу — панель покажет твой баланс.<br>
-      Нет ключа? Шаг можно пройти позже: панель будет работать на текущем прокси, но сама менять его не сможет.</div>
+      <b>Нужен хотя бы один рабочий ключ</b> — без него мастер не завершится. Если сервис недоступен с сервера
+      напрямую (у российских хостеров так бывает с PROXY6), ключ сохранится без проверки рядом с рабочим:
+      узел будет ходить к такому сервису через собственный канал.</div>
     <label>PROXY6 · API-ключ (рекомендуется)</label><input id="proxy6" autocomplete="off" placeholder="например 0000000000-…">
     <label>ProxyLine · API-ключ (необязательно)</label><input id="proxyline" autocomplete="off">
     <button class="btn g" style="margin-top:9px" onclick="saveProv()">Проверить и сохранить</button>
@@ -806,7 +808,9 @@ async function totpVerify(){const c=document.getElementById('otp').value;
 async function saveProv(){const b={proxy6:document.getElementById('proxy6').value.trim(),
   proxyline:document.getElementById('proxyline').value.trim()};
   try{const r=await sapi('/api/setup/provider',b);const box=document.getElementById('provbox');
-  box.innerHTML=Object.entries(r.result||{}).map(([k,v])=>k+': '+(v.ok?('<span class="ok">ключ рабочий, баланс '+v.balance+' '+(v.currency||'')+'</span>'):('<span class="bad">'+esc(v.error)+'</span>'))).join('<br>');
+  box.innerHTML=Object.entries(r.result||{}).map(([k,v])=>k+': '+(v.ok?('<span class="ok">ключ рабочий, баланс '+v.balance+' '+(v.currency||'')+'</span>'):
+    v.saved_unverified?('<span class="warn">сервис недоступен с сервера напрямую — ключ сохранён без проверки, узел будет ходить к нему через свой канал ('+esc(v.error)+')</span>'):
+    ('<span class="bad">'+esc(v.error)+'</span>'))).join('<br>');
   done(3)}catch(e){document.getElementById('provbox').innerHTML='<span class="bad">'+esc(e.message)+'</span>';toast(e.message,'bad')}}
 async function saveSmtp(){const b={host:v('sm_host'),port:v('sm_port'),user:v('sm_user'),
   password:v('sm_password'),from:v('sm_from'),to:v('sm_to')};

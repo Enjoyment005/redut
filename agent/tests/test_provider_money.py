@@ -240,7 +240,7 @@ class TestProxylineProlong(unittest.TestCase):
     def test_renew_request_shape(self):
         cap = {}
 
-        def fake(url, fields, headers=None, timeout=None, host_label=""):
+        def fake(url, fields, headers=None, timeout=None, host_label="", **kw):
             cap.update(url=url, fields=fields, headers=headers)
             return {"balance": "59.33", "price": "1.20", "currency": "USD"}
         pl_mod.http_post_form = fake
@@ -273,7 +273,7 @@ class TestMutatingNoFailover(unittest.TestCase):
     def _install(self):
         calls = []
 
-        def fake(url, headers=None, timeout=None, host_label=""):
+        def fake(url, headers=None, timeout=None, host_label="", **kw):
             calls.append(host_label)
             raise ProviderError("timeout", network=True)
         self._p6.http_get_json = fake

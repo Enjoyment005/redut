@@ -124,6 +124,22 @@ def _run_agent(args, timeout=240):
         return -1, str(e)
 
 
+def _first_channel_kick():
+    """После мастера: подтянуть пул и сразу подобрать первый канал (фоновый поток).
+
+    Отдельным процессом vpn-agent (он перечитает secrets.json сам): pool-refresh, затем
+    rotate --force --reason setup — force обходит окно повтора EMERGENCY (§8), в котором
+    узел публичной сборки сидит с момента установки. Ошибки не роняют панель — только лог.
+    """
+    try:
+        rc, out = _run_agent(["pool-refresh"], timeout=300)
+        print("[setup] pool-refresh rc=%s: %s" % (rc, (out or "")[-300:].replace("\n", " | ")))
+        rc, out = _run_agent(["rotate", "--force", "--reason", "setup"], timeout=600)
+        print("[setup] первый канал: rotate rc=%s: %s" % (rc, (out or "")[-300:].replace("\n", " | ")))
+    except Exception as e:      # noqa: BLE001 — фон, панель жить должна
+        print("[setup] подбор первого канала не удался: %s" % e)
+
+
 def _make_mask(secrets):
     """Маска секретов для тела писем (§15): ключи провайдеров, SMTP-пароль."""
     vals = []
@@ -735,8 +751,16 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(200, {"recovery": plain})
 
     def _setup_provider(self, body):
-        """Валидируем ключи живьём (balance). proxy6 в приоритете (умеет возврат)."""
-        res, keys = {}, {}
+        """Валидируем ключи живьём (balance). proxy6 в приоритете (умеет возврат).
+
+        Ключ, который не удалось ПРОВЕРИТЬ из-за недоступности провайдера с сервера
+        (ProviderError.network — например, PROXY6 закрыт у российского хостера SNI-блокировкой,
+        приёмка 15.08), НЕ выбрасываем: сохраняем как «непроверенный» рядом с хотя бы одним
+        рабочим ключом. После установки узел ходит к такому провайдеру через собственный канал
+        (providers/base: транспорт tun0), и ключ заработает без правки secrets.json по SSH.
+        Ключ, ОТВЕРГНУТЫЙ провайдером (ответ API: неверный ключ), не сохраняем.
+        """
+        res, keys, verified = {}, {}, 0
         for name in PROVIDER_CLASSES:
             key = (body.get(name) or "").strip()
             if not key:
@@ -745,9 +769,18 @@ class Handler(BaseHTTPRequestHandler):
                 bal = PROVIDER_CLASSES[name](key).balance()
                 res[name] = {"ok": True, "balance": bal.get("balance"), "currency": bal.get("currency")}
                 keys[name] = key
+                verified += 1
+            except ProviderError as e:
+                if e.network:
+                    res[name] = {"ok": False, "network": True, "saved_unverified": True, "error": str(e)}
+                    keys[name] = key
+                else:
+                    res[name] = {"ok": False, "error": str(e)}
             except Exception as e:
                 res[name] = {"ok": False, "error": str(e)}
-        if not keys:
+        if not verified:
+            for name, r in res.items():
+                r.pop("saved_unverified", None)     # без единого проверенного ключа не сохраняем ничего
             return self._json(400, {"error": "нужен хотя бы один рабочий ключ", "result": res})
         APP.setup["providers"] = keys
         return self._json(200, {"result": res})
@@ -789,6 +822,12 @@ class Handler(BaseHTTPRequestHandler):
                                % (",".join(st["providers"]), bool(st.get("smtp"))),
                                src_ip=self._client_ip())
         APP.setup = {}
+        # Первый канал — сразу, а не по расписанию. До этого узел (публичная сборка) сидит в
+        # EMERGENCY с окном повтора 15 мин, и после мастера человек ждал до четверти часа
+        # (приёмка 15.08: ключ введён 15:51, канал появился 15:54 — просто повезло с окном).
+        # Фоном: подтянуть пул у провайдеров и прогнать машину состояний с --force
+        # (обходит окно повтора аварии). Ответ мастеру не ждёт — /login открывается сразу.
+        threading.Thread(target=_first_channel_kick, name="first-channel", daemon=True).start()
         return self._json(200, {"ok": True, "next": "/login"})
 
     # ------------------------------------------------ сборка status/pool

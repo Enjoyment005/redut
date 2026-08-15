@@ -92,15 +92,22 @@ class Alerter:
 
     # ------------------------------------------------------- типовые события
     def rotated(self, *, old_ip, new_ip, uid, egress, cc, tg_code, score=None, candidates_tried=None):
+        # Холодный старт (канал ещё не выбирался): old_ip пуст — пишем это словами, а не пустотой
+        # (письмо «Ротация upstream:  -> X» выглядело как обрыв строки; приёмка 15.08).
+        first = not old_ip
+        was = old_ip or "канала не было (первый выбор)"
         body = (
-            "Upstream-прокси заменён автоматически (§8 ROTATING).\n\n"
-            "  было:   %s\n  стало:  %s  (%s)\n"
+            ("Первый исходящий канал выбран автоматически (§8 ROTATING).\n\n" if first
+             else "Upstream-прокси заменён автоматически (§8 ROTATING).\n\n")
+            + "  было:   %s\n  стало:  %s  (%s)\n"
             "  выход:  %s  страна=%s  telegram=%s\n"
             "%s"
-            "Реакция на смерть прежнего upstream. Действий не требуется."
-            % (old_ip, new_ip, uid, egress, cc or "?", tg_code or "?",
-               ("  перебрано кандидатов: %s\n" % candidates_tried) if candidates_tried else ""))
-        return self._send("Ротация upstream: %s -> %s" % (old_ip, new_ip), body)
+            % (was, new_ip, uid, egress, cc or "?", tg_code or "?",
+               ("  перебрано кандидатов: %s\n" % candidates_tried) if candidates_tried else "")
+            + ("Узел вышел из прямого выхода на канал из пула. Действий не требуется." if first
+               else "Реакция на смерть прежнего upstream. Действий не требуется."))
+        subject = ("Первый канал: %s" % new_ip) if first else ("Ротация upstream: %s -> %s" % (old_ip, new_ip))
+        return self._send(subject, body)
 
     def retuned(self, *, host, old_mode, new_mode, uid=None):
         body = (
