@@ -142,11 +142,26 @@ def write_config(name, net, port, subnet, wg_port, dnsmasq):
 
 
 def ensure_secrets():
-    """Пустой secrets.json = панель уйдёт в мастер первого входа. Существующий не трогаем."""
+    """Пустой secrets.json ({} или нет файла) = панель уйдёт в мастер первого входа.
+    Настроенный (есть блок admin) не трогаем. Возвращает True, если мастер ещё впереди —
+    по этому флагу setup.sh печатает адрес /setup и предупреждение о первом входе.
+    (Раньше «{}» считался настроенной панелью, и повторный запуск до мастера писал
+    «панель уже настроена» — найдено на приёмке 15.08.)"""
     path = os.path.join(ETC, "secrets.json")
-    if os.path.isfile(path) and open(path, encoding="utf-8").read().strip():
-        print("  secrets.json: оставлен как есть (панель уже настроена)")
-        return False
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = f.read()
+            data = json.loads(raw) if raw.strip() else {}
+        except (ValueError, OSError):
+            print("  secrets.json: не разобрать как JSON — оставлен как есть")
+            return False
+        if isinstance(data, dict) and data.get("admin"):
+            print("  secrets.json: оставлен как есть (панель уже настроена)")
+            return False
+        if data:
+            print("  secrets.json: оставлен как есть (учётка панели ещё не заведена — мастер впереди)")
+            return True
     with open(path, "w", encoding="utf-8") as f:
         f.write("{}\n")
     os.chmod(path, 0o600)

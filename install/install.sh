@@ -203,6 +203,12 @@ with open(dst, "w", encoding="utf-8") as f:
     json.dump(c, f, ensure_ascii=False, indent=2)
 PY
 /usr/local/bin/sing-box check -c /etc/sing-box/config.json || die "sing-box check не прошёл"
+# Действующий upstream (сохранённый живой или из params.sh; в публичной сборке при первой
+# установке — ПУСТО: канал появится после мастера). Именно он идёт в boot-скрипт и verify.
+UP_HOST_EFF="$(python3 -c 'import json,sys
+c = json.load(open(sys.argv[1], encoding="utf-8"))
+print(next((o.get("server") or "" for o in c.get("outbounds", []) if o.get("tag") == "socks-out"), ""))' \
+    /etc/sing-box/config.json 2>/dev/null || true)"
 
 # ── 6. self-heal (unit + post + watchdog) из templates/ ──────────────────
 log "6/12 self-heal (sing-box.service, singbox-post, watchdog)"
@@ -215,9 +221,11 @@ put_tpl "$TPL/vpn-boot-setup.service" /etc/systemd/system/vpn-boot-setup.service
 log "7/12 vpn-boot-setup.sh (§11 RETURN + wg0 fallback)"
 cat > /usr/local/bin/vpn-boot-setup.sh <<BOOT
 #!/bin/bash
-# VPN boot setup — subnet $SUBNET, upstream $UP_HOST (сгенерирован install.sh).
+# VPN boot setup — subnet $SUBNET, upstream $UP_HOST_EFF (сгенерирован install.sh).
 # Идемпотентно, переживает ребут. §11: RETURN для трафика ВНУТРИ VPN и К самому серверу
 # (панель/SSH из-под VPN не заворачиваются в middleman->tun0). Плюс фолбэк подъёма wg0.
+# UP_HOST правит агент (apply.patch_boot_script) при смене канала; пусто = канал ещё не выбран.
+UP_HOST="$UP_HOST_EFF"
 
 # 0) фолбэк — поднять wg0, если systemd не поднял его на буте (баг node1)
 if ! ip link show wg0 >/dev/null 2>&1; then
@@ -245,7 +253,8 @@ ip route replace default dev tun0 table middleman
 ip route replace $SUBNET dev wg0 table middleman
 ip rule del fwmark 0x64 2>/dev/null || true
 ip rule add fwmark 0x64 lookup middleman priority 100
-ip route replace $UP_HOST/32 via $GW dev $WAN          # анти-луп: до upstream — напрямую через WAN
+# анти-луп: до самого upstream — напрямую через WAN (при пустом UP_HOST строка пропускается)
+[ -n "\$UP_HOST" ] && ip route replace "\$UP_HOST/32" via $GW dev $WAN
 sysctl -q net.ipv4.ip_forward=1
 echo "[\$(date)] vpn-boot-setup completed"
 BOOT
@@ -283,7 +292,7 @@ cache-size=1000
 EOF
     put_tpl "$TPL/dnsmasq/no-log.conf" /etc/dnsmasq.d/no-log.conf 0644
 else
-    log "9/12 dnsmasq OFF (весь трафик через прокси — как на node1)"
+    log "9/12 dnsmasq OFF (весь трафик клиентов уходит в исходящий канал; DNS клиента $DNS_SERVER)"
     systemctl disable --now dnsmasq 2>/dev/null || true
 fi
 
@@ -322,6 +331,10 @@ echo "  tun0 carrier: $(cat /sys/class/net/tun0/carrier 2>/dev/null || echo none
 echo "  wg peers: $(wg show wg0 peers 2>/dev/null | wc -l)"
 echo "  middleman: $(ip route show table middleman 2>/dev/null | tr '\n' ';')"
 echo "  mangle §11 RETURN: $(iptables -t mangle -S PREROUTING 2>/dev/null | grep -c -- '-j RETURN')"
-egress="$(curl -s --max-time 15 --interface tun0 https://api.ipify.org 2>/dev/null || true)"
-echo "  egress(tun0): ${egress:-ПУСТО}  (ждём upstream $UP_HOST)"
-log "база готова. Панель/агент накатывает bootstrap.py (panel/deploy.py)."
+if [ -n "$UP_HOST_EFF" ]; then
+    egress="$(curl -s --max-time 15 --interface tun0 https://api.ipify.org 2>/dev/null || true)"
+    echo "  egress(tun0): ${egress:-ПУСТО}  (ждём upstream $UP_HOST_EFF)"
+else
+    echo "  egress(tun0): канал ещё не выбран — появится после ввода ключа провайдера в мастере"
+fi
+log "база готова. Дальше — агент и веб-панель (setup.sh / bootstrap.py ставят их следующим шагом)."

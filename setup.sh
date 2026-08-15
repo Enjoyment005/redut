@@ -1,7 +1,8 @@
 #!/bin/bash
 # setup.sh — установка узла «Редут» ОДНОЙ КОМАНДОЙ прямо на сервере.
 #
-#   bash <(curl -fsSL https://raw.githubusercontent.com/Enjoyment005/redut/main/setup.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/Enjoyment005/redut/main/setup.sh \
+#          || wget -qO- https://raw.githubusercontent.com/Enjoyment005/redut/main/setup.sh)
 #
 # Скрипт рассчитан на чистую Debian 13 и запуск от root. Он скачивает репозиторий,
 # ставит базу (WireGuard, sing-box, маршруты, самолечение) и веб-панель, после чего
@@ -9,6 +10,9 @@
 #
 # Почему `bash <(curl …)`, а не `curl … | bash`: при пайпе у скрипта нет stdin, и он
 # не может ничего спросить у человека. Здесь stdin остаётся терминалом.
+# Почему `curl … || wget …`: на минимальных образах Debian 13 (netinst у российских
+# хостеров) curl не установлен, а wget есть; с одним curl команда молча делала ничего
+# (bash получал пустой файл и выходил с кодом 0). Проверено на живом сервере 15.08.
 #
 # Идемпотентно: повторный запуск обновляет узел, не теряя ключи, клиентов и учётку панели.
 #
@@ -37,11 +41,18 @@ die()  { printf '\n\033[1;31m✖ %s\033[0m\n' "$*" >&2; exit 1; }
 say "Проверяю сервер"
 [ "$(id -u)" = "0" ] || die "нужен root: запусти через sudo -i или от root"
 [ -r /etc/os-release ] || die "не похоже на Linux с /etc/os-release"
-. /etc/os-release
-[ "${ID:-}" = "debian" ] || die "нужен Debian (у тебя: ${PRETTY_NAME:-неизвестно}). Установщик проверялся на Debian 13."
-case "${VERSION_ID:-}" in
-    13*) ok "Debian ${VERSION_ID} — то, что нужно" ;;
-    *)   printf '  \033[1;33m!\033[0m Debian %s вместо 13 — не проверялось, продолжаю на свой страх\n' "${VERSION_ID:-?}" ;;
+# os-release читаем в подоболочке: он объявляет свою переменную NAME («Debian GNU/Linux»)
+# и иначе затирает имя узла — так узел получал имя 'Debian GNU/Linux' (найдено 15.08).
+OS_ID="$(. /etc/os-release && printf '%s' "${ID:-}")"
+OS_VER="$(. /etc/os-release && printf '%s' "${VERSION_ID:-}")"
+OS_PRETTY="$(. /etc/os-release && printf '%s' "${PRETTY_NAME:-неизвестно}")"
+[ "$OS_ID" = "debian" ] || die "нужен Debian (у тебя: $OS_PRETTY). Установщик проверялся на Debian 13."
+case "$OS_VER" in
+    13*) ok "Debian $OS_VER — то, что нужно" ;;
+    *)   printf '  \033[1;33m!\033[0m Debian %s вместо 13 — не проверялось, продолжаю на свой страх\n' "${OS_VER:-?}" ;;
+esac
+case "$NAME" in
+    ""|*[!A-Za-z0-9._-]*) die "NAME='$NAME' — имя узла: латиница, цифры, точка, дефис, подчёркивание" ;;
 esac
 [ "$(uname -m)" = "x86_64" ] || die "нужна архитектура x86_64 (у тебя $(uname -m))"
 command -v systemctl >/dev/null || die "нет systemd"
@@ -149,6 +160,25 @@ SERVER_IP="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('ser
 CERT_FP="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('cert_fp',''))" "$json")"
 FRESH="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('fresh_setup'))" "$json")"
 
+# ── 5b. Исходящий канал ещё не выбран (первая установка публичной сборки) ────
+# Пока владелец не ввёл ключ провайдера в мастере, у sing-box нет upstream и туннель
+# упирается в пустоту. Сторож заметил бы это через ≤2 мин и перевёл узел на прямой
+# выход через адрес сервера (агент, режим EMERGENCY). Делаем это сразу, чтобы устройство,
+# подключённое через минуту после установки, не сидело без сети до первого тика крона.
+UP_NOW="$(python3 -c 'import json,sys
+c = json.load(open(sys.argv[1], encoding="utf-8"))
+print(next((o.get("server") or "" for o in c.get("outbounds", []) if o.get("tag") == "socks-out"), ""))' \
+    /etc/sing-box/config.json 2>/dev/null || true)"
+if [ -z "$UP_NOW" ]; then
+    say "Исходящий канал ещё не выбран — включаю прямой выход до настройки провайдера"
+    /usr/local/bin/singbox-watchdog.sh >/dev/null 2>&1 || true
+    if [ -f /run/vpn-agent-emergency ]; then
+        ok "устройства выходят напрямую через $SERVER_IP (в панели это «аварийный режим» — норма для нового узла)"
+    else
+        printf '  \033[1;33m!\033[0m прямой выход не включился сам — сторож включит его в течение 2 минут\n'
+    fi
+fi
+
 # ── 6. Проверка ─────────────────────────────────────────────────────────────
 say "Проверяю, что всё поднялось"
 fail=0
@@ -177,6 +207,12 @@ else
 fi
 printf '  Сертификат самоподписанный, браузер предупредит. Сверь отпечаток:\n'
 printf '      %s\n\n' "$CERT_FP"
+if [ -z "$UP_NOW" ]; then
+    printf '  Исходящий канал появится после ввода ключа провайдера в мастере (шаг 3):\n'
+    printf '  автоматика сама подберёт и применит канал из пула. До этого устройства выходят\n'
+    printf '  в интернет напрямую через адрес сервера — панель показывает это как\n'
+    printf '  «аварийный режим», для только что поставленного узла это ожидаемо.\n\n'
+fi
 printf '  Профили устройств выдаются в панели: раздел «Кто подключён» →\n'
 printf '  имя устройства → «Выдать доступ» → QR для телефона или файл для компьютера.\n\n'
 printf '  Клиентские конфиги на сервере: /etc/wireguard/clients/\n'

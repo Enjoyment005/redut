@@ -138,6 +138,66 @@ class TestPoolAutomat(unittest.TestCase):
         self.assertIsNotNone(self.pool.last_heartbeat())
 
 
+class TestEmergencyRestoreRoutes(unittest.TestCase):
+    """EMERGENCY в базе, а прямой выход сбит (нет флага после ребута / middleman снова в tun0
+    после переустановки) — чиним сразу, не дожидаясь 15-минутного окна (приёмка 15.08)."""
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.pool = pool_mod.Pool(self.db, server="test")
+        fd, self.flag = tempfile.mkstemp(suffix=".flag")
+        os.close(fd)
+        os.unlink(self.flag)                       # по умолчанию флага НЕТ
+        self._orig = (states.EMERGENCY_FLAG, states.emergency_on, states._middleman_default)
+        states.EMERGENCY_FLAG = self.flag
+        self.on_calls = []
+        states.emergency_on = lambda cfg, log=print: self.on_calls.append(cfg) or True
+        self.route = "default via 198.51.100.1 dev ens3"      # по умолчанию — уже прямой
+        states._middleman_default = lambda: self.route
+
+    def tearDown(self):
+        states.EMERGENCY_FLAG, states.emergency_on, states._middleman_default = self._orig
+        self.pool.close()
+        os.unlink(self.db)
+        if os.path.exists(self.flag):
+            os.unlink(self.flag)
+
+    def _events(self):
+        return self.pool.conn.execute(
+            "SELECT result, detail FROM event WHERE action='emergency'").fetchall()
+
+    def _set_flag(self):
+        with open(self.flag, "w") as f:
+            f.write("2026-08-15 12:00:00\n")
+
+    def test_no_flag_restores_routes_and_logs(self):
+        self.assertTrue(states.restore_emergency_routes({"gw": "1.1.1.1"}, self.pool, log=lambda *a: None))
+        self.assertEqual(len(self.on_calls), 1, "emergency_on вызван ровно один раз")
+        ev = self._events()
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0][0], "restore")
+        self.assertIn("перезагрузки", ev[0][1])
+
+    def test_flag_present_route_reset_restores(self):
+        self._set_flag()
+        self.route = "default dev tun0 scope link"           # boot-скрипт вернул tun0
+        self.assertTrue(states.restore_emergency_routes({}, self.pool, log=lambda *a: None))
+        self.assertEqual(len(self.on_calls), 1)
+        self.assertIn("сброса маршрута", self._events()[0][1])
+
+    def test_flag_present_route_direct_noop(self):
+        self._set_flag()
+        self.assertFalse(states.restore_emergency_routes({}, self.pool, log=lambda *a: None))
+        self.assertEqual(self.on_calls, [])
+        self.assertEqual(self._events(), [])
+
+    def test_emergency_on_failed_no_event(self):
+        states.emergency_on = lambda cfg, log=print: False    # не posix / не смогли
+        self.assertFalse(states.restore_emergency_routes({}, self.pool, log=lambda *a: None))
+        self.assertEqual(self._events(), [])
+
+
 class _FakeAlerter:
     def __init__(self):
         self.calls = []

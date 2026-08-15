@@ -109,6 +109,69 @@ class TestPatchConfig(unittest.TestCase):
         self.assertEqual(apply_mod.current_upstream(self.patch(62955, 62954)), NEW["host"])
 
 
+class TestPatchBootScript(unittest.TestCase):
+    """vpn-boot-setup.sh: правка анти-луп адреса, включая ХОЛОДНЫЙ старт (old_ip == "").
+
+    Найдено на приёмке публичной сборки 15.08: при пустом прежнем адресе re.sub("")
+    вставлял новый IP между каждыми двумя символами — скрипт превращался в кашу.
+    """
+    OLD_FMT = ("#!/bin/bash\n# VPN boot setup — subnet 10.8.0.0/24, upstream %s (сгенерирован install.sh).\n"
+               "ip route replace %s/32 via 198.51.100.1 dev ens3          # анти-луп: до upstream — напрямую\n"
+               "echo done\n")
+    NEW_FMT = ("#!/bin/bash\n# VPN boot setup — subnet 10.8.0.0/24, upstream %s.\n"
+               "UP_HOST=\"%s\"\n"
+               "[ -n \"$UP_HOST\" ] && ip route replace \"$UP_HOST/32\" via 198.51.100.1 dev ens3\n"
+               "echo done\n")
+
+    def _tmp(self, text):
+        import os
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".sh")
+        os.close(fd)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        return path
+
+    def _read(self, path):
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def test_replace_existing_ip_both_formats(self):
+        for fmt in (self.OLD_FMT, self.NEW_FMT):
+            p = self._tmp(fmt % ("1.1.1.1", "1.1.1.1"))
+            self.assertTrue(apply_mod.patch_boot_script(p, "1.1.1.1", "2.2.2.2"))
+            self.assertEqual(self._read(p), fmt % ("2.2.2.2", "2.2.2.2"))
+
+    def test_cold_start_old_format_fills_antiloop_line_only(self):
+        p = self._tmp(self.OLD_FMT % ("", ""))
+        self.assertTrue(apply_mod.patch_boot_script(p, "", "5.6.7.8"))
+        got = self._read(p)
+        self.assertIn("ip route replace 5.6.7.8/32 via 198.51.100.1 dev ens3", got)
+        self.assertEqual(got.count("5.6.7.8"), 1, "адрес вписан ровно один раз, а не между символами")
+        self.assertTrue(got.startswith("#!/bin/bash\n"), "скрипт остался скриптом")
+
+    def test_cold_start_new_format_sets_variable(self):
+        p = self._tmp(self.NEW_FMT % ("", ""))
+        self.assertTrue(apply_mod.patch_boot_script(p, "", "5.6.7.8"))
+        got = self._read(p)
+        self.assertIn('UP_HOST="5.6.7.8"\n', got)
+        self.assertEqual(got.count("5.6.7.8"), 1)
+        # следующий кандидат при всё ещё пустом live-конфиге перезаписывает переменную
+        self.assertTrue(apply_mod.patch_boot_script(p, "", "9.9.9.9"))
+        got = self._read(p)
+        self.assertIn('UP_HOST="9.9.9.9"\n', got)
+        self.assertNotIn("5.6.7.8", got)
+
+    def test_noop_cases(self):
+        p = self._tmp(self.NEW_FMT % ("1.1.1.1", "1.1.1.1"))
+        before = self._read(p)
+        self.assertFalse(apply_mod.patch_boot_script(p, "1.1.1.1", "1.1.1.1"))
+        self.assertFalse(apply_mod.patch_boot_script(p, "1.1.1.1", ""), "пустой новый адрес — ничего не делаем")
+        self.assertFalse(apply_mod.patch_boot_script(p + ".missing", "1.1.1.1", "2.2.2.2"))
+        self.assertEqual(self._read(p), before)
+
+
 class TestValidation(unittest.TestCase):
     def test_stage_rejects_bad_host(self):
         # §15: валидация до каких-либо действий

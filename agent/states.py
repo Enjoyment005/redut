@@ -55,6 +55,10 @@ COOLDOWN_MAX = 2 * 3600
 # переживает только до ребута, а после ребута vpn-boot-setup ставит tun0-маршрут,
 # и обычная диагностика при первом же вызове поднимет автомат заново.
 EMERGENCY_FLAG = "/run/vpn-agent-emergency"
+# ТОЛЬКО полный путь: агента дёргает cron с PATH=/usr/bin:/bin, а iptables лежит в
+# /usr/sbin — короткое имя из крона даёт [Errno 2], и emergency_on «добавлял» MASQUERADE
+# только в логе (найдено 15.08 на приёмке публичной сборки; тот же класс, что и sing-box §12.4).
+IPTABLES = "/usr/sbin/iptables"
 
 # Прямые проверки живости сети (мимо прокси). -k: 1.1.1.1/8.8.8.8 по IP без валид. cert.
 NET_CHECK_URLS = ("https://api.ipify.org", "https://1.1.1.1", "https://8.8.8.8")
@@ -222,6 +226,7 @@ def rotate(cfg, providers, pool, alerter, reason="manual", actor="auto",
     state_before = pool.get_setting("automat_state") or OK
     # EMERGENCY: повтор не чаще 15 мин (§8), иначе watchdog долбил бы каждые 2 мин
     if state_before == EMERGENCY and not force:
+        restore_emergency_routes(cfg, pool, log, actor)
         last = pool.get_setting("emergency_last_retry")
         age = age_seconds(last)
         if age is not None and age < EMERGENCY_RETRY_SEC:
@@ -634,12 +639,15 @@ def emergency_on(cfg, log=print):
     wan = cfg.get("wan") or "ens3"
     subnet = cfg.get("subnet")
     if subnet:
-        rc, _ = apply_mod.run_cmd(["iptables", "-t", "nat", "-C", "POSTROUTING",
+        rc, _ = apply_mod.run_cmd([IPTABLES, "-t", "nat", "-C", "POSTROUTING",
                                    "-s", subnet, "-o", wan, "-j", "MASQUERADE"])
         if rc != 0:      # правила ещё нет — добавляем (идемпотентно)
-            apply_mod.run_cmd(["iptables", "-t", "nat", "-A", "POSTROUTING",
-                               "-s", subnet, "-o", wan, "-j", "MASQUERADE"])
-            log("  emergency: добавлен MASQUERADE %s -> %s" % (subnet, wan))
+            rc2, out2 = apply_mod.run_cmd([IPTABLES, "-t", "nat", "-A", "POSTROUTING",
+                                           "-s", subnet, "-o", wan, "-j", "MASQUERADE"])
+            if rc2 == 0:
+                log("  emergency: добавлен MASQUERADE %s -> %s" % (subnet, wan))
+            else:
+                log("  emergency: MASQUERADE %s -> %s НЕ добавлен: %s" % (subnet, wan, out2))
     if gw:
         apply_mod.run_cmd(["ip", "route", "replace", "default", "via", gw, "dev", wan, "table", "middleman"])
         log("  emergency: middleman default -> via %s dev %s (прямой выход)" % (gw, wan))
@@ -665,6 +673,37 @@ def emergency_off(cfg, log=print):
     except OSError:
         pass
     log("  emergency off: middleman default -> tun0")
+    return True
+
+
+def _middleman_default():
+    """Строка default-маршрута таблицы middleman ('' если нет / не Linux)."""
+    rc, out = apply_mod.run_cmd(["ip", "route", "show", "table", "middleman"])
+    for ln in (out or "").splitlines():
+        if ln.startswith("default"):
+            return ln
+    return ""
+
+
+def restore_emergency_routes(cfg, pool, log=print, actor="auto"):
+    """Мы в EMERGENCY, но прямой выход сбит — восстановить его СРАЗУ, не дожидаясь окна
+    повтора (15 мин). Два случая, оба найдены 15.08 на приёмке публичной сборки:
+      • перезагрузка: флаг в /run исчез, boot-скрипт вернул middleman в мёртвый tun0
+        (5 минут «чёрной дыры» после ребута);
+      • переустановка/ручной запуск boot-скрипта при живом флаге: маршрут снова tun0.
+    emergency_on идемпотентен; попытка выйти из аварии остаётся по расписанию.
+    Возвращает True, если восстанавливали."""
+    if not os.path.exists(EMERGENCY_FLAG):
+        why = "после перезагрузки (флага в /run не было)"
+    elif "dev tun0" in _middleman_default():
+        why = "после сброса маршрута (переустановка/boot-скрипт вернули middleman в tun0)"
+    else:
+        return False
+    if not emergency_on(cfg, log):
+        return False
+    log("  emergency: прямой выход восстановлен %s" % why)
+    pool.log_event("emergency", actor=actor, result="restore",
+                   detail="маршруты прямого выхода восстановлены %s" % why)
     return True
 
 

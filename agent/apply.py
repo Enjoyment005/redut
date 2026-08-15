@@ -226,13 +226,31 @@ def antiloop_replace(new_ip, old_ip, gw, wan):
     return "anti-loop: %s/32 via %s dev %s" % (new_ip, gw, wan)
 
 
+# Строки boot-скрипта, куда вписывается адрес upstream при ХОЛОДНОМ старте (см. ниже):
+#   UP_HOST=""                                  — новый формат install.sh (переменная)
+#   ip route replace /32 via <gw> dev <wan>     — старый формат (адрес прямо в команде)
+_BOOT_UPHOST_RE = re.compile(r'(?m)^(UP_HOST=")([^"]*)(")')
+_BOOT_ANTILOOP_RE = re.compile(r"(?m)^(\s*ip route replace )(\S*)(/32 via )")
+
+
 def patch_boot_script(path, old_ip, new_ip):
-    """Замена IP в vpn-boot-setup.sh — re.sub + os.replace, не sed (§15)."""
-    if old_ip == new_ip or not os.path.isfile(path):
+    """Замена IP в vpn-boot-setup.sh — re.sub + os.replace, не sed (§15).
+
+    Холодный старт (публичная сборка: канал в конфиге ещё не выбран) даёт old_ip == "".
+    Раньше это уходило в re.sub("", …) — пустой шаблон совпадает между КАЖДЫМИ двумя
+    символами, и boot-скрипт превращался в кашу из IP-адресов (после ребута узел
+    оставался без правил и маршрутов). Поэтому пустой old_ip обрабатываем отдельно:
+    адрес вписывается только в строку анти-лупа / переменную UP_HOST.
+    """
+    if not new_ip or old_ip == new_ip or not os.path.isfile(path):
         return False
     with open(path, encoding="utf-8") as f:
         text = f.read()
-    new_text = re.sub(re.escape(old_ip), new_ip, text)
+    if old_ip:
+        new_text = re.sub(re.escape(old_ip), new_ip, text)
+    else:
+        put = lambda m: m.group(1) + new_ip + m.group(3)  # noqa: E731
+        new_text = _BOOT_ANTILOOP_RE.sub(put, _BOOT_UPHOST_RE.sub(put, text))
     if new_text == text:
         return False
     tmp = path + ".tmp"
