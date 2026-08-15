@@ -43,7 +43,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 %s/webpanel/server.py
+# -u: не буферизовать stdout, иначе логи фоновых потоков (подбор первого канала после
+# мастера) застревают в буфере и не видны в journalctl (найдено на приёмке 15.08, снос №5).
+ExecStart=/usr/bin/python3 -u %s/webpanel/server.py
 Restart=always
 RestartSec=3
 # Панель работает от root: apply/rollback правят /etc/sing-box и маршруты.

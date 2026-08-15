@@ -133,11 +133,11 @@ def _first_channel_kick():
     """
     try:
         rc, out = _run_agent(["pool-refresh"], timeout=300)
-        print("[setup] pool-refresh rc=%s: %s" % (rc, (out or "")[-300:].replace("\n", " | ")))
+        print("[setup] pool-refresh rc=%s: %s" % (rc, (out or "")[-300:].replace("\n", " | ")), flush=True)
         rc, out = _run_agent(["rotate", "--force", "--reason", "setup"], timeout=600)
-        print("[setup] первый канал: rotate rc=%s: %s" % (rc, (out or "")[-300:].replace("\n", " | ")))
+        print("[setup] первый канал: rotate rc=%s: %s" % (rc, (out or "")[-300:].replace("\n", " | ")), flush=True)
     except Exception as e:      # noqa: BLE001 — фон, панель жить должна
-        print("[setup] подбор первого канала не удался: %s" % e)
+        print("[setup] подбор первого канала не удался: %s" % e, flush=True)
 
 
 def _make_mask(secrets):

@@ -21,6 +21,43 @@ def mk_norm(ext_id, host, country="de"):
             "date_end": "", "descr": ""}
 
 
+class TestRankCandidates(unittest.TestCase):
+    """Порядок выбора канала (снос №5): trusted-страна вперёд, чёрный список выброшен,
+    сырой кандидат хорошей страны обгоняет пробованный кандидат плохой страны."""
+
+    def _row(self, host, country, exit_cc=None, probe_ok=0, score=None, role="auto"):
+        return {"uid": "proxy6:%s" % host, "host": host, "country": country,
+                "exit_cc": exit_cc, "probe_ok": probe_ok, "score": score, "role": role}
+
+    def test_blacklist_dropped(self):
+        rows = [self._row("r", "ru"), self._row("u", "ua"), self._row("b", "by"),
+                self._row("d", "de")]
+        out = states.rank_candidates(rows)
+        self.assertEqual([r["host"] for r in out], ["d"])
+
+    def test_trusted_before_low_trust_even_if_unprobed(self):
+        # Латвия сырая (score=None) должна идти ПЕРЕД Нигерией, уже пробованной (score=60) —
+        # ровно баг сноса №5 (первый канал ушёл в ng при живой lv в пуле)
+        rows = [self._row("ng", "ng", exit_cc="ng", probe_ok=1, score=60.0),
+                self._row("lv", "lv")]
+        out = [r["host"] for r in states.rank_candidates(rows)]
+        self.assertEqual(out[0], "lv")
+        self.assertEqual(out, ["lv", "ng"])
+
+    def test_probed_trusted_before_raw_trusted(self):
+        rows = [self._row("lv_raw", "lv"),
+                self._row("de_ok", "de", exit_cc="de", probe_ok=1, score=150.0)]
+        out = [r["host"] for r in states.rank_candidates(rows)]
+        self.assertEqual(out, ["de_ok", "lv_raw"])   # при равной стране — выше по реальному score
+
+    def test_exit_cc_overrides_declared_country(self):
+        # продан как lv, но geoip видит ng -> ранжируем по фактической стране
+        rows = [self._row("x", "lv", exit_cc="ng", probe_ok=1, score=60.0),
+                self._row("y", "fi")]
+        out = [r["host"] for r in states.rank_candidates(rows)]
+        self.assertEqual(out[0], "y")
+
+
 class TestDecideLadder(unittest.TestCase):
     """Порядок §8 критичен: шаг 1 (сеть) раньше всего — иначе сожжём пул."""
 
@@ -136,6 +173,99 @@ class TestPoolAutomat(unittest.TestCase):
         self.assertIsNone(self.pool.last_heartbeat())
         self.pool.heartbeat()
         self.assertIsNotNone(self.pool.last_heartbeat())
+
+    def test_selectable_includes_unprobed_excludes_blacklist(self):
+        # «Из чего выбрать»: сырые (непробованные) кандидаты тоже считаются, ru — нет
+        self._addc(1, "1.1.1.1", "lv", probe_ok=0, score=None)   # сырой trusted — годен
+        self._addc(2, "2.2.2.2", "ru", probe_ok=1, score=90.0)   # чёрный список — не годен
+        self._addc(3, "3.3.3.3", "de", probe_ok=1, score=140.0)  # текущий
+        sel = states.selectable_candidates(self.pool, {"role": None}, "3.3.3.3")
+        hosts = [r["host"] for r in sel]
+        self.assertEqual(hosts, ["1.1.1.1"])
+
+    def test_selectable_orders_trusted_first(self):
+        self._addc(1, "ng", "ng", probe_ok=1, score=60.0)
+        self._addc(2, "lv", "lv", probe_ok=0, score=None)
+        self._addc(3, "mx", "mx", probe_ok=0, score=None)
+        sel = [r["host"] for r in states.selectable_candidates(self.pool, {"role": None}, None)]
+        self.assertEqual(sel[0], "lv")           # trusted сырой — первым, раньше пробованной ng
+        # ng и mx обе low-trust; среди равной страны пробованный рабочий (ng) выше сырого (mx)
+        self.assertEqual(sel, ["lv", "ng", "mx"])
+
+    def _addc(self, ext_id, host, country, probe_ok=0, score=None, role="auto"):
+        uid = self.pool.upsert_proxy(mk_norm(ext_id, host, country=country), role=role)
+        self.pool.conn.execute("UPDATE proxy SET probe_ok=?, score=?, exit_cc=? WHERE uid=?",
+                               (probe_ok, score, country, uid))
+        self.pool.conn.commit()
+        return uid
+
+
+class TestBuyOnlyWhenPoolEmpty(unittest.TestCase):
+    """Жёсткое правило владельца (снос №5): автоматика покупает ТОЛЬКО когда выбрать из
+    пула нечего. Есть пригодные кандидаты (даже непробованные) -> покупки нет."""
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.pool = pool_mod.Pool(self.db, server="test")
+        self._orig_load = states.apply_mod.load_json
+        states.apply_mod.load_json = lambda p: {"outbounds": [{"tag": "socks-out", "server": "9.9.9.9"}]}
+        self.cfg = {"role": None, "singbox_config": "x",
+                    "money": {"buy_enabled": True, "buy_period_days": 7, "buy_version": 4}}
+
+    def tearDown(self):
+        states.apply_mod.load_json = self._orig_load
+        self.pool.close()
+        os.unlink(self.db)
+
+    def _addc(self, ext_id, host, country, probe_ok=0, score=None, role="auto"):
+        uid = self.pool.upsert_proxy(mk_norm(ext_id, host, country=country), role=role)
+        self.pool.conn.execute("UPDATE proxy SET probe_ok=?, score=?, exit_cc=? WHERE uid=?",
+                               (probe_ok, score, country, uid))
+        self.pool.conn.commit()
+        return uid
+
+    class _Prov:
+        caps = {"buy": True}
+
+        def __init__(self):
+            self.bought = False
+
+        def getcount(self, *a, **k):
+            self.bought = True           # дошли до рынка — значит собирались купить
+            return 0
+
+    def test_replenish_refuses_when_unprobed_candidates_exist(self):
+        self._addc(1, "1.1.1.1", "lv", probe_ok=0, score=None)   # сырой годный — есть из чего выбрать
+        prov = self._Prov()
+        r = states.try_replenish(self.cfg, {"proxy6": prov}, self.pool,
+                                 _NullAlerter(), lambda *a: None, "auto")
+        self.assertFalse(r["ok"])
+        self.assertIn("непровер", r["reason"])
+        self.assertFalse(prov.bought, "покупка не должна была даже дойти до рынка")
+
+    def test_ensure_reserve_refuses_when_pool_has_candidates(self):
+        self._addc(1, "1.1.1.1", "lv", probe_ok=0, score=None)
+        self._addc(2, "2.2.2.2", "fi", probe_ok=0, score=None)
+        prov = self._Prov()
+        r = states.ensure_reserve(self.cfg, {"proxy6": prov}, self.pool,
+                                  _NullAlerter(), lambda *a: None, "auto")
+        self.assertFalse(r["bought"])
+        self.assertGreaterEqual(r["have"], 1)
+        self.assertFalse(prov.bought)
+
+    def test_replenish_proceeds_when_only_blacklist_left(self):
+        # в пуле только ru (чёрный список) -> выбирать нечего -> покупка допустима (дойдёт до рынка)
+        self._addc(1, "1.1.1.1", "ru", probe_ok=1, score=90.0)
+        prov = self._Prov()
+        states.try_replenish(self.cfg, {"proxy6": prov}, self.pool,
+                             _NullAlerter(), lambda *a: None, "auto")
+        self.assertTrue(prov.bought, "пул из одного ru = выбирать нечего -> покупка идёт на рынок")
+
+
+class _NullAlerter:
+    def __getattr__(self, _):
+        return lambda *a, **k: None
 
 
 class TestEmergencyRestoreRoutes(unittest.TestCase):

@@ -27,6 +27,7 @@ import datetime
 import os
 
 import apply as apply_mod
+import country as country_mod
 import money as money_mod
 import probe as probe_mod
 from providers import ProviderError
@@ -168,6 +169,58 @@ def _pool_row_by_host(pool, host):
     return None
 
 
+def _cc_of(row):
+    """Страна кандидата для ранжирования: фактическая (по geoip пробы), иначе заявленная."""
+    try:
+        return row["exit_cc"] or row["country"]
+    except (KeyError, TypeError):
+        return (row.get("exit_cc") if hasattr(row, "get") else None) or \
+               (row.get("country") if hasattr(row, "get") else None)
+
+
+def _rowget(row, key):
+    try:
+        return row[key]
+    except (KeyError, TypeError, IndexError):
+        return row.get(key) if hasattr(row, "get") else None
+
+
+def rank_candidates(rows, cfg=None):
+    """Упорядочить кандидатов для выбора канала (§7.4 + политика стран §6.1).
+
+    Найдено на приёмке 15.08 (снос №5): первый автоматический канал ушёл в Нигерию
+    (disputed) при живых Латвии/Германии/Финляндии в пуле — `rotate` брал первого,
+    у кого уже была проба (score), и не сравнивал со свежими кандидатами (score=None).
+    Теперь порядок перебора детерминирован и уважает политику стран:
+
+      * страны из чёрного списка (ru/ua/by) выбрасываются — их даже не пробуем;
+      * сначала — выше априорная оценка страны (Латвия перед Нигерией), даже если
+        по стране кандидат ещё не пробован (score=None): его проверят при переборе;
+      * при равной стране — выше фактический score пробы (проверенный рабочий вперёд).
+
+    Это тот же вывод, что даёт полный скоринг probe.score (в него входит country.rating),
+    но без требования, чтобы КАЖДЫЙ кандидат уже был пробован. rotate перебирает список
+    и берёт ПЕРВОГО прошедшего живую пробу — поэтому важен именно порядок.
+    """
+    ranked = []
+    for r in rows:
+        cr = country_mod.rating(_cc_of(r), True, cfg)
+        if cr is None:            # чёрный список — не выбираем и не тратим пробу
+            continue
+        score = _rowget(r, "score") if _rowget(r, "probe_ok") else None
+        ranked.append((-(cr), -(score or 0.0), r))
+    ranked.sort(key=lambda t: (t[0], t[1]))
+    return [t[2] for t in ranked]
+
+
+def selectable_candidates(pool, cfg, current_host):
+    """Кандидаты, из которых МОЖНО собрать канал прямо сейчас (для ротации и для
+    решения «докупать или выбрать из пула»): не gone/off/chrome, не на cooldown,
+    не текущий, страна не в чёрном списке — упорядочены rank_candidates."""
+    rows = pool.rotation_candidates(cfg.get("role"), exclude_host=current_host)
+    return rank_candidates(rows, cfg)
+
+
 def _row_from_sb(sb, host):
     """Синтетическая запись из live-конфига, если upstream не из пула (ручной)."""
     socks = http = None
@@ -302,10 +355,26 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
     if rot.get("ok"):
         if state_before == EMERGENCY:
             _leave_emergency(cfg, pool, alerter, rot["verify"], log, actor)
-        ensure_reserve(cfg, providers, pool, alerter, log, actor)   # N+1: докупить в фоне (§6.5)
+        ensure_reserve(cfg, providers, pool, alerter, log, actor)   # N+1: из пула, не покупкой (§6.5)
         return _state(pool, result, OK, "rotate", rot.get("detail", "ротация ок"))
 
-    # --- ШАГ 4b: REPLENISH (покупка) ---
+    # ROTATING остановился по лимиту, но в пуле ещё есть непроверенные кандидаты (§8, снос №5):
+    # НЕ покупаем — включаем прямой выход для связи и добираем пул СЛЕДУЮЩИМ тиком сторожа
+    # (без 15-мин окна аварии: emergency_last_retry не ставим, чтобы повтор пришёл через ~2 мин).
+    if rot.get("capped"):
+        emergency_on(cfg, log)
+        pool.set_setting("automat_state", EMERGENCY)
+        if state_before != EMERGENCY:
+            pool.set_setting("emergency_since", _now_iso())
+        # НЕ троттлим повтор 15 минутами: следующий тик сторожа (~2 мин) должен добрать
+        # остаток пула. Сбрасываем метку повтора, иначе rotate() уйдёт в emergency-wait.
+        pool.set_setting("emergency_last_retry", None)
+        pool.log_event("emergency", actor=actor, result="probing",
+                       detail="перебираю пул порциями (ещё есть непроверенные) — не покупаю")
+        return _state(pool, result, EMERGENCY, "pool-probing",
+                      "в пуле есть непроверенные кандидаты — добираю, покупка не нужна")
+
+    # --- ШАГ 4b: REPLENISH (покупка — только когда пул честно исчерпан) ---
     rep = try_replenish(cfg, providers, pool, alerter, log, actor)
     if rep.get("ok"):
         if state_before == EMERGENCY:
@@ -361,15 +430,20 @@ def try_retune(cfg, providers, pool, alerter, log, actor):
 def try_rotating(cfg, providers, pool, alerter, log, actor):
     sb = apply_mod.load_json(cfg["singbox_config"])
     host = apply_mod.current_upstream(sb)
-    cands = pool.rotation_candidates(cfg.get("role"), exclude_host=host)
+    # Кандидаты уже упорядочены по стране+score (rank_candidates): сначала пробуем
+    # надёжные страны (Латвия перед Нигерией), чёрный список выброшен (§6.1, снос №5).
+    cands = selectable_candidates(pool, cfg, host)
     if not cands:
-        log("  ROTATING: проверенных кандидатов нет (все off/gone/на cooldown)")
+        log("  ROTATING: пригодных кандидатов нет (все off/gone/на cooldown/в чёрном списке)")
         return {"ok": False, "exhausted": True}
     tried = 0
     for row in cands:
         if tried >= MAX_CANDIDATES_PER_CYCLE:
-            log("  ROTATING: лимит ≤%d кандидатов/цикл — стоп" % MAX_CANDIDATES_PER_CYCLE)
-            break
+            # Остановились по лимиту, но в пуле ещё есть НЕпробованные кандидаты. Это НЕ
+            # повод покупать (решение владельца, снос №5): доберём их следующим тиком.
+            log("  ROTATING: лимит ≤%d кандидатов/цикл — остальные попробую в следующем цикле"
+                % MAX_CANDIDATES_PER_CYCLE)
+            return {"ok": False, "exhausted": False, "capped": True, "tried": tried}
         if row["role"] == "chrome":
             continue
         tried += 1
@@ -394,11 +468,23 @@ def try_rotating(cfg, providers, pool, alerter, log, actor):
                         tg_code=r["verify"]["tg_code"], score=res.get("score"), candidates_tried=tried)
         return {"ok": True, "uid": row["uid"], "new_ip": r["new_ip"], "verify": r["verify"],
                 "detail": "ротация %s -> %s (%s)" % (host, r["new_ip"], row["uid"])}
-    return {"ok": False, "exhausted": False, "tried": tried}
+    # перебрали всех пригодных, никто не прошёл живую пробу (провалившиеся ушли на cooldown) —
+    # пул честно исчерпан, только теперь допустима докупка (REPLENISH)
+    return {"ok": False, "exhausted": True, "tried": tried}
 
 
 # ------------------------------------------------------------------- REPLENISH
 def try_replenish(cfg, providers, pool, alerter, log, actor):
+    # ПЕРЕД ПОКУПКОЙ — всегда выбрать из уже купленного пула (жёсткое правило владельца,
+    # снос №5): покупаем ТОЛЬКО когда пригодных кандидатов в пуле не осталось. Если ROTATING
+    # остановился по лимиту и в пуле ещё есть непроверенные — деньги не тратим, доберём тиком.
+    sb = apply_mod.load_json(cfg["singbox_config"])
+    still = selectable_candidates(pool, cfg, apply_mod.current_upstream(sb))
+    if still:
+        log("  REPLENISH: в пуле ещё %d непроверенных кандидатов — сначала пробую их, не покупаю"
+            % len(still))
+        return {"ok": False, "reason": "в пуле есть %d непроверенных кандидатов — покупка не нужна" % len(still),
+                "have_candidates": len(still)}
     prov = providers.get("proxy6")
     if prov is None or not prov.caps.get("buy"):
         alerter.pool_empty(detail="нет ключа PROXY6 — докупить нечем")
@@ -583,19 +669,24 @@ def auto_prolong(cfg, providers, pool, alerter, log=print, actor="auto"):
 
 # ------------------------------------------------------------------- N+1 (§6.5)
 def ensure_reserve(cfg, providers, pool, alerter, log, actor, min_reserve=1):
-    """Держать ≥1 тёплый резерв (§6.5). Резерв ушёл в работу — докупить в фоне.
+    """Держать запас на случай смерти боевого канала. РЕЗЕРВ БЕРЁМ ИЗ ПУЛА, А НЕ ПОКУПАЕМ:
+    если в пуле уже есть пригодные кандидаты (любой страны вне чёрного списка, не важно —
+    пробованные или ещё нет), докупать не нужно (жёсткое правило владельца, снос №5 — раньше
+    считали только ПРОБОВАННЫЕ резервы и докупали сразу после первой же ротации, хотя пул был
+    полон). Покупаем только когда выбирать реально не из чего.
     Best-effort: ошибки/гейты глушим (докупка резерва не должна ронять цикл)."""
     try:
         sb = apply_mod.load_json(cfg["singbox_config"])
         current = apply_mod.current_upstream(sb)
-        have = pool.reserve_count(cfg.get("role"), current_host=current)
+        have = len(selectable_candidates(pool, cfg, current))
         if have >= min_reserve:
+            log("  N+1: в пуле %d пригодных кандидатов (≥%d) — выбираю из пула, не покупаю" % (have, min_reserve))
             return {"ok": True, "have": have, "bought": False}
         lim = money_mod.limits(cfg)
         if not lim.get("buy_enabled"):
-            log("  N+1: резерв=%d, но покупки выключены — пропускаю" % have)
+            log("  N+1: запас=%d, но покупки выключены — пропускаю" % have)
             return {"ok": False, "have": have, "bought": False}
-        log("  N+1: тёплых резервов %d < %d — докупаю в фоне (§6.5)" % (have, min_reserve))
+        log("  N+1: пригодных кандидатов в пуле %d < %d — докупаю в фоне (§6.5)" % (have, min_reserve))
         prov = providers.get("proxy6")
         if prov is None or not prov.caps.get("buy"):
             return {"ok": False, "have": have, "bought": False}
