@@ -33,7 +33,9 @@ PROFILES = {
         ],
         "panel_port": 8443,
         "dnsmasq": False,                  # осознанно выкл (весь трафик через прокси, §7 node1/README)
-        "microsocks": {"port": 1080, "user": "proxyuser", "pass": "CHANGE_ME_SOCKS_PASS"},
+        # SOCKS5 для приложений (:1080). Пароль пусто -> установщик сгенерирует случайный
+        # и сохранит в /etc/microsocks.env (install.sh §8); заглушка в юнит не попадает.
+        "microsocks": {"port": 1080, "user": "proxyuser", "pass": ""},
     },
 }
 

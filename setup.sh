@@ -171,8 +171,10 @@ print(next((o.get("server") or "" for o in c.get("outbounds", []) if o.get("tag"
     /etc/sing-box/config.json 2>/dev/null || true)"
 if [ -z "$UP_NOW" ]; then
     say "Исходящий канал ещё не выбран — включаю прямой выход до настройки провайдера"
+    # boot-скрипт при пустом канале уже поставил прямой маршрут (install.sh §7, снос №4);
+    # сторож/агент здесь заводят автомат в EMERGENCY, чтобы панель и журнал это объясняли.
     /usr/local/bin/singbox-watchdog.sh >/dev/null 2>&1 || true
-    if [ -f /run/vpn-agent-emergency ]; then
+    if ip route show table middleman 2>/dev/null | grep -q '^default via'; then
         ok "устройства выходят напрямую через $SERVER_IP (в панели это «аварийный режим» — норма для нового узла)"
     else
         printf '  \033[1;33m!\033[0m прямой выход не включился сам — сторож включит его в течение 2 минут\n'
@@ -188,6 +190,46 @@ for s in wg-quick@wg0 sing-box vpn-boot-setup vpn-panel; do
 done
 hz="$(curl -sk --max-time 10 "https://127.0.0.1:${PANEL_PORT}/healthz" || true)"
 [ "$hz" = "ok" ] && ok "панель отвечает" || { printf '  \033[1;31m✖\033[0m панель не отвечает\n'; fail=1; }
+
+# SOCKS5 :1080 слушает весь интернет. Проверяем рукопожатием (RFC 1929), что пароль-заглушка
+# из репозитория ОТВЕРГАЕТСЯ, а свой (из /etc/microsocks.env) ПРИНИМАЕТСЯ. Найдено на приёмке
+# снос №4 (15.08): узел, поставленный одной командой, был открытым прокси с паролем с GitHub.
+socks5_auth(){ # port user pass -> печатает accepted|rejected|noauth|down|error
+python3 - "$@" <<'PY'
+import socket, sys
+port, user, pw = int(sys.argv[1]), sys.argv[2].encode(), sys.argv[3].encode()
+try:
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    s.sendall(b"\x05\x01\x02")                       # SOCKS5, метод 2 = логин/пароль
+    r = s.recv(2)
+    if r == b"\x05\x00":
+        print("noauth"); sys.exit(0)                 # пускает вообще без пароля
+    if r != b"\x05\x02":
+        print("error"); sys.exit(0)
+    s.sendall(b"\x01" + bytes([len(user)]) + user + bytes([len(pw)]) + pw)
+    r = s.recv(2)
+    print("accepted" if r == b"\x01\x00" else "rejected")
+except OSError:
+    print("down")
+PY
+}
+MS_PORT="$(sed -n "s/^MICROSOCKS_PORT='\{0,1\}\([0-9]*\)'\{0,1\}$/\1/p" "$WORKDIR/install/params.sh" 2>/dev/null | head -1 || true)"
+MS_PORT="${MS_PORT:-1080}"
+MS_USER=""; MS_PASS=""
+if [ -r /etc/microsocks.env ]; then
+    MS_USER="$(sed -n 's/^MICROSOCKS_USER=//p' /etc/microsocks.env | head -1 | sed 's/^"//; s/"$//' || true)"
+    MS_PASS="$(sed -n 's/^MICROSOCKS_PASS=//p' /etc/microsocks.env | head -1 | sed 's/^"//; s/"$//' || true)"
+fi
+placeholder_res="$(socks5_auth "$MS_PORT" "${MS_USER:-proxyuser}" "CHANGE_ME_SOCKS_PASS" || true)"
+own_res="no-env"
+[ -n "$MS_PASS" ] && own_res="$(socks5_auth "$MS_PORT" "$MS_USER" "$MS_PASS" || true)"
+if [ "$placeholder_res" = "rejected" ] && [ "$own_res" = "accepted" ]; then
+    ok "SOCKS5 :$MS_PORT — свой пароль принят, заглушка из репозитория отвергнута"
+elif [ "$placeholder_res" = "down" ]; then
+    printf '  \033[1;31m✖\033[0m SOCKS5 :%s не отвечает (microsocks: %s)\n' "$MS_PORT" "$(systemctl is-active microsocks 2>/dev/null)"; fail=1
+else
+    printf '  \033[1;31m✖\033[0m SOCKS5 :%s — заглушка: %s, свой пароль: %s (ожидалось rejected/accepted)\n' "$MS_PORT" "$placeholder_res" "$own_res"; fail=1
+fi
 
 # ── 7. Итог ─────────────────────────────────────────────────────────────────
 printf '\n\033[1;36m══════════════════════════════════════════════════════════\033[0m\n'
@@ -216,4 +258,6 @@ fi
 printf '  Профили устройств выдаются в панели: раздел «Кто подключён» →\n'
 printf '  имя устройства → «Выдать доступ» → QR для телефона или файл для компьютера.\n\n'
 printf '  Клиентские конфиги на сервере: /etc/wireguard/clients/\n'
+printf '  SOCKS5-прокси для приложений (по желанию): %s:%s, логин «%s»,\n' "$SERVER_IP" "$MS_PORT" "${MS_USER:-proxyuser}"
+printf '  пароль сгенерирован при установке — смотри /etc/microsocks.env (только root).\n'
 printf '  Повторный запуск этой команды безопасен — узел обновится, ключи сохранятся.\n\n'

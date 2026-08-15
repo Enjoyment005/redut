@@ -171,6 +171,39 @@ class TestPatchBootScript(unittest.TestCase):
         self.assertFalse(apply_mod.patch_boot_script(p + ".missing", "1.1.1.1", "2.2.2.2"))
         self.assertEqual(self._read(p), before)
 
+    # Формат install.sh §7 после сноса №4 (15.08): при пустом UP_HOST boot-скрипт сам ставит
+    # прямой выход (default via шлюз) и флаг аварии — без «чёрной дыры» до тика сторожа.
+    # Ветвление не должно мешать агенту вписывать адрес: только строка UP_HOST="…".
+    BRANCH_FMT = (
+        "#!/bin/bash\n# VPN boot setup — subnet 10.8.0.0/24, upstream %s (сгенерирован install.sh).\n"
+        "UP_HOST=\"%s\"\n"
+        "if [ -n \"$UP_HOST\" ]; then\n"
+        "    ip route replace default dev tun0 table middleman\n"
+        "    ip route replace \"$UP_HOST/32\" via 198.51.100.1 dev ens3\n"
+        "else\n"
+        "    ip route replace default via 198.51.100.1 dev ens3 table middleman\n"
+        "    echo \"$(date '+%%F %%T') boot: канал не выбран — прямой выход\" > /run/vpn-agent-emergency\n"
+        "fi\n"
+        "echo \"[$(date)] vpn-boot-setup completed (upstream: ${UP_HOST:-не выбран, прямой выход})\"\n")
+
+    def test_branching_format_cold_start_touches_only_variable(self):
+        p = self._tmp(self.BRANCH_FMT % ("", ""))
+        self.assertTrue(apply_mod.patch_boot_script(p, "", "5.6.7.8"))
+        got = self._read(p)
+        self.assertIn('UP_HOST="5.6.7.8"\n', got)
+        self.assertEqual(got.count("5.6.7.8"), 1, "адрес вписан ровно один раз — в переменную")
+        self.assertIn('ip route replace "$UP_HOST/32" via 198.51.100.1 dev ens3\n', got,
+                      "строка анти-лупа осталась через переменную (шаблон агента её не трогает)")
+        self.assertIn("default via 198.51.100.1 dev ens3 table middleman", got, "ветка прямого выхода цела")
+        self.assertTrue(got.startswith("#!/bin/bash\n"))
+
+    def test_branching_format_replace_existing_ip(self):
+        p = self._tmp(self.BRANCH_FMT % ("1.1.1.1", "1.1.1.1"))
+        self.assertTrue(apply_mod.patch_boot_script(p, "1.1.1.1", "2.2.2.2"))
+        got = self._read(p)
+        self.assertEqual(got, self.BRANCH_FMT % ("2.2.2.2", "2.2.2.2"))
+        self.assertNotIn("1.1.1.1", got)
+
 
 class TestValidation(unittest.TestCase):
     def test_stage_rejects_bad_host(self):

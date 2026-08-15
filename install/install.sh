@@ -227,7 +227,7 @@ cat > /usr/local/bin/vpn-boot-setup.sh <<BOOT
 # UP_HOST правит агент (apply.patch_boot_script) при смене канала; пусто = канал ещё не выбран.
 UP_HOST="$UP_HOST_EFF"
 
-# 0) фолбэк — поднять wg0, если systemd не поднял его на буте (баг node1)
+# 0) фолбэк — поднять wg0, если systemd не поднял его на буте (случалось на живом узле)
 if ! ip link show wg0 >/dev/null 2>&1; then
     systemctl start wg-quick@wg0 2>/dev/null || wg-quick up wg0 2>/dev/null || true
 fi
@@ -249,19 +249,57 @@ iptables -C FORWARD -o wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o wg0 -
 # ждём tun0 от sing-box (до 30 с)
 for i in \$(seq 1 30); do ip link show tun0 >/dev/null 2>&1 && break; sleep 1; done
 
-ip route replace default dev tun0 table middleman
+if [ -n "\$UP_HOST" ]; then
+    # канал выбран: клиенты -> tun0 -> sing-box -> upstream
+    ip route replace default dev tun0 table middleman
+    # анти-луп: до самого upstream — напрямую через WAN
+    ip route replace "\$UP_HOST/32" via $GW dev $WAN
+else
+    # Канал ещё не выбран (публичная сборка до мастера): в tun0 отправлять некуда, и
+    # раньше после каждой перезагрузки клиенты сидели без сети до первого тика сторожа
+    # (измерено 143 с, снос №4 15.08). Сразу прямой выход адресом сервера + флаг аварийного
+    # режима: сторож при флаге маршрут не «чинит» обратно в мёртвый tun0, агент видит
+    # флаг и не-tun0 — восстанавливать нечего, а из аварии выйдет сам, когда появится канал.
+    ip route replace default via $GW dev $WAN table middleman
+    echo "\$(date '+%F %T') boot: канал не выбран — прямой выход" > /run/vpn-agent-emergency
+fi
 ip route replace $SUBNET dev wg0 table middleman
 ip rule del fwmark 0x64 2>/dev/null || true
 ip rule add fwmark 0x64 lookup middleman priority 100
-# анти-луп: до самого upstream — напрямую через WAN (при пустом UP_HOST строка пропускается)
-[ -n "\$UP_HOST" ] && ip route replace "\$UP_HOST/32" via $GW dev $WAN
 sysctl -q net.ipv4.ip_forward=1
-echo "[\$(date)] vpn-boot-setup completed"
+echo "[\$(date)] vpn-boot-setup completed (upstream: \${UP_HOST:-не выбран, прямой выход})"
 BOOT
 chmod 755 /usr/local/bin/vpn-boot-setup.sh
 
-# ── 8. microsocks (локальный SOCKS5) ─────────────────────────────────────
+# ── 8. microsocks (SOCKS5 для приложений, :1080) ─────────────────────────
+# ИСПРАВЛЕНО 2026-08-15 (снос №4, приёмка публичной сборки): пароль профиля в публичной
+# сборке — заглушка CHANGE_ME_SOCKS_PASS, и она уходила прямо в юнит. Каждый узел,
+# поставленный одной командой, слушал 0.0.0.0:1080 с паролем, опубликованным на GitHub, —
+# открытый SOCKS5 для всего интернета с выходом адресом сервера (проверено снаружи на node1:
+# curl --socks5-hostname <ip>:1080 --proxy-user proxyuser:CHANGE_ME_SOCKS_PASS -> IP сервера).
+# Теперь: заглушка/пусто -> случайный пароль, который переживает повторные установки
+# (/etc/microsocks.env, 0600); юнит читает креды из этого файла (EnvironmentFile), а не из
+# командной строки установщика. Явный пароль профиля (частная сборка) по-прежнему главнее.
 log "8/12 microsocks :$MICROSOCKS_PORT"
+MS_ENV="${MS_ENV:-/etc/microsocks.env}"     # переопределяем только в локальном тесте логики
+MS_USER="${MICROSOCKS_USER:-proxyuser}"
+MS_PASS="${MICROSOCKS_PASS:-}"
+ms_is_placeholder(){ case "$1" in ""|*CHANGE_ME*|*change_me*|*CHANGEME*) return 0;; *) return 1;; esac; }
+if ms_is_placeholder "$MS_PASS"; then
+    # берём уже сгенерированный (повторный прогон), иначе генерим новый
+    if [ -f "$MS_ENV" ]; then
+        MS_PASS="$(sed -n 's/^MICROSOCKS_PASS=//p' "$MS_ENV" | head -1 | sed 's/^"//; s/"$//')"
+    fi
+    if ms_is_placeholder "$MS_PASS"; then
+        MS_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)"
+        [ ${#MS_PASS} -ge 20 ] || die "не сгенерировать пароль SOCKS5 (/dev/urandom?)"
+        log "  пароль SOCKS5 сгенерирован (заглушка профиля не используется) -> $MS_ENV"
+    else
+        log "  пароль SOCKS5 сохранён из $MS_ENV (повторная установка его не меняет)"
+    fi
+fi
+( umask 077; printf 'MICROSOCKS_USER="%s"\nMICROSOCKS_PASS="%s"\n' "$MS_USER" "$MS_PASS" > "$MS_ENV.new" ) \
+    && mv "$MS_ENV.new" "$MS_ENV" && chmod 600 "$MS_ENV" || die "не записать $MS_ENV"
 cat > /etc/systemd/system/microsocks.service <<EOF
 [Unit]
 Description=MicroSOCKS SOCKS5 Proxy
@@ -269,7 +307,9 @@ After=network.target wg-quick@wg0.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/microsocks -i 0.0.0.0 -p $MICROSOCKS_PORT -u $MICROSOCKS_USER -P $MICROSOCKS_PASS
+# логин/пароль — в $MS_ENV (0600); заглушка из репозитория сюда не попадает (install.sh §8)
+EnvironmentFile=$MS_ENV
+ExecStart=/usr/bin/microsocks -i 0.0.0.0 -p $MICROSOCKS_PORT -u \${MICROSOCKS_USER} -P \${MICROSOCKS_PASS}
 Restart=always
 RestartSec=3
 
@@ -331,6 +371,12 @@ echo "  tun0 carrier: $(cat /sys/class/net/tun0/carrier 2>/dev/null || echo none
 echo "  wg peers: $(wg show wg0 peers 2>/dev/null | wc -l)"
 echo "  middleman: $(ip route show table middleman 2>/dev/null | tr '\n' ';')"
 echo "  mangle §11 RETURN: $(iptables -t mangle -S PREROUTING 2>/dev/null | grep -c -- '-j RETURN')"
+# SOCKS5 :1080 слушает весь интернет — пароль-заглушка из репозитория недопустим (снос №4)
+if grep -qi 'CHANGE_ME' /etc/microsocks.env /etc/systemd/system/microsocks.service 2>/dev/null; then
+    echo "  microsocks: ОШИБКА — в кредах SOCKS5 осталась заглушка CHANGE_ME (см. §8)"
+else
+    echo "  microsocks: креды свои (не заглушка), файл /etc/microsocks.env $(stat -c %a /etc/microsocks.env 2>/dev/null)"
+fi
 if [ -n "$UP_HOST_EFF" ]; then
     egress="$(curl -s --max-time 15 --interface tun0 https://api.ipify.org 2>/dev/null || true)"
     echo "  egress(tun0): ${egress:-ПУСТО}  (ждём upstream $UP_HOST_EFF)"

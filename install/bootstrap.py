@@ -277,6 +277,14 @@ def verify(c, p, net, with_panel):
     else:
         warn("MASQUERADE правил: %s (ждали 1)" % masq)
 
+    # SOCKS5 :1080 слушает весь интернет — пароль-заглушка из репозитория недопустим (снос №4, 15.08)
+    ms = run(c, "grep -ci CHANGE_ME /etc/microsocks.env /etc/systemd/system/microsocks.service 2>/dev/null | "
+                "awk -F: '{s+=$2} END{print s+0}'; test -f /etc/microsocks.env && echo env-ok")
+    if "env-ok" in ms and ms.split()[0] == "0":
+        ok("microsocks: креды свои (/etc/microsocks.env, без заглушки)")
+    else:
+        bad("microsocks: заглушка CHANGE_ME в кредах или нет /etc/microsocks.env (%s)" % ms.replace("\n", " "))
+
     if with_panel:
         hz = run(c, "curl -sk --max-time 10 https://127.0.0.1:%d/healthz" % p["panel_port"])
         (ok if "ok" in hz.lower() else bad)("панель /healthz: %s" % (hz or "пусто"))

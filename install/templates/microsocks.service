@@ -4,7 +4,10 @@ After=network.target wg-quick@wg0.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/microsocks -i 0.0.0.0 -p 1080 -u proxyuser -P CHANGE_ME_SOCKS_PASS
+# логин/пароль — в /etc/microsocks.env (0600), пишет install.sh §8:
+# заглушка из репозитория (CHANGE_ME…) в юнит не попадает — генерится случайный пароль
+EnvironmentFile=/etc/microsocks.env
+ExecStart=/usr/bin/microsocks -i 0.0.0.0 -p 1080 -u ${MICROSOCKS_USER} -P ${MICROSOCKS_PASS}
 Restart=always
 RestartSec=3
 
