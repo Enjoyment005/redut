@@ -1,0 +1,13 @@
+[Unit]
+Description=VPN boot setup (iptables, ipset, routes)
+After=network.target wg-quick@wg0.service sing-box.service
+Wants=wg-quick@wg0.service sing-box.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/local/bin/vpn-boot-setup.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

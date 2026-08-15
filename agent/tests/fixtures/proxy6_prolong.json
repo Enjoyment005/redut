@@ -1,0 +1,18 @@
+{
+  "status": "yes",
+  "user_id": "1",
+  "balance": 872.0,
+  "currency": "RUB",
+  "order_id": 778,
+  "price": 120,
+  "price_single": 120,
+  "period": 30,
+  "count": 1,
+  "list": {
+    "40998400": {
+      "id": 40998400,
+      "date_end": "2026-09-20 15:30:00",
+      "unixtime_end": 1790000000
+    }
+  }
+}

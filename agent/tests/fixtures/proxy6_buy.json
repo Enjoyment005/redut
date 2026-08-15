@@ -1,0 +1,28 @@
+{
+  "status": "yes",
+  "user_id": "1",
+  "balance": 900.0,
+  "currency": "RUB",
+  "order_id": 777,
+  "count": 1,
+  "price": 28,
+  "price_single": 28,
+  "period": 7,
+  "country": "fi",
+  "list": {
+    "40998400": {
+      "id": "40998400",
+      "ip": "203.0.113.20",
+      "host": "203.0.113.20",
+      "port": "8000",
+      "user": "buyu",
+      "pass": "buyp",
+      "type": "auto",
+      "date": "2026-08-14 15:30:00",
+      "date_end": "2026-08-21 15:30:00",
+      "unixtime": 1786800600,
+      "unixtime_end": 1787405400,
+      "active": "1"
+    }
+  }
+}

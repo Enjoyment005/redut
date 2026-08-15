@@ -1,0 +1,18 @@
+{
+  "getprice": {
+    "status": "yes", "user_id": "1", "balance": "928.00", "currency": "RUB",
+    "price": 28, "price_single": 28, "period": 7, "count": 1
+  },
+  "getcountry": {
+    "status": "yes", "user_id": "1", "balance": "928.00", "currency": "RUB",
+    "list": ["fi", "de", "nl", "us", "ru", "ua"]
+  },
+  "getcount": {
+    "status": "yes", "user_id": "1", "balance": "928.00", "currency": "RUB",
+    "count": 971
+  },
+  "delete": {
+    "status": "yes", "user_id": "1", "balance": "928.00", "currency": "RUB",
+    "count": 1
+  }
+}

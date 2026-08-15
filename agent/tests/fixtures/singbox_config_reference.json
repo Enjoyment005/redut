@@ -1,0 +1,82 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "proxy-dns",
+        "address": "https://1.1.1.1/dns-query",
+        "detour": "socks-out"
+      }
+    ],
+    "strategy": "ipv4_only",
+    "reverse_mapping": true,
+    "independent_cache": true
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "tun0",
+      "address": [
+        "198.18.0.1/15"
+      ],
+      "auto_route": false,
+      "sniff": true,
+      "sniff_override_destination": true,
+      "sniff_timeout": "500ms"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "socks",
+      "tag": "socks-out",
+      "server": "155.212.40.40",
+      "server_port": 64297,
+      "username": "UPSTREAM_USER",
+      "password": "UPSTREAM_PASS",
+      "version": "5"
+    },
+    {
+      "type": "http",
+      "tag": "http-tg",
+      "server": "155.212.40.40",
+      "server_port": 64296,
+      "username": "UPSTREAM_USER",
+      "password": "UPSTREAM_PASS"
+    },
+    {
+      "type": "dns",
+      "tag": "dns-out"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "protocol": "dns",
+        "outbound": "dns-out"
+      },
+      {
+        "ip_cidr": [
+          "149.154.160.0/20",
+          "91.108.4.0/22",
+          "91.108.8.0/22",
+          "91.108.12.0/22",
+          "91.108.56.0/22",
+          "91.105.192.0/23",
+          "185.76.151.0/24",
+          "95.161.64.0/20"
+        ],
+        "outbound": "http-tg"
+      },
+      {
+        "domain_suffix": [
+          "telegram.org", "t.me", "telegram.me", "telegra.ph",
+          "telegram-cdn.org", "tdesktop.com", "telesco.pe"
+        ],
+        "outbound": "http-tg"
+      }
+    ]
+  }
+}

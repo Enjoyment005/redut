@@ -1,0 +1,29 @@
+# ── секреты: никогда не коммитить ──────────────────────────────────────────
+servers.json
+*secrets*.json
+!*secrets*.example.json
+profiles.json
+config.local.json
+*.key
+*.pem
+*.crt
+
+# клиентские профили содержат приватные ключи устройств
+install/clients/
+*.conf
+!templates/*.conf
+
+# ── питон ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# ── прочее ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.log
+*.db
+.idea/
+.vscode/

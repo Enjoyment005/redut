@@ -1,0 +1,19 @@
+[Unit]
+Description=sing-box TUN proxy with SNI sniffing
+After=network.target wg-quick@wg0.service
+Wants=wg-quick@wg0.service
+# Никогда не сдаваться при рестартах (причина краша устранена в ExecStartPre)
+StartLimitIntervalSec=0
+
+[Service]
+# SELF-HEAL: снять осиротевший tun0 ДО старта -> ошибка 'file exists' невозможна
+ExecStartPre=-/usr/sbin/ip link delete tun0
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+# SELF-HEAL: дождаться tun0 и вернуть default-маршрут в таблицу middleman
+ExecStartPost=/usr/local/bin/singbox-post.sh
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,54 @@
+{
+  "count": 2,
+  "next": null,
+  "previous": null,
+  "results": [
+    {
+      "id": 12345,
+      "ip": "11.22.33.44",
+      "internal_ip": null,
+      "port_http": 10000,
+      "port_socks5": 10001,
+      "user": "username",
+      "username": "username",
+      "password": "password",
+      "order_id": 123,
+      "type": "1",
+      "ip_version": 4,
+      "country": "ru",
+      "date": "2022-09-10 11:48:15.355913+00:00",
+      "date_end": "2022-09-15T14:48:15.355913+03:00",
+      "tags": [
+        {
+          "id": 123,
+          "name": "tag 1"
+        }
+      ],
+      "access_ips": [
+        {
+          "id": 1,
+          "value": "44.44.44.0/24",
+          "name": "optional name"
+        }
+      ]
+    },
+    {
+      "id": 12346,
+      "ip": "11.22.33.45",
+      "internal_ip": null,
+      "port_http": 10000,
+      "port_socks5": 10001,
+      "user": "username2",
+      "username": "username2",
+      "password": "password2",
+      "order_id": 123,
+      "type": "2",
+      "ip_version": 4,
+      "country": "de",
+      "date": "2022-09-10 11:48:15.355913+00:00",
+      "date_end": "2022-09-15T14:48:15.355913+03:00",
+      "tags": [],
+      "access_ips": []
+    }
+  ]
+}
