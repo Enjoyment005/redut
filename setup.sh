@@ -189,7 +189,18 @@ for s in wg-quick@wg0 sing-box vpn-boot-setup vpn-panel; do
     if [ "$st" = "active" ]; then ok "$s"; else printf '  \033[1;31m✖\033[0m %s: %s\n' "$s" "$st"; fail=1; fi
 done
 hz="$(curl -sk --max-time 10 "https://127.0.0.1:${PANEL_PORT}/healthz" || true)"
-[ "$hz" = "ok" ] && ok "панель отвечает" || { printf '  \033[1;31m✖\033[0m панель не отвечает\n'; fail=1; }
+if [ "$hz" = "ok" ]; then
+    ok "панель отвечает по HTTPS"
+else
+    # Различаем «мертва» и «поднялась без TLS» (снос №6): пароль/2FA по HTTP недопустимы
+    hp="$(curl -s --max-time 8 "http://127.0.0.1:${PANEL_PORT}/healthz" 2>/dev/null || true)"
+    if [ "$hp" = "ok" ]; then
+        printf '  \033[1;31m✖\033[0m панель работает по HTTP без TLS — пароль/2FA шли бы открытым текстом (сертификат не выпущен до старта)\n'
+    else
+        printf '  \033[1;31m✖\033[0m панель не отвечает\n'
+    fi
+    fail=1
+fi
 
 # SOCKS5 :1080 слушает весь интернет. Проверяем рукопожатием (RFC 1929), что пароль-заглушка
 # из репозитория ОТВЕРГАЕТСЯ, а свой (из /etc/microsocks.env) ПРИНИМАЕТСЯ. Найдено на приёмке

@@ -195,6 +195,17 @@ def install_units(with_panel):
         sh("systemctl restart vpn-panel")
 
 
+def _panel_https_ok(port, tries=6):
+    """Панель отвечает 'ok' по HTTPS на /healthz? (проверка TLS после старта, снос №6)."""
+    import time
+    for _ in range(tries):
+        out = sh("curl -sk --max-time 5 https://127.0.0.1:%d/healthz" % port)
+        if out.strip() == "ok":
+            return True
+        time.sleep(1)
+    return False
+
+
 def install_crons():
     cur = sh("crontab -l 2>/dev/null")
     keep = [ln for ln in cur.splitlines()
@@ -233,13 +244,26 @@ def main():
     print("  скопировано файлов: %d" % n)
     write_config(a.name, net, a.port, a.subnet, a.wg_port, a.dnsmasq)
     fresh = ensure_secrets()
+
+    # СЕРТИФИКАТ — ДО старта панели (исправлено 15.08, снос №6). Раньше cert выпускался ПОСЛЕ
+    # install_units, и на чистой установке панель успевала подняться без panel.crt -> уходила
+    # в HTTP-фолбэк («работаю без TLS»): пароль и TOTP шли открытым текстом, а verify по https
+    # не отвечал. Теперь cert есть до первого старта, панель всегда поднимается по HTTPS.
+    fp = ensure_cert(net["server_ip"], a.regen_cert) if with_panel else ""
+
     install_units(with_panel)
     install_crons()
     sh("vpn-agent pool-refresh >/dev/null 2>&1")   # создать БД
 
-    fp = ensure_cert(net["server_ip"], a.regen_cert) if with_panel else ""
     if with_panel:
-        print("  панель: %s" % sh("systemctl is-active vpn-panel"))
+        # Страховка от гонки старта: панель должна отвечать по HTTPS. Если поднялась по HTTP
+        # (cert появился в момент старта) — один рестарт, теперь cert гарантированно на месте.
+        if not _panel_https_ok(a.port):
+            print("  панель поднялась без TLS — перезапускаю с сертификатом")
+            sh("systemctl restart vpn-panel")
+            _panel_https_ok(a.port, tries=10)
+        print("  панель: %s (%s)" % (sh("systemctl is-active vpn-panel"),
+                                     "https ok" if _panel_https_ok(a.port) else "TLS НЕ поднялся"))
     print(json.dumps({"panel_port": a.port, "server_ip": net["server_ip"],
                       "cert_fp": fp, "fresh_setup": fresh}, ensure_ascii=False))
     return 0

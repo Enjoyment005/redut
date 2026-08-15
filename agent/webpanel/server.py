@@ -902,6 +902,14 @@ def _pulse_monitor():
             print("pulse-monitor: %s" % e, file=sys.stderr)
 
 
+def requires_tls(cfg):
+    """Боевой узел (в конфиге внешний server_ip) обязан работать по HTTPS — HTTP-фолбэк только
+    для локальной разработки (server_ip пуст или loopback). Снос №6: без этого панель на чистой
+    установке молча уходила в HTTP при гонке выпуска сертификата."""
+    server_ip = str((cfg or {}).get("server_ip") or "").strip()
+    return bool(server_ip) and not server_ip.startswith("127.") and server_ip != "::1"
+
+
 def main():
     global APP
     APP = App()
@@ -911,12 +919,27 @@ def main():
               "провайдер, 2FA, пароль, почта)" % port, file=sys.stderr)
     threading.Thread(target=_pulse_monitor, daemon=True).start()   # §6.3 пульс агента
     httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    # На РЕАЛЬНОМ узле (в конфиге прописан внешний server_ip) панель обязана работать по HTTPS:
+    # пароль и TOTP не должны идти открытым текстом. При гонке старта (установщик ещё выпускает
+    # cert) коротко подождём его появления, и только dev-запуск без server_ip уходит в HTTP.
+    # Найдено на приёмке 15.08 (снос №6): cert выпускался после старта -> панель молча на HTTP.
+    on_server = requires_tls(APP.cfg)
+    if on_server and not (os.path.isfile(CERT) and os.path.isfile(KEY)):
+        for _ in range(20):
+            time.sleep(0.5)
+            if os.path.isfile(CERT) and os.path.isfile(KEY):
+                break
     if os.path.isfile(CERT) and os.path.isfile(KEY):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(CERT, KEY)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         scheme = "https"
+    elif on_server:
+        # cert так и не появился, но это боевой узел — HTTP недопустим, лучше упасть (systemd
+        # перезапустит через RestartSec, а установщик к тому времени выпустит cert).
+        sys.exit("НЕТ %s на боевом узле (server_ip=%s) — отказываюсь работать без TLS"
+                 % (CERT, APP.cfg.get("server_ip")))
     else:
         scheme = "http"
         print("⚠️ Нет %s — работаю без TLS (только для локального теста!)" % CERT, file=sys.stderr)
