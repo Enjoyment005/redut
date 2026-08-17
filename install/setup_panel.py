@@ -67,10 +67,11 @@ DEFAULTS = {
     },
     "countries": {
         "blacklist": [],
-        "whitelist": ["fi", "ee", "lv", "lt", "se", "de", "nl", "pl", "cz",
-                      "at", "ch", "gb", "fr", "it", "es", "us", "ca"],
+        # белого списка больше нет (приёмка №7): страны оценивает внутренний рейтинг,
+        # вручную можно купить любую вне чёрного списка; старый ключ whitelist
+        # в конфигах существующих узлов игнорируется.
         # насколько сильно страна влияет на выбор; переключается в панели
-        # (country.STRATEGIES: whitelist | reputation | balanced | speed)
+        # (country.STRATEGIES: reputation | balanced | speed)
         "strategy": "reputation",
     },
     "auto_prolong": {"enabled": True, "days_before": 3, "period_days": 30},

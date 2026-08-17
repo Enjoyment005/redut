@@ -576,12 +576,14 @@ class Handler(BaseHTTPRequestHandler):
     def _market(self, qs):
         """§12 GET /api/market: что и почём доступно (getcountry+getprice PROXY6).
 
-        Per-country getcount не гоняем (17 стран × троттлинг — долго): наличие
-        берём из getcountry, точный count по стране считает уже поток покупки."""
+        Белого списка больше нет (приёмка №7): отдаём ВСЕ страны провайдера, кроме
+        чёрного списка, — человек вручную волен купить любую. Сортировка внутренним
+        рейтингом (money.rank_countries), к каждой стране — её оценка для пометки
+        в списке. Per-country getcount не гоняем (много стран × троттлинг — долго):
+        наличие берём из getcountry, точный count считает уже поток покупки."""
         prov = APP.providers.get("proxy6")
         lim = money_mod.limits(APP.cfg)
-        wl = money_mod.whitelist(APP.cfg)
-        out = {"whitelist": wl, "limits": lim, "available": [], "price": None}
+        out = {"limits": lim, "available": [], "price": None}
         if prov is None:
             out["error"] = "нет ключа PROXY6"
             return out
@@ -589,8 +591,11 @@ class Handler(BaseHTTPRequestHandler):
         period = int((qs.get("period") or [str(lim["buy_period_days"])])[0])
         out["version"], out["period"] = version, period
         try:
-            avail = set(prov.getcountry(version))
-            out["available"] = [cc for cc in wl if cc in avail]
+            avail = prov.getcountry(version)
+            with _DB_LOCK:   # F8: rank_countries читает выученную стабильность
+                ranked = money_mod.rank_countries(avail, APP.cfg, pool=APP.pool)
+            out["available"] = [{"cc": cc, "tier": country_mod.tier(cc, True, APP.cfg)}
+                                for cc in ranked]
         except ProviderError as e:
             out["country_error"] = str(e)
         try:
@@ -849,13 +854,11 @@ class Handler(BaseHTTPRequestHandler):
             out.append({"id": sid, "title": st["title"], "short": st["short"], "desc": st["desc"],
                         "current": sid == country_mod.strategy(APP.cfg),
                         "buy": buy[:8], "buy_total": len(buy),
-                        "buy_mode": ("whitelist" if st.get("only_whitelist") else
-                                     "gated" if st.get("auto_gate") else "open"),
+                        "buy_mode": ("gated" if st.get("auto_gate") else "open"),
                         "pool_pass": pool_pass,
                         "pool_block": [c for c in pool_cc if c not in pool_pass],
                         "pick": pick})
         return {"current": country_mod.strategy(APP.cfg), "strategies": out,
-                "whitelist": country_mod.whitelist(APP.cfg),
                 "blacklist": sorted(country_mod.blacklist(APP.cfg)),
                 "pool_size": len(rows)}
 
@@ -1048,7 +1051,6 @@ class Handler(BaseHTTPRequestHandler):
         if prov is None:
             return self._json(400, {"error": "нет ключа PROXY6 — покупка недоступна"})
         lim = money_mod.limits(APP.cfg)
-        wl = money_mod.whitelist(APP.cfg)
         country = str(body.get("country") or "").strip().lower()
         # чёрный список — «нет» всегда; страна с низкой оценкой — можно, но человек
         # должен видеть, на что идёт (предупреждение уедет в ответ и в журнал).
@@ -1376,9 +1378,7 @@ class Handler(BaseHTTPRequestHandler):
         out = {"server": APP.cfg.get("server"), "role": APP.cfg.get("role"),
                "version": update_mod.node_version(),
                "subnet": APP.cfg.get("subnet"), "final": (sb.get("route") or {}).get("final"),
-               "singbox": "?", "upstream": {}, "balances": {}, "egress": None,
-               # белый список стран — дашборд предупреждает, если выход идёт мимо него
-               "cc_whitelist": (APP.cfg.get("countries") or {}).get("whitelist") or []}
+               "singbox": "?", "upstream": {}, "balances": {}, "egress": None}
         for o in sb.get("outbounds", []):
             if o.get("tag") == "socks-out":
                 out["upstream"]["socks_out"] = "%s:%s %s" % (o.get("server"), o.get("server_port"), o.get("type"))
@@ -1439,12 +1439,10 @@ class Handler(BaseHTTPRequestHandler):
         # подпись страны — глазами АКТИВНОЙ стратегии (приёмка №7): под «скорость
         # и отклик» страна на оценку не влияет, и тревожный бейдж «спорная» врал бы
         st_info = country_mod.strategy_info(APP.cfg)
-        if st_info["only_whitelist"] and cc and country_mod.norm(cc) not in country_mod.whitelist(APP.cfg):
-            cc_mode = "wl_out"     # вне избранных: штраф −60, автоматика сама не купит
-        elif not st_info["country_first"] and not st_info["weight"]:
+        if not st_info["country_first"] and not st_info["weight"]:
             cc_mode = "ignored"    # «скорость и отклик»: решают только замеры
         else:
-            cc_mode = "rated"      # репутация/баланс/внутри избранных — обычный бейдж
+            cc_mode = "rated"      # репутация/баланс — обычный бейдж по рейтингу
         return {"uid": r["uid"], "provider": r["provider"], "country": r["country"],
                 "provider_active": r["provider"] in APP.providers,
                 "host": r["host"], "port_socks5": r["port_socks5"], "port_http": r["port_http"],

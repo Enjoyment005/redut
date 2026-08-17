@@ -146,20 +146,24 @@ class TestBuyRanking(unittest.TestCase):
         return {"countries": {"whitelist": list(whitelist), "strategy": strategy}}
 
     def test_bonus_reorders_equal_countries(self):
-        # fi и de обе trusted (+25); выученная надёжность de поднимает её выше fi
+        # fi и de обе trusted (+25); выученная надёжность de поднимает её на верх
+        # внутреннего порядка, а провальная история fi роняет её ниже прочих trusted
         self.seed("de", ok=1000, fail=0, days=60)
         self.seed("fi", ok=300, fail=700, days=60)
         out = money.buy_candidates(self.cfg(), pool=self.pool)
-        self.assertEqual(out, ["de", "fi"])
+        self.assertEqual(out[0], "de")
+        self.assertLess(out.index("de"), out.index("fi"))
 
     def test_without_pool_order_unchanged(self):
+        # без пула порядок задаёт внутренний рейтинг + близость (fi раньше de)
         out = money.buy_candidates(self.cfg())
-        self.assertEqual(out, ["fi", "de"], "без пула — прежнее поведение")
+        self.assertLess(out.index("fi"), out.index("de"))
+        self.assertEqual(out[0], "fi")
 
     def test_learning_pair_does_not_move(self):
         self.seed("de", ok=50, fail=0, days=3)      # мало данных — бонус 0
         out = money.buy_candidates(self.cfg(), pool=self.pool)
-        self.assertEqual(out, ["fi", "de"])
+        self.assertLess(out.index("fi"), out.index("de"))
 
     def test_bonus_cannot_beat_blacklist(self):
         self.seed("ru", ok=100000, fail=0, days=600)

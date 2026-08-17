@@ -40,7 +40,7 @@ class TestParity(unittest.TestCase):
     """score() после живой пробы и score_from_row() на одинаковых входах совпадают."""
 
     def test_same_inputs_same_score(self):
-        for strat in ("whitelist", "reputation", "balanced", "speed"):
+        for strat in ("reputation", "balanced", "speed"):
             cfg = cfg_strategy(strat)
             row_pre = {"fail_count": 0, "kind": "dedicated", "ip_version": 4,
                        "date_end": _in(10), "country": "fi"}
@@ -140,7 +140,7 @@ class TestRankConsistency(unittest.TestCase):
 
     def test_blacklist_dropped_everywhere(self):
         bad = make_row(uid="proxy6:ru", host="5.5.5.5", exit_cc="ru", country="ru")
-        for strat in ("whitelist", "reputation", "balanced", "speed"):
+        for strat in ("reputation", "balanced", "speed"):
             got = [r["uid"] for r in states.rank_candidates(self.rows() + [bad],
                                                             cfg_strategy(strat))]
             self.assertNotIn("proxy6:ru", got, strat)

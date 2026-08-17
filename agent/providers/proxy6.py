@@ -277,7 +277,8 @@ class Proxy6(Provider):
     def buy(self, count, period, country, version=4, descr=None, allow_cc=None):
         """Покупка прокси. ВСЯ валидация — ДО обращения к API (§15).
 
-        allow_cc — белый список стран (из config.json); None -> DEFAULT_WHITELIST_CC.
+        allow_cc — необязательное сужение списка стран (None — любая вне чёрного
+        списка: пользовательского «белого списка» больше нет, приёмка №7).
         auto_prolong НЕ передаём никогда (§6.2: продлением управляет агент осознанно).
         Возврат: dict(proxies=[norm], order_id, price, price_single, count, period,
                        country, balance, currency).

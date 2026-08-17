@@ -98,10 +98,13 @@ class Base(unittest.TestCase):
 
 
 class TestConfig(Base):
-    def test_whitelist_strips_blacklisted(self):
-        wl = money.whitelist(cfg())
-        self.assertIn("fi", wl)
-        self.assertNotIn("ru", wl, "чёрный список вычищается из предпочитаемых (§6.1)")
+    def test_market_ranking_strips_blacklisted(self):
+        # «что в продаже» для человека: всё, кроме чёрного списка (белого нет)
+        market = money.rank_countries(["fi", "ru", "ng"], cfg())
+        self.assertIn("fi", market)
+        self.assertIn("ng", market, "рискованную страну руками купить можно")
+        self.assertNotIn("ru", market, "чёрный список вычищается всегда (§6.1)")
+        self.assertEqual(market[0], "fi", "порядок — внутренний рейтинг")
 
     def test_buy_candidates_ranked_by_rating(self):
         """Порядок покупки задаёт умная оценка: надёжные страны раньше рискованных,

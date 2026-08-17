@@ -184,7 +184,7 @@ class TestStrategyPreviewNoNetwork(unittest.TestCase):
 
         try:
             st = H()._strategy_state()
-            self.assertEqual(len(st["strategies"]), 4)
+            self.assertEqual(len(st["strategies"]), 3)
             self.assertEqual(st["pool_size"], 1)
         finally:
             urllib.request.urlopen, subprocess.run = saved

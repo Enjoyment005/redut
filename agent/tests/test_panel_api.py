@@ -234,8 +234,7 @@ class TestStrategyPreview(_AppHarness):
     def test_picks_follow_strategy(self):
         st = self.state()
         self.assertEqual(self.by_id(st, "speed")["pick"]["host"], "10.0.0.1")
-        for sid in ("reputation", "whitelist"):
-            self.assertEqual(self.by_id(st, sid)["pick"]["host"], "10.0.0.2", sid)
+        self.assertEqual(self.by_id(st, "reputation")["pick"]["host"], "10.0.0.2")
 
     def test_current_channel_participates(self):
         # боевой канал — лучший по скорости: speed обязан сказать «останется текущий»,
@@ -252,11 +251,9 @@ class TestStrategyPreview(_AppHarness):
     def test_buy_modes_and_pool_gate_differ(self):
         st = self.state()
         modes = {s["id"]: s["buy_mode"] for s in st["strategies"]}
-        self.assertEqual(modes, {"whitelist": "whitelist", "reputation": "gated",
-                                 "balanced": "open", "speed": "open"})
+        self.assertEqual(modes, {"reputation": "gated", "balanced": "open", "speed": "open"})
         self.assertIn("ng", self.by_id(st, "reputation")["pool_block"])
         self.assertIn("ng", self.by_id(st, "balanced")["pool_pass"])
-        self.assertIn("ng", self.by_id(st, "whitelist")["pool_block"])
 
     def test_buy_capped_but_total_reported(self):
         st = self.state()
@@ -290,10 +287,6 @@ class TestPoolRowStrategyBadge(_AppHarness):
         self.assertEqual(self.row("speed")["cc_mode"], "ignored")
         # даже спорная строка под speed не тревожит: спор на оценку не влияет
         self.assertEqual(self.row("speed", agree=0)["cc_mode"], "ignored")
-
-    def test_whitelist_marks_outsiders(self):
-        self.assertEqual(self.row("whitelist", cc="tw")["cc_mode"], "wl_out")
-        self.assertEqual(self.row("whitelist", cc="de")["cc_mode"], "rated")
 
     def test_reputation_and_balanced_keep_tier(self):
         self.assertEqual(self.row("reputation")["cc_mode"], "rated")

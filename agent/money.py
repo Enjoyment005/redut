@@ -127,34 +127,43 @@ def limits(cfg):
     return m
 
 
-def whitelist(cfg):
-    """Предпочитаемые страны трат — «начни отсюда», НЕ жёсткий фильтр (с 2026-08-15).
+def rank_countries(available, cfg, pool=None, provider="proxy6"):
+    """«Что в продаже» глазами ЧЕЛОВЕКА: всё, кроме чёрного списка.
 
-    Исключение — стратегия «только избранные» (17.08): при ней этот же список работает
-    как фильтр покупок, поэтому источник у него один — country.whitelist (там же
-    вычищается чёрный список, §6.1). Провайдер проверит ещё раз.
-    """
-    return country_mod.whitelist(cfg)
+    Белого списка больше нет (приёмка №7): человек вручную может купить любую
+    страну из продажи. Сортировка — внутренним рейтингом системы (репутация +
+    выученная стабильность F8), при равном рейтинге ближние к РФ первыми
+    (providers.base.DEFAULT_COUNTRY_ORDER). Никакого auto-гейта: он только
+    для автоматики (см. buy_candidates)."""
+    from providers.base import DEFAULT_COUNTRY_ORDER
+    order = {c: i for i, c in enumerate(DEFAULT_COUNTRY_ORDER)}
+    out = []
+    for cc in {country_mod.norm(x) for x in (available or [])}:
+        if not cc:
+            continue
+        r = country_mod.rating(cc, True, cfg)
+        if r is None:
+            continue                    # чёрный список — единственный фильтр
+        b = 0.0
+        if pool is not None:
+            b = stability_bonus(pool.stability_get(provider, cc), cfg)
+        out.append((-(r + b), order.get(cc, len(order)), cc))
+    return [c for _, _, c in sorted(out)]
 
 
 def buy_candidates(cfg, available=None, pool=None, provider="proxy6"):
-    """Порядок перебора стран при авто-покупке.
+    """Порядок перебора стран при АВТО-покупке.
 
-    Сначала предпочитаемые из конфига, затем всё остальное, что есть у провайдера,
-    и всё это пересортировано умной оценкой. Страны с оценкой ниже порога автоматика
-    сама не покупает — их берут только по явной просьбе человека.
-
-    Что именно отсеет `auto_allowed` и как сильно перемешается список, решает
-    выбранная стратегия стран (country.STRATEGIES): «только избранные» оставит здесь
-    ровно `countries.whitelist`, «скорость» не переставит ничего и не отсеет никого,
-    кроме чёрного списка. Сам порядок «предпочитаемые вперёд» осмыслен и без стратегий:
-    список по умолчанию отсортирован по возрастанию задержки из РФ.
+    Кандидаты — внутренний порядок предпочтения системы (ближние к РФ первыми,
+    providers.base.DEFAULT_COUNTRY_ORDER) плюс страны провайдера, пересортированные
+    умной оценкой. Страны с оценкой ниже порога автоматика сама не покупает — их
+    берут только по явной просьбе человека (rank_countries + POST /api/buy).
 
     pool (F8): при переданном пуле к рейтингу страны добавляется бонус выученной
     стабильности пары (provider, страна). Приоритеты не переопределяются: чёрный
     список (rating is None) отсекается ДО бонуса, auto_allowed бонусом не обходится.
     """
-    pref = whitelist(cfg)
+    pref = country_mod.preference_order(cfg)
     rest = [c for c in (available or []) if c not in pref]
     out = []
     for i, cc in enumerate(list(pref) + list(rest)):
@@ -192,14 +201,13 @@ def gen_descr(server, now=None):
 def preflight_buy(pool, provider, cfg, *, country, period=None, count=1, version=None,
                   auto=True):
     """Все гейты §6.2 ДО траты. -> dict(price, currency, balance_before, period,
-    version, count, country, whitelist). Отказ -> SpendDenied (ничего не потрачено).
+    version, count, country). Отказ -> SpendDenied (ничего не потрачено).
 
     `auto=True` — покупает автоматика: разрешены только страны с оценкой не ниже
     порога (country.MIN_AUTO_RATING). `auto=False` — человек выбрал страну руками:
     пропускаем всё, кроме чёрного списка, но причину пишем в журнал вызывающего.
     """
     lim = limits(cfg)
-    wl = whitelist(cfg)
     period = int(period or lim["buy_period_days"])
     version = int(version if version is not None else lim["buy_version"])
     count = int(count)
@@ -245,7 +253,7 @@ def preflight_buy(pool, provider, cfg, *, country, period=None, count=1, version
                           % (bal_before, price, lim["min_balance_reserve"], currency))
     return {"price": price, "currency": currency, "balance_before": bal_before,
             "period": period, "version": version, "count": count,
-            "country": country, "whitelist": wl}
+            "country": country}
 
 
 def plan_and_buy(pool, provider, cfg, *, country, period=None, count=1, version=None,

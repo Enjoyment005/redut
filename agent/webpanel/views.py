@@ -284,7 +284,8 @@ _DASH_HTML = """
       ⚪ нейтральная, ⚠️ рискованная (банки и платёжки часто просят подтверждения),
       ❓ спорная (базы геолокации не сошлись — для сайтов «страна скачет»).
       Подпись живёт по выбранной стратегии: при «Скорость и отклик» страна на оценку не влияет —
-      панель так и пишет («не влияет»), при «Только избранных» помечает страны вне твоего списка.
+      панель так и пишет («не влияет»). Оценка — внутренняя, списков «избранных» больше нет:
+      вручную можно купить любую страну, кроме запрещённых.
       <b>Россия, Украина и Беларусь запрещены навсегда</b> — такие прокси не покупаются и не используются.
       Страны с плохой оценкой автоматика сама не покупает, но ты можешь выбрать любую вручную.</div>
     <div class="scroll"><table id="pool"><thead><tr>
@@ -490,13 +491,12 @@ function tierBadge(t,hint){const d=TIER[t]||TIER.neutral;
   return '<span class="pill'+(t=='trusted'||t=='good'?' ok':(t=='risky'||t=='blocked'?' bad':(t=='disputed'?' warn':'')))+
     '" title="'+esc(hint||'')+'">'+d[0]+' '+d[1]+'</span>'}
 /* подпись страны глазами АКТИВНОЙ стратегии (приёмка №7): при «Скорость и отклик»
-   страна на оценку не влияет — тревожить «спорной» не за что; при «только избранных»
-   главное — в списке страна или нет. Оценка самой страны остаётся в подсказке. */
+   страна на оценку не влияет — тревожить «спорной» не за что. Оценка самой страны
+   (внутренний рейтинг) остаётся в подсказке. */
 function ccBadge(p){
   if(p.cc_mode==='ignored')return '<span class="pill" style="opacity:.55" title="'+
     esc('стратегия «Скорость и отклик»: страна в оценке не участвует, решают замеры. Для справки: '+(p.cc_hint||''))+
     '">⏱ не влияет</span>';
-  if(p.cc_mode==='wl_out')return '<span class="pill warn" title="'+esc(p.cc_hint||'')+'">✂ вне избранных</span>';
   return tierBadge(p.cc_tier,p.cc_hint)}
 function ccWarn(s){const t=s.cc_tier;
   if(t!=='risky'&&t!=='disputed')return '';
@@ -699,13 +699,14 @@ function apTile(){const a=(window.__S||{}).auto_prolong;
 async function market(){toast('Спрашиваю провайдера, что есть в продаже…');try{const m=await api('/api/market');window.__MARKET=m;const box=document.getElementById('marketbox');
   const pr=m.price?('цена '+m.price.price+' '+m.price.currency+' за 1 шт × '+m.period+' дн · баланс '+m.price.balance):(m.price_error||'цена недоступна');
   box.textContent=(m.country_error?('рынок недоступен ('+m.country_error+') · '):
-    ('Доступные страны ('+(m.available||[]).length+'): '+((m.available||[]).join(', ')||'—')+' · '))+pr;
+    ('Доступные страны ('+(m.available||[]).length+'): '+((m.available||[]).map(a=>country(a.cc)).join(', ')||'—')+' · '))+pr;
   fillBuyCC();
   toast('Список обновлён','ok')}catch(e){toast(e.message,'bad')}}
 
-/* ── форма покупки (A5): select из белого списка + свободный фолбэк ──
-   Опции — белый список (после «Что есть в продаже» помечаются доступные);
-   при недоступном рынке — полный словарь стран минус чёрный список;
+/* ── форма покупки (приёмка №7): белого списка больше нет ──
+   Опции — ВСЕ страны провайдера в продаже (кроме чёрного списка), отранжированы
+   внутренним рейтингом на сервере, с пометкой оценки (✅/🟢/⚪/⚠️);
+   пока рынок не спрошен или недоступен — полный словарь стран минус чёрный список;
    «другая страна…» открывает свободный ввод (сервер валидирует сам). */
 function buyccChange(sel){document.getElementById('buyccfreebox').style.display=(sel.value==='__other__')?'':'none'}
 function fillBuyCC(){const s=window.__S||{};const m=window.__MARKET||null;
@@ -713,13 +714,15 @@ function fillBuyCC(){const s=window.__S||{};const m=window.__MARKET||null;
   if(document.activeElement===sel)return; /* не пересобирать открытый список под руками (loadStatus идёт каждые 30 с) */
   const cur=sel.value;
   const bl=new Set(s.cc_blacklist||[]);
-  let list=(s.cc_whitelist||[]).filter(c=>!bl.has(c));
-  let suffix='';
-  if(m&&m.country_error){list=Object.keys(CC).filter(c=>!bl.has(c));suffix=' · рынок недоступен, страна не проверена'}
-  const avail=(m&&!m.country_error)?new Set(m.available||[]):null;
+  let list,suffix='';const tiers={};
+  if(m&&!m.country_error&&(m.available||[]).length){
+    list=(m.available||[]).map(a=>{tiers[a.cc]=a.tier;return a.cc}).filter(c=>!bl.has(c))}
+  else{list=Object.keys(CC).filter(c=>!bl.has(c));
+    if(m&&m.country_error)suffix=' · рынок недоступен, страна не проверена'}
   const opts=['<option value="">— панель выберет сама —</option>'];
-  for(const c of list)opts.push('<option value="'+esc(c)+'"'+(cur===c?' selected':'')+'>'+
-    esc(country(c))+(avail&&avail.has(c)?' · есть в продаже':'')+esc(suffix)+'</option>');
+  for(const c of list){const t=TIER[tiers[c]];
+    opts.push('<option value="'+esc(c)+'"'+(cur===c?' selected':'')+'>'+
+      esc(country(c))+(t?(' '+t[0]):'')+esc(suffix)+'</option>')}
   opts.push('<option value="__other__"'+(cur==='__other__'?' selected':'')+'>другая страна…</option>');
   sel.innerHTML=opts.join('')}
 
@@ -757,10 +760,9 @@ async function loadStrategy(){try{const r=await api('/api/strategy');
     const names=a=>(a||[]).map(country).join(', ');
     const more=(s.buy_total||0)>(s.buy||[]).length?' и ещё '+(s.buy_total-(s.buy||[]).length):'';
     let buy;
-    if(s.buy_mode==='whitelist')buy='докупать — строго из избранных ('+(s.buy_total||0)+' стран): '+(names(s.buy)||'—')+more;
-    else if(s.buy_mode==='gated')buy='докупать — только в надёжных: '+(names(s.buy)||'—')+more+
-      (s.pool_block&&s.pool_block.length?'; страны пула '+names(s.pool_block)+' сама не купит':'');
-    else buy='докупать можно везде, кроме запрещённых'+
+    if(s.buy_mode==='gated')buy='сама докупает только надёжные: '+(names(s.buy)||'—')+more+
+      (s.pool_block&&s.pool_block.length?'; страны пула '+names(s.pool_block)+' сама не купит (вручную — можно)':'');
+    else buy='сама докупает везде, кроме запрещённых'+
       (s.pool_pass&&s.pool_pass.length?' — страны пула ('+names(s.pool_pass)+') разрешены':'')+
       '; сначала пробует: '+(names((s.buy||[]).slice(0,4))||'—');
     const pick=s.pick?(esc(s.pick.host)+(s.pick.cc?(' · '+country(s.pick.cc)):'')+
