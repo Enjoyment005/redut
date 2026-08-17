@@ -815,7 +815,7 @@ def main(argv=None):
     sp = sub.add_parser("rollback", help="откат на бэкап из кольца")
     sp.add_argument("--backup", help="конкретный файл кольца (дефолт: самый свежий)")
     sp = sub.add_parser("buy", help="⚠️ купить прокси (PROXY6, деньги §6.2)")
-    sp.add_argument("--country", help="страна iso2 из белого списка (по умолч. — первая доступная)")
+    sp.add_argument("--country", help="страна iso2, любая вне чёрного списка (по умолч. — лучшая по рейтингу)")
     sp.add_argument("--period", type=int, help="период, дней (дефолт из config.money.buy_period_days)")
     sp.add_argument("--dry-run", action="store_true", help="показать рынок+гейты, не покупать")
     sp.add_argument("--yes", action="store_true", help="подтвердить РЕАЛЬНУЮ трату")
