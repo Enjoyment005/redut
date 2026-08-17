@@ -224,6 +224,10 @@ put_tpl "$TPL/singbox-post.sh"      /usr/local/bin/singbox-post.sh            07
 put_tpl "$TPL/singbox-watchdog.sh"  /usr/local/bin/singbox-watchdog.sh        0755
 put_tpl "$TPL/vpn-boot-setup.service" /etc/systemd/system/vpn-boot-setup.service 0644
 
+# Гигиена следов: журналы (IP клиентов и dst), история логинов/команд, apt/dpkg.
+# Скрипт ставим всегда; крон (0 */3) навешиваем в §11 при CLEANUP=1 (по умолчанию вкл).
+put_tpl "$TPL/server_cleanup.sh"    /usr/local/bin/server_cleanup.sh          0755
+
 # ── 7. vpn-boot-setup.sh — с §11 RETURN и фолбэком wg0 (переживает ребут) ─
 log "7/12 vpn-boot-setup.sh (§11 RETURN + wg0 fallback)"
 cat > /usr/local/bin/vpn-boot-setup.sh <<BOOT
@@ -240,10 +244,21 @@ if ! ip link show wg0 >/dev/null 2>&1; then
 fi
 
 ipset create ru_whitelist hash:ip timeout 7200 2>/dev/null || true
+# Статический белый список сетей РФ (IP/CIDR из GitHub). Файл пишет update-ru-whitelist.sh;
+# на ребуте восстанавливаем набор из него, без обращения к сети. Нет файла (напр. dnsmasq
+# выключен) -> блок пропускается, правило ниже не навешивается.
+if [ -f /etc/ru_whitelist_net.ipset ]; then
+    ipset create ru_whitelist_net hash:net family inet hashsize 16384 maxelem 1000000 2>/dev/null || true
+    ipset flush ru_whitelist_net 2>/dev/null || true
+    grep '^add ' /etc/ru_whitelist_net.ipset | sed 's/^add [^ ]* /add ru_whitelist_net /' | ipset restore -! 2>/dev/null || true
+fi
 
-# mangle PREROUTING: whitelist RETURN -> §11 RETURN (внутри VPN + сам сервер) -> MARK 0x64
+# mangle PREROUTING: whitelist(домены+сети) RETURN -> §11 RETURN (внутри VPN + сам сервер) -> MARK 0x64
 iptables -t mangle -F PREROUTING
 iptables -t mangle -A PREROUTING -s $SUBNET -m set --match-set ru_whitelist dst -j RETURN
+if ipset list -n ru_whitelist_net >/dev/null 2>&1; then
+    iptables -t mangle -A PREROUTING -s $SUBNET -m set --match-set ru_whitelist_net dst -j RETURN
+fi
 iptables -t mangle -A PREROUTING -s $SUBNET -d $SUBNET -j RETURN
 iptables -t mangle -A PREROUTING -s $SUBNET -d $SERVER_IP/32 -j RETURN
 iptables -t mangle -A PREROUTING -s $SUBNET -j MARK --set-mark 0x64
@@ -296,6 +311,10 @@ if ms_is_placeholder "$MS_PASS"; then
     # берём уже сгенерированный (повторный прогон), иначе генерим новый
     if [ -f "$MS_ENV" ]; then
         MS_PASS="$(sed -n 's/^MICROSOCKS_PASS=//p' "$MS_ENV" | head -1 | sed 's/^"//; s/"$//')"
+        # сохраняем пароль из env -> сохраняем и логин-пару к нему: иначе профильный
+        # логин при чужом/кастомном env отвалил бы приложения со старыми кредами
+        ms_env_user="$(sed -n 's/^MICROSOCKS_USER=//p' "$MS_ENV" | head -1 | sed 's/^"//; s/"$//')"
+        [ -n "$ms_env_user" ] && MS_USER="$ms_env_user"
     fi
     if ms_is_placeholder "$MS_PASS"; then
         MS_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)"
@@ -328,9 +347,13 @@ EOF
 if [ "$DNSMASQ" = "1" ]; then
     log "9/12 dnsmasq ON ($WG_IP:53 + ru_whitelist)"
     systemctl disable --now systemd-resolved 2>/dev/null || true
+    # bind-dynamic, НЕ bind-interfaces: dnsmasq слушает адрес wg0 ($WG_IP), который на буте
+    # появляется ПОЗЖЕ старта dnsmasq. С bind-interfaces демон падал бы «failed to create
+    # listening socket ... Cannot assign requested address» (найдено на приёмке node2 2026-08-17,
+    # ребут). bind-dynamic привязывается к адресу, когда интерфейс поднялся, и переживает ребут.
     cat > /etc/dnsmasq.d/vpn-main.conf <<EOF
 listen-address=$WG_IP,127.0.0.1
-bind-interfaces
+bind-dynamic
 port=53
 no-resolv
 server=1.1.1.1
@@ -338,6 +361,11 @@ server=8.8.8.8
 cache-size=1000
 EOF
     put_tpl "$TPL/dnsmasq/no-log.conf" /etc/dnsmasq.d/no-log.conf 0644
+    # Белый список РФ-доменов (прямой выход через РФ-адрес): сид сразу (~447 доменов),
+    # плюс апдейтер + git для него. Без сида ipset ru_whitelist наполнялся бы с нуля.
+    put_tpl "$TPL/dnsmasq/ru-whitelist.conf" /etc/dnsmasq.d/ru-whitelist.conf   0644
+    put_tpl "$TPL/update-ru-whitelist.sh"    /usr/local/bin/update-ru-whitelist.sh 0755
+    command -v git >/dev/null 2>&1 || apt-get install -y -qq git >/dev/null 2>&1 || true
 else
     log "9/12 dnsmasq OFF (весь трафик клиентов уходит в исходящий канал; DNS клиента $DNS_SERVER)"
     systemctl disable --now dnsmasq 2>/dev/null || true
@@ -361,12 +389,25 @@ systemctl start vpn-boot-setup 2>/dev/null || true   # RemainAfterExit=yes -> о
 if [ "$DNSMASQ" = "1" ]; then
     ipset create ru_whitelist hash:ip timeout 7200 2>/dev/null || true
     systemctl enable --now dnsmasq 2>/dev/null || true
+    # Первое наполнение белого списка из GitHub (сид уже применён — это лишь освежает).
+    # Не критично: нет сети к GitHub/нет git -> остаёмся на сиде, крон обновит в воскресенье.
+    /usr/local/bin/update-ru-whitelist.sh >/dev/null 2>&1 || true
 fi
 
-# ── 11. Крон сторожа (агентские кроны добавит deploy.py) ──────────────────
-log "11/12 cron watchdog */2"
-( crontab -l 2>/dev/null | grep -v 'singbox-watchdog'; \
-  echo '*/2 * * * * /usr/local/bin/singbox-watchdog.sh' ) | crontab -
+# ── 11. Кроны узла (агентские кроны добавит deploy.py/setup_panel) ────────
+# Сторож — всегда. Чистка следов — при CLEANUP=1 (по умолчанию вкл; CLEANUP=0 для
+# тест-стенда, чтобы не тереть journald между тестами). Белый список — только при
+# dnsmasq (иначе ipset ru_whitelist негде наполнять). Идемпотентно: свои строки
+# срезаем и добавляем заново. Агентские (pool-refresh/heartbeat) не трогаем.
+CLEANUP="${CLEANUP:-1}"
+log "11/12 cron (watchdog */2; cleanup 0 */3 = $CLEANUP; whitelist 0 3 * * 0 при dnsmasq=$DNSMASQ)"
+{
+    crontab -l 2>/dev/null | grep -v 'singbox-watchdog' | grep -v 'server_cleanup' | grep -v 'update-ru-whitelist'
+    echo '*/2 * * * * /usr/local/bin/singbox-watchdog.sh'
+    [ "$CLEANUP" = "1" ] && echo '0 */3 * * * /usr/local/bin/server_cleanup.sh'
+    [ "$DNSMASQ" = "1" ] && echo '0 3 * * 0 /usr/local/bin/update-ru-whitelist.sh >> /var/log/ru-whitelist-update.log 2>&1'
+    true
+} | crontab -
 
 # ── 12. Verify базы ──────────────────────────────────────────────────────
 log "12/12 verify"
@@ -389,5 +430,10 @@ if [ -n "$UP_HOST_EFF" ]; then
     echo "  egress(tun0): ${egress:-ПУСТО}  (ждём upstream $UP_HOST_EFF)"
 else
     echo "  egress(tun0): канал ещё не выбран — появится после ввода ключа провайдера в мастере"
+fi
+echo "  cron: watchdog=$(crontab -l 2>/dev/null | grep -c 'singbox-watchdog') cleanup=$(crontab -l 2>/dev/null | grep -c 'server_cleanup') whitelist=$(crontab -l 2>/dev/null | grep -c 'update-ru-whitelist')"
+if [ "$DNSMASQ" = "1" ]; then
+    echo "  ru_whitelist: доменов в конфиге $(grep -c '^ipset=/' /etc/dnsmasq.d/ru-whitelist.conf 2>/dev/null || echo 0), dnsmasq $(systemctl is-active dnsmasq 2>/dev/null)"
+    echo "  ru_whitelist_net: $(ipset list ru_whitelist_net 2>/dev/null | sed -n 's/^Number of entries: //p' | head -1 || echo 0) сетей РФ (IP/CIDR)"
 fi
 log "база готова. Дальше — агент и веб-панель (setup.sh / bootstrap.py ставят их следующим шагом)."

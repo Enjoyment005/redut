@@ -25,6 +25,7 @@ _locked=True (второй flock в том же процессе конфлик�
 """
 import datetime
 import os
+import time
 
 import apply as apply_mod
 import country as country_mod
@@ -45,10 +46,18 @@ FROZEN = "FROZEN"            # ручная пауза автоматики из
 # --- лимиты (§8) ---
 MAX_REPLACEMENTS_PER_HOUR = 3
 MAX_CANDIDATES_PER_CYCLE = 5
-EMERGENCY_RETRY_SEC = 15 * 60           # повтор попытки раз в 15 мин
 HEARTBEAT_STALE_HOURS = 24              # §6.3: нет цикла >24ч -> письмо
 COOLDOWN_STEPS = {1: 600, 2: 1800}      # 10 мин -> 30 мин -> (иначе) 2 ч
 COOLDOWN_MAX = 2 * 3600
+
+# --- пакет F (1.3.0): подтверждение отказов и backoff ---
+RECHECK_DELAY_SEC = 8                   # F1: вторая попытка verify перед деструктивом
+TG_ALERT_STREAK = 3                     # F1: письмо про мёртвый TG после стольких подряд
+CALM_MAX_STREAK = 3                     # F2: «прокси жив, egress мёртв» -> эскалация
+# F6: ретраи в EMERGENCY — backoff вместо ровных 15 мин: быстрые повторы ловят
+# короткие сбои (частый случай владельца), редкие поздние не спамят. Cap 30 мин.
+EMERGENCY_BACKOFF = (120, 300, 600, 900, 1800)
+ALERT_DEDUP_SEC = 6 * 3600              # F7: no_funds/pool_empty/no_market ≤1 письма/6ч
 
 # Флаг аварийного режима для СТОРОЖА (singbox-watchdog.sh): пока он есть, сторож
 # НЕ трогает sing-box/tun0/маршрут middleman (иначе вернул бы default в мёртвый
@@ -86,6 +95,17 @@ def decide(net_alive, egress_ok, singbox_ok):
     if not singbox_ok:
         return "self_heal"           # шаг 2 — виноват sing-box/tun0/маршрут
     return "proxy_fault"             # шаги 3-4 — разбираемся с прокси
+
+
+def emergency_retry_delay(retry_n):
+    """F6: пауза до следующего ретрая в EMERGENCY по номеру попытки (чистая, тест).
+
+    0-я -> 2 мин, дальше 5, 10, 15 и по 30 мин (cap)."""
+    try:
+        n = max(0, int(retry_n or 0))
+    except (TypeError, ValueError):
+        n = 0
+    return EMERGENCY_BACKOFF[min(n, len(EMERGENCY_BACKOFF) - 1)]
 
 
 def age_seconds(iso_str, now=None):
@@ -137,14 +157,20 @@ def singbox_health(cfg):
             "ok": active and tun0 and route_ok}
 
 
-def try_self_heal(cfg, log):
-    """Шаг 2: чинит существующий watchdog делает то же — рестарт sing-box +
-    восстановление маршрута middleman. -> healthy?"""
-    log("  self-heal: рестарт sing-box + маршрут middleman")
-    apply_mod.run_cmd(["ip", "route", "replace", "default", "dev", "tun0", "table", "middleman"])
+def try_self_heal(cfg, log, keep_direct=False):
+    """Шаг 2: рестарт sing-box + восстановление маршрута middleman. -> healthy?
+
+    keep_direct (F6): в EMERGENCY/ROTATING маршрут WAN НЕ трогаем до победы —
+    раньше каждый ретрай безусловно возвращал default в мёртвый tun0 на всё
+    время попытки, и клиенты моргали минутами (node1/README §12.6). Маршрут
+    вернёт _leave_direct после подтверждённого живого egress."""
+    log("  self-heal: рестарт sing-box%s" % ("" if keep_direct else " + маршрут middleman"))
+    if not keep_direct:
+        apply_mod.run_cmd(["ip", "route", "replace", "default", "dev", "tun0", "table", "middleman"])
     apply_mod.restart_singbox()
     apply_mod.wait_tun0()
-    return singbox_health(cfg)["ok"]
+    h = singbox_health(cfg)
+    return h["ok"] or (keep_direct and h["active"] and h["tun0"])
 
 
 # ----------------------------------------------------------- работа с текущим
@@ -178,11 +204,11 @@ def _cc_of(row):
                (row.get("country") if hasattr(row, "get") else None)
 
 
-def _rowget(row, key):
-    try:
-        return row[key]
-    except (KeyError, TypeError, IndexError):
-        return row.get(key) if hasattr(row, "get") else None
+# Сколько «стоит» непробованный кандидат там, где страна не первичный ключ (стратегии
+# balanced/speed). 100 — не магия: ровно с этого числа стартует probe.score, то есть
+# «пока не проверили — считаем средним»: измеренный хороший его обгонит, измеренный
+# плохой отстанет, а сам он попадёт в перебор раньше заведомо слабых.
+UNPROBED_SCORE = 100.0
 
 
 def rank_candidates(rows, cfg=None):
@@ -201,23 +227,53 @@ def rank_candidates(rows, cfg=None):
     Это тот же вывод, что даёт полный скоринг probe.score (в него входит country.rating),
     но без требования, чтобы КАЖДЫЙ кандидат уже был пробован. rotate перебирает список
     и берёт ПЕРВОГО прошедшего живую пробу — поэтому важен именно порядок.
+
+    **Стратегия стран (17.08)** решает, остаётся ли страна первичным ключом. При
+    «репутации» и «только избранных» — да, порядок ровно тот, что описан выше. При
+    «балансе» и «скорости» страна перестаёт диктовать: сортируем по сумме «вклад страны
+    + результат замеров», поэтому быстрый прокси может обогнать более приличный по
+    репутации. Непробованному кандидату в этом режиме засчитывается UNPROBED_SCORE —
+    иначе свежекупленный прокси навсегда уступал бы любому уже измеренному и не получил
+    бы шанса быть проверенным.
+
+    **Оценка — на лету (П3, 1.3.0):** вместо колонки score из БД (посчитанной той
+    стратегией, что была активна при пробе) берём probe.score_from_row под текущую.
+    Явно про ключ, чтобы не удвоить вес страны: в режимах country_first ключ — пара
+    (−rating, −базовая_часть_без_страны); в режимах сумм — −полная_оценка целиком
+    (страна уже внутри неё). UI и автоматика видят одни и те же числа.
     """
+    country_first = country_mod.strategy_info(cfg)["country_first"]
     ranked = []
     for r in rows:
-        cr = country_mod.rating(_cc_of(r), True, cfg)
+        # geo_agree строки участвует в первичном ключе (ревью 1.3.0): иначе штраф
+        # «базы разошлись» есть в отображаемой оценке, но не в порядке перебора,
+        # и спорный IP выбирался бы раньше чистого той же страны
+        geo = probe_mod._rget(r, "geo_agree")
+        agree = True if geo is None else bool(geo)
+        cr = country_mod.rating(_cc_of(r), agree, cfg)
         if cr is None:            # чёрный список — не выбираем и не тратим пробу
             continue
-        score = _rowget(r, "score") if _rowget(r, "probe_ok") else None
-        ranked.append((-(cr), -(score or 0.0), r))
-    ranked.sort(key=lambda t: (t[0], t[1]))
-    return [t[2] for t in ranked]
+        full, base = probe_mod.score_from_row(r, cfg)
+        if country_first:
+            key = (-(cr), -(base if base is not None else 0.0))
+        else:
+            key = (-(full if full is not None else cr + UNPROBED_SCORE), 0.0)
+        ranked.append((key, r))
+    ranked.sort(key=lambda t: t[0])     # только по ключу: равные сохраняют входной порядок
+    return [r for _, r in ranked]
 
 
-def selectable_candidates(pool, cfg, current_host):
+def selectable_candidates(pool, cfg, current_host, providers=None):
     """Кандидаты, из которых МОЖНО собрать канал прямо сейчас (для ротации и для
-    решения «докупать или выбрать из пула»): не gone/off/chrome, не на cooldown,
-    не текущий, страна не в чёрном списке — упорядочены rank_candidates."""
-    rows = pool.rotation_candidates(cfg.get("role"), exclude_host=current_host)
+    решения «докупать или выбрать из пула»): не gone/off, не на cooldown,
+    не текущий, страна не в чёрном списке — упорядочены rank_candidates.
+
+    providers (П7): активные адаптеры — строки провайдера без ключа не кандидаты
+    (второй пояс поверх gone: продлить/проверить их всё равно нечем). Заодно
+    честными становятся ensure_reserve и try_replenish."""
+    rows = pool.rotation_candidates(exclude_host=current_host)
+    if providers is not None:
+        rows = [r for r in rows if r["provider"] in providers]
     return rank_candidates(rows, cfg)
 
 
@@ -246,11 +302,13 @@ def _check_cb(providers, row):
     return None
 
 
-def _probe(pool, providers, row, current_host):
+def _probe(pool, providers, row, current_host, cfg=None):
     res = probe_mod.probe(row, provider_check=_check_cb(providers, row))
-    res["score"] = probe_mod.score(row, res, is_current=(row.get("host") == current_host))
+    is_cur = (row.get("host") == current_host)
+    res["score"] = probe_mod.score(row, res, is_current=is_cur, cfg=cfg)
     if pool.get(row["uid"]):
-        pool.record_probe(row["uid"], res)
+        pool.record_probe(row["uid"], res, is_current=is_cur,
+                          strategy=country_mod.strategy(cfg))
     return res
 
 
@@ -272,22 +330,40 @@ def rotate(cfg, providers, pool, alerter, reason="manual", actor="auto",
     result = {"state": None, "action": None, "detail": "", "ok": False}
 
     if pool.get_setting("automat_frozen") == "1" and not force:
-        return _state(pool, result, FROZEN, "manual-pause",
-                      "автоматика на паузе (FROZEN) — пропускаю")
+        # Пауза НЕ затирает automat_state (ревью 1.3.0): FROZEN в состоянии хоронил
+        # EMERGENCY/ROTATING, и после снятия паузы прямой WAN-выход оставался
+        # осиротевшим навсегда (флаг есть, а снять его некому — нарушение
+        # инварианта флага). Пауза видна панели через automat_frozen; прямой
+        # выход на паузе поддерживаем (ребут не должен дать чёрную дыру).
+        state_now = pool.get_setting("automat_state") or OK
+        if state_now in (EMERGENCY, ROTATING):
+            restore_emergency_routes(cfg, pool, log, actor)
+        result.update(state=state_now, action="manual-pause",
+                      detail="автоматика на паузе (FROZEN) — пропускаю", ok=False)
+        return result
     if os.name != "posix":
         result.update(state=pool.get_setting("automat_state") or OK, action="noop",
                       detail="rotate доступен только на сервере (Linux)")
         return result
 
     state_before = pool.get_setting("automat_state") or OK
-    # EMERGENCY: повтор не чаще 15 мин (§8), иначе watchdog долбил бы каждые 2 мин
     if state_before == EMERGENCY and not force:
         restore_emergency_routes(cfg, pool, log, actor)
-        last = pool.get_setting("emergency_last_retry")
-        age = age_seconds(last)
-        if age is not None and age < EMERGENCY_RETRY_SEC:
+        # F7: ручную аварию автоматика НЕ снимает — снимет только человек
+        if pool.get_setting("emergency_manual") == "1":
+            return _state(pool, result, EMERGENCY, "manual-emergency",
+                          "авария включена вручную — автоматика её не снимает (кнопка/CLI)")
+        # F6: backoff 2→5→10→15→30 мин вместо ровных 15 (watchdog долбит каждые 2 мин)
+        delay = emergency_retry_delay(pool.get_setting("emergency_retry_n"))
+        age = age_seconds(pool.get_setting("emergency_last_retry"))
+        if age is not None and age < delay:
             return _state(pool, result, EMERGENCY, "emergency-wait",
-                          "аварийный режим: до следующей попытки %d с" % (EMERGENCY_RETRY_SEC - age))
+                          "аварийный режим: до следующей попытки %d с (backoff)" % (delay - age))
+    if state_before == ROTATING and not force:
+        # инвариант флага: прямой выход времён перебора переживает ребут/сброс
+        # маршрута так же, как аварийный; окна повтора у ROTATING нет — добираем
+        # пул каждым тиком сторожа
+        restore_emergency_routes(cfg, pool, log, actor)
 
     try:
         with apply_mod.Flock(cfg.get("lock") or "/run/vpn-agent.lock"):
@@ -301,49 +377,115 @@ def rotate(cfg, providers, pool, alerter, reason="manual", actor="auto",
 def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, state_before):
     if state_before == EMERGENCY:
         pool.set_setting("emergency_last_retry", _now_iso())
+        pool.set_setting("emergency_retry_n",
+                         int(pool.get_setting("emergency_retry_n") or 0) + 1)
 
     # --- ШАГ 1: сеть сервера жива? ---
     alive, via = net_alive(cfg, log)
     egress = apply_mod.verify_egress()
     pool.set_egress(egress)          # дашборд показывает эту метку, сам пробу не гоняет
     sb_h = singbox_health(cfg)
-    d = decide(alive, egress["ok"], sb_h["ok"])
+    in_direct = state_before in (EMERGENCY, ROTATING) or os.path.exists(EMERGENCY_FLAG)
+    # F6: в прямом выходе middleman-маршрут СОЗНАТЕЛЬНО не tun0 — здоровье sing-box
+    # считаем без него, иначе каждый ретрай уходил бы в self-heal и дёргал маршрут.
+    sb_ok = sb_h["ok"] or (in_direct and sb_h["active"] and sb_h["tun0"])
+    d = decide(alive, egress["ok"], sb_ok)
     log("диагностика (§8): сеть=%s egress=%s sing-box=%s -> %s"
         % ("жива" if alive else "МЕРТВА", "ok" if egress["ok"] else "нет",
-           "ok" if sb_h["ok"] else "нет", d))
+           "ok" if sb_ok else "нет", d))
 
     if d == "frozen_net":
-        first = state_before != FROZEN_NET
         pool.log_event("frozen_net", actor=actor, result="on",
                        detail="сеть сервера недоступна — ничего не меняю, не покупаю")
-        if first:
-            alerter.frozen_net(detail="прямой curl мимо прокси не проходит (%s)" % reason)
+        _alert_once(pool, alerter, "frozen_net",
+                    detail="прямой curl мимо прокси не проходит (%s)" % reason)
+        if state_before in (EMERGENCY, ROTATING):
+            # сеть легла ПОВЕРХ прямого выхода: состояние не затираем — иначе после
+            # восстановления сети выход из EMERGENCY/ROTATING никогда не снимет
+            # WAN-маршрут (инвариант флага, ревью 1.3.0)
+            result.update(state=state_before, action="frozen_net",
+                          detail="сеть сервера мертва — заморожено; прямой выход сохранён", ok=False)
+            return result
         return _state(pool, result, FROZEN_NET, "frozen_net",
                       "сеть сервера мертва — заморожено, покупок нет")
 
     if d == "ok":
-        # выход через tun0 жив. Если были в аварии — снять её.
-        if state_before == EMERGENCY:
-            _leave_emergency(cfg, pool, alerter, egress, log, actor)
+        _reset_streaks(pool)
+        # выход через tun0 жив. Прямой выход снимаем по ФАКТУ (in_direct: состояние
+        # ИЛИ флаг) — состояние могло быть затёрто паузой/чужим сбоем, а осиротевший
+        # WAN-выход с флагом никто больше не снимет (инвариант флага, ревью 1.3.0).
+        if in_direct:
+            _leave_direct(cfg, pool, alerter, egress, log, actor, state_before)
         return _state(pool, result, OK, "noop", "egress жив (%s) — делать нечего" % egress["egress_ip"])
 
+    # --- F1: Telegram ≠ канал: ipify через tun0 жив, мёртв только api.telegram.org ---
+    if d == "proxy_fault" and egress.get("why_kind") == "tg":
+        return _tg_degraded(cfg, providers, pool, alerter, result, egress, log, actor,
+                            state_before, in_direct)
+
     if d == "self_heal":
-        if try_self_heal(cfg, log) and apply_mod.verify_egress()["ok"]:
+        if (try_self_heal(cfg, log, keep_direct=in_direct)
+                and apply_mod.verify_egress()["ok"]):
             pool.log_event("self-heal", actor=actor, result="ok", detail="sing-box/tun0 восстановлены")
-            if state_before == EMERGENCY:
-                _leave_emergency(cfg, pool, alerter, apply_mod.verify_egress(), log, actor)
+            _reset_streaks(pool)
+            if in_direct:
+                _leave_direct(cfg, pool, alerter, apply_mod.verify_egress(), log, actor, state_before)
             return _state(pool, result, OK, "self-heal", "sing-box восстановлен")
         log("  self-heal не помог — вероятно, виноват прокси, иду дальше")
 
     # --- ШАГ 3: RETUNE (текущий прокси жив по другому протоколу) ---
     rt = try_retune(cfg, providers, pool, alerter, log, actor)
     if rt.get("ok"):
-        if state_before == EMERGENCY:
-            _leave_emergency(cfg, pool, alerter, rt.get("verify") or apply_mod.verify_egress(), log, actor)
+        _reset_streaks(pool)
+        if in_direct:
+            _leave_direct(cfg, pool, alerter, rt.get("verify") or apply_mod.verify_egress(),
+                          log, actor, state_before)
         return _state(pool, result, OK, "retune", rt.get("detail", "RETUNE ок"))
 
+    # F1/F2: перед деструктивными шагами отказ должен быть ПОДТВЕРЖДЁН.
+    # В EMERGENCY/ROTATING он подтверждён самим состоянием; исход «прокси жив,
+    # egress мёртв даже после рестарта» (calm_failed) считается подтверждением
+    # после CALM_MAX_STREAK подряд (предохранитель F2 — иначе вечное «успокойся»).
+    confirmed = state_before in (EMERGENCY, ROTATING)
+    if rt.get("calm_failed"):
+        streak = int(pool.get_setting("calm_fail_streak") or 0) + 1
+        pool.set_setting("calm_fail_streak", streak)
+        if streak >= CALM_MAX_STREAK:
+            log("  F2: «прокси жив» не лечится рестартом %d циклов подряд — эскалация в перебор" % streak)
+            confirmed = True
+        elif not confirmed:
+            pool.log_event("suspect", actor=actor, result="calm-wait",
+                           detail="прокси жив, egress мёртв после рестарта sing-box (%d/%d)"
+                                  % (streak, CALM_MAX_STREAK))
+            return _state(pool, result, SUSPECT, "calm-wait",
+                          "прокси жив, egress мёртв после рестарта (%d/%d) — эскалация после %d подряд"
+                          % (streak, CALM_MAX_STREAK, CALM_MAX_STREAK))
+    else:
+        pool.set_setting("calm_fail_streak", None)
+
+    if not confirmed:
+        # F1: единичный чих не запускает лестницу — вторая попытка через паузу
+        pool.set_setting("automat_state", SUSPECT)
+        log("  SUSPECT: первый провал verify — подтверждаю повтором через %d с (F1)" % RECHECK_DELAY_SEC)
+        time.sleep(RECHECK_DELAY_SEC)
+        egress2 = apply_mod.verify_egress()
+        pool.set_egress(egress2)
+        if egress2["ok"]:
+            _reset_streaks(pool)
+            if in_direct:
+                _leave_direct(cfg, pool, alerter, egress2, log, actor, state_before)
+            pool.log_event("suspect", actor=actor, result="flap",
+                           detail="повтор verify через %d с прошёл — единичный чих, деструктив отменён"
+                                  % RECHECK_DELAY_SEC)
+            return _state(pool, result, OK, "flap",
+                          "egress флапнул: повтор verify прошёл — ничего не ломаю")
+        if egress2.get("why_kind") == "tg":
+            return _tg_degraded(cfg, providers, pool, alerter, result, egress2, log, actor,
+                                state_before, in_direct)
+
     # --- ШАГ 4: ROTATING ---
-    if pool.rotations_last_hour() >= MAX_REPLACEMENTS_PER_HOUR and not (reason == "manual"):
+    # F3: кнопка панели (reason=panel) — ручной запуск, лимит замен её не касается
+    if pool.rotations_last_hour() >= MAX_REPLACEMENTS_PER_HOUR and reason not in ("manual", "panel"):
         log("  лимит замен ≤%d/час исчерпан — в аварийный режим до охлаждения"
             % MAX_REPLACEMENTS_PER_HOUR)
         _enter_emergency(cfg, pool, alerter,
@@ -353,38 +495,110 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
 
     rot = try_rotating(cfg, providers, pool, alerter, log, actor)
     if rot.get("ok"):
-        if state_before == EMERGENCY:
-            _leave_emergency(cfg, pool, alerter, rot["verify"], log, actor)
+        _reset_streaks(pool)
+        if in_direct:
+            _leave_direct(cfg, pool, alerter, rot["verify"], log, actor, state_before)
         ensure_reserve(cfg, providers, pool, alerter, log, actor)   # N+1: из пула, не покупкой (§6.5)
         return _state(pool, result, OK, "rotate", rot.get("detail", "ротация ок"))
 
-    # ROTATING остановился по лимиту, но в пуле ещё есть непроверенные кандидаты (§8, снос №5):
-    # НЕ покупаем — включаем прямой выход для связи и добираем пул СЛЕДУЮЩИМ тиком сторожа
-    # (без 15-мин окна аварии: emergency_last_retry не ставим, чтобы повтор пришёл через ~2 мин).
+    # Остановились по лимиту кандидатов/цикл, в пуле ещё есть непроверенные (§8, снос №5):
+    # НЕ покупаем — честный ЖЁЛТЫЙ ROTATING (F3), а не «авария». Прямой выход на время
+    # перебора — СТРОГО под флагом (инвариант: сторож не вернёт default в мёртвый tun0);
+    # маршрутами ROTATING управляет ровно как EMERGENCY, отличие — только UI и алерты.
     if rot.get("capped"):
         emergency_on(cfg, log)
-        pool.set_setting("automat_state", EMERGENCY)
-        if state_before != EMERGENCY:
-            pool.set_setting("emergency_since", _now_iso())
-        # НЕ троттлим повтор 15 минутами: следующий тик сторожа (~2 мин) должен добрать
-        # остаток пула. Сбрасываем метку повтора, иначе rotate() уйдёт в emergency-wait.
+        pool.set_setting("automat_state", ROTATING)
+        if state_before != ROTATING:
+            pool.set_setting("rotating_since", _now_iso())
+        # повтор придёт следующим тиком сторожа (~2 мин) — окна ретрая нет
         pool.set_setting("emergency_last_retry", None)
-        pool.log_event("emergency", actor=actor, result="probing",
-                       detail="перебираю пул порциями (ещё есть непроверенные) — не покупаю")
-        return _state(pool, result, EMERGENCY, "pool-probing",
-                      "в пуле есть непроверенные кандидаты — добираю, покупка не нужна")
+        pool.log_event("rotating", actor=actor, result="probing",
+                       detail="перебираю пул: %s из %s за цикл — добираю следующим тиком, не покупаю"
+                              % (rot.get("tried"), rot.get("total")))
+        return _state(pool, result, ROTATING, "pool-probing",
+                      "перебор пула (%s из %s) — прямой выход на время перебора, покупка не нужна"
+                      % (rot.get("tried"), rot.get("total")))
 
     # --- ШАГ 4b: REPLENISH (покупка — только когда пул честно исчерпан) ---
     rep = try_replenish(cfg, providers, pool, alerter, log, actor)
     if rep.get("ok"):
-        if state_before == EMERGENCY:
-            _leave_emergency(cfg, pool, alerter, rep["verify"], log, actor)
+        _reset_streaks(pool)
+        if in_direct:
+            _leave_direct(cfg, pool, alerter, rep["verify"], log, actor, state_before)
         return _state(pool, result, OK, "replenish", rep.get("detail", "докупка ок"))
 
     # --- EMERGENCY ---
     _enter_emergency(cfg, pool, alerter, rep.get("reason") or "живых кандидатов нет и купить нельзя",
                      log, actor, state_before)
     return _state(pool, result, EMERGENCY, "emergency", rep.get("reason") or "авария")
+
+
+def _reset_streaks(pool):
+    """Здоровый исход цикла: обнулить стрики подозрений (F1 TG, F2 calm)."""
+    pool.set_setting("tg_fail_streak", None)
+    pool.set_setting("calm_fail_streak", None)
+
+
+def sync_degraded_state(pool, verify, alerter=None, actor="auto", light=False):
+    """Лёгкая синхронизация SUSPECT/DEGRADED вне полного цикла rotate (ревью 1.3.0).
+
+    Сторож на здоровом по его меркам узле rotate не зовёт вовсе, поэтому:
+    «мёртв только Telegram» сам по себе не выставлял DEGRADED (проверка сторожа —
+    ipify, он жив), а однажды выставленные SUSPECT/DEGRADED после самоизлечения
+    висели в панели бессрочно. Эту функцию зовут циклы, которые и так меряют выход:
+    pool-refresh (полный verify, раз в 30 мин) и egress-mark (light=True, раз в
+    5 мин — TG не меряет, поэтому только снимает SUSPECT, DEGRADED не трогает).
+    Деструктива нет; EMERGENCY/ROTATING/FROZEN* не трогаем — ими правит rotate."""
+    st = pool.get_setting("automat_state") or OK
+    if verify.get("ok"):
+        # light-метка TG не меряет: живой ipify снимает только SUSPECT; DEGRADED
+        # снимается лишь полным verify (TG реально ожил)
+        clearable = (SUSPECT,) if light else (SUSPECT, DEGRADED)
+        if st in clearable:
+            pool.set_setting("automat_state", OK)
+            _reset_streaks(pool)
+            return OK
+        return st
+    if light:
+        return st
+    if verify.get("why_kind") == "tg" and st in (OK, SUSPECT, DEGRADED):
+        streak = int(pool.get_setting("tg_fail_streak") or 0) + 1
+        pool.set_setting("tg_fail_streak", streak)
+        pool.set_setting("automat_state", DEGRADED)
+        if streak == TG_ALERT_STREAK and alerter is not None:
+            pool.log_event("degraded", actor=actor, result="tg",
+                           detail="api.telegram.org недоступен %d проверок подряд; канал (ipify) жив"
+                                  % streak)
+            alerter.tg_degraded(streak=streak, egress=verify.get("egress_ip"))
+        return DEGRADED
+    return st
+
+
+def _tg_degraded(cfg, providers, pool, alerter, result, egress, log, actor, state_before,
+                 in_direct=False):
+    """F1: ipify через tun0 жив — канал НЕ мёртв, недоступен только api.telegram.org.
+
+    RETUNE разрешён (мог умереть именно http-канал прокси), ротация/авария — нет:
+    живой IP из-за чужого сбоя не теряем. Событие + письмо после TG_ALERT_STREAK
+    подряд (один раз на стрик). Из прямого выхода выходим: канал-то жив."""
+    streak = int(pool.get_setting("tg_fail_streak") or 0) + 1
+    pool.set_setting("tg_fail_streak", streak)
+    rt = try_retune(cfg, providers, pool, alerter, log, actor)
+    if rt.get("ok"):
+        _reset_streaks(pool)
+        if in_direct or state_before in (EMERGENCY, ROTATING):
+            _leave_direct(cfg, pool, alerter, rt.get("verify") or egress, log, actor, state_before)
+        return _state(pool, result, OK, "retune", rt.get("detail", "RETUNE ок"))
+    if in_direct or state_before in (EMERGENCY, ROTATING):
+        _leave_direct(cfg, pool, alerter, egress, log, actor, state_before)
+    if streak == TG_ALERT_STREAK:
+        pool.log_event("degraded", actor=actor, result="tg",
+                       detail="api.telegram.org недоступен %d проверок подряд; канал (ipify) жив"
+                              % streak)
+        alerter.tg_degraded(streak=streak, egress=egress.get("egress_ip"))
+    return _state(pool, result, DEGRADED, "tg-degraded",
+                  "канал жив (ipify %s), Telegram недоступен (%d подряд) — ротацию не делаю"
+                  % (egress.get("egress_ip"), streak))
 
 
 # ------------------------------------------------------------------- RETUNE §7.3
@@ -396,7 +610,7 @@ def try_retune(cfg, providers, pool, alerter, log, actor):
     cur_socks = _outbound_of(sb, "socks-out")
     cur_tg = _outbound_of(sb, "http-tg")
     row = _pool_row_by_host(pool, host) or _row_from_sb(sb, host)
-    res = _probe(pool, providers, row, host)
+    res = _probe(pool, providers, row, host, cfg)
     if res.get("disqualified") or not res.get("ok"):
         return {"ok": False, "why": "текущий прокси не проксирует ни по одному протоколу"}
     try:
@@ -408,7 +622,23 @@ def try_retune(cfg, providers, pool, alerter, log, actor):
     changed = (socks_out["type"] != cur_socks[0] or socks_out["server_port"] != cur_socks[1]
                or http_tg["type"] != cur_tg[0] or http_tg["server_port"] != cur_tg[1])
     if not changed:
-        return {"ok": False, "why": "конфиг уже оптимален — RETUNE ничего не даст"}
+        # F2: прокси ЖИВ (проба только что прошла), комбинация уже оптимальна —
+        # значит виноват не прокси (egress флапнул / sing-box завис). Раньше это
+        # был ok=False, и цикл честно шёл ЛОМАТЬ живой канал ротацией. Теперь:
+        # рестарт sing-box, verify — успех цикла без ротации. Не помогло —
+        # calm_failed: предохранитель в rotate() эскалирует после 3 подряд.
+        log("  RETUNE: прокси жив, конфиг оптимален — рестарт sing-box без ротации (F2)")
+        apply_mod.restart_singbox()
+        apply_mod.wait_tun0()
+        v = apply_mod.verify_egress()
+        pool.set_egress(v)
+        if v["ok"]:
+            pool.log_event("retune", actor=actor, to_uid=row["uid"], result="calm",
+                           detail="прокси жив, конфиг оптимален — egress ожил после рестарта sing-box")
+            return {"ok": True, "verify": v, "calm": True,
+                    "detail": "прокси жив, egress ожил после рестарта sing-box (ротация не нужна)"}
+        return {"ok": False, "calm_failed": True,
+                "why": "прокси жив, но egress мёртв даже после рестарта sing-box"}
     log("  RETUNE: %s  %s -> %s (IP не меняется)"
         % (host, _mode(cur_socks), _mode((socks_out["type"], socks_out["server_port"]))))
     try:
@@ -432,7 +662,7 @@ def try_rotating(cfg, providers, pool, alerter, log, actor):
     host = apply_mod.current_upstream(sb)
     # Кандидаты уже упорядочены по стране+score (rank_candidates): сначала пробуем
     # надёжные страны (Латвия перед Нигерией), чёрный список выброшен (§6.1, снос №5).
-    cands = selectable_candidates(pool, cfg, host)
+    cands = selectable_candidates(pool, cfg, host, providers)
     if not cands:
         log("  ROTATING: пригодных кандидатов нет (все off/gone/на cooldown/в чёрном списке)")
         return {"ok": False, "exhausted": True}
@@ -443,11 +673,10 @@ def try_rotating(cfg, providers, pool, alerter, log, actor):
             # повод покупать (решение владельца, снос №5): доберём их следующим тиком.
             log("  ROTATING: лимит ≤%d кандидатов/цикл — остальные попробую в следующем цикле"
                 % MAX_CANDIDATES_PER_CYCLE)
-            return {"ok": False, "exhausted": False, "capped": True, "tried": tried}
-        if row["role"] == "chrome":
-            continue
+            return {"ok": False, "exhausted": False, "capped": True,
+                    "tried": tried, "total": len(cands)}
         tried += 1
-        res = _probe(pool, providers, row, host)
+        res = _probe(pool, providers, row, host, cfg)
         if res.get("disqualified") or not res.get("ok"):
             _cooldown_after_fail(pool, row["uid"], log)
             continue
@@ -460,6 +689,11 @@ def try_rotating(cfg, providers, pool, alerter, log, actor):
             continue
         pool.mark_used(row["uid"])
         pool.clear_cooldown(row["uid"])
+        # F8: уходящий канал этой пары считается «оборвавшимся в бою» — ротация
+        # запускается только по мёртвому каналу (ручной apply сюда не попадает)
+        old_row = _pool_row_by_host(pool, host)
+        if old_row is not None:
+            pool.stability_bump_drop(old_row["provider"], old_row.get("country"))
         pool.log_event("rotate", actor=actor, from_uid=None, to_uid=row["uid"], result="ok",
                        detail="%s -> %s egress=%s cc=%s (перебрано %d)"
                        % (host, r["new_ip"], r["verify"]["egress_ip"], r["verify"]["exit_cc"], tried))
@@ -474,12 +708,25 @@ def try_rotating(cfg, providers, pool, alerter, log, actor):
 
 
 # ------------------------------------------------------------------- REPLENISH
+def _alert_once(pool, alerter, kind, period=ALERT_DEDUP_SEC, **kw):
+    """F7: дедуп писем. no_funds/pool_empty/no_market шлются на каждом ретрае
+    аварии — не чаще раза в period на причину (отметка в setting)."""
+    key = "alert_last:%s" % kind
+    age = age_seconds(pool.get_setting(key))
+    if age is not None and age < period:
+        return False
+    getattr(alerter, kind)(**kw)
+    pool.set_setting(key, _now_iso())
+    return True
+
+
 def try_replenish(cfg, providers, pool, alerter, log, actor):
     # ПЕРЕД ПОКУПКОЙ — всегда выбрать из уже купленного пула (жёсткое правило владельца,
     # снос №5): покупаем ТОЛЬКО когда пригодных кандидатов в пуле не осталось. Если ROTATING
     # остановился по лимиту и в пуле ещё есть непроверенные — деньги не тратим, доберём тиком.
     sb = apply_mod.load_json(cfg["singbox_config"])
-    still = selectable_candidates(pool, cfg, apply_mod.current_upstream(sb))
+    dead_host = apply_mod.current_upstream(sb)
+    still = selectable_candidates(pool, cfg, dead_host, providers)
     if still:
         log("  REPLENISH: в пуле ещё %d непроверенных кандидатов — сначала пробую их, не покупаю"
             % len(still))
@@ -487,16 +734,17 @@ def try_replenish(cfg, providers, pool, alerter, log, actor):
                 "have_candidates": len(still)}
     prov = providers.get("proxy6")
     if prov is None or not prov.caps.get("buy"):
-        alerter.pool_empty(detail="нет ключа PROXY6 — докупить нечем")
+        _alert_once(pool, alerter, "pool_empty", detail="нет ключа PROXY6 — докупить нечем")
         return {"ok": False, "reason": "нет провайдера с покупкой (PROXY6)"}
     lim = money_mod.limits(cfg)
     # порядок перебора задаёт умная оценка: сначала надёжные страны выхода,
-    # страны с низкой репутацией автоматика не берёт вовсе (§6.1, 2026-08-15)
-    wl = money_mod.buy_candidates(cfg)
+    # страны с низкой репутацией автоматика не берёт вовсе (§6.1, 2026-08-15);
+    # выученная стабильность пар добавляет свой бонус (F8)
+    wl = money_mod.buy_candidates(cfg, pool=pool)
     period = int(lim["buy_period_days"])
     version = int(lim["buy_version"])
     if not lim.get("buy_enabled"):
-        alerter.no_funds(detail="тумблер покупок buy_enabled=false — купи руками")
+        _alert_once(pool, alerter, "no_funds", detail="тумблер покупок buy_enabled=false — купи руками")
         return {"ok": False, "reason": "покупки выключены тумблером (§6.2)"}
 
     # рынок: первая страна из ранжированного списка с наличием
@@ -514,7 +762,7 @@ def try_replenish(cfg, providers, pool, alerter, log, actor):
             pick, avail = cc, n
             break
     if not pick:
-        alerter.no_market(detail="проверены страны: %s" % ",".join(wl))
+        _alert_once(pool, alerter, "no_market", detail="проверены страны: %s" % ",".join(wl))
         return {"ok": False, "reason": "нет прокси version=%d в наличии (§10 error 300)" % version}
 
     log("  REPLENISH: покупаю в %s (в наличии %s), период %d дн" % (pick, avail, period))
@@ -522,17 +770,17 @@ def try_replenish(cfg, providers, pool, alerter, log, actor):
         r = money_mod.plan_and_buy(pool, prov, cfg, country=pick, period=period, count=1,
                                    version=version, server=cfg.get("server"), actor=actor)
     except money_mod.SpendDenied as e:
-        alerter.no_funds(detail=str(e))
+        _alert_once(pool, alerter, "no_funds", detail=str(e))
         return {"ok": False, "reason": "гейт трат: %s" % e, "denied": True}
     except ProviderError as e:
         if e.code == 400:
-            alerter.no_funds(detail=str(e))
+            _alert_once(pool, alerter, "no_funds", detail=str(e))
             return {"ok": False, "reason": "денег не хватило (error 400)"}
         if e.code == 105:
             alerter.api_105(detail=str(e))
             return {"ok": False, "reason": "PROXY6 105 (неверный IP)"}
         if e.code == 300:
-            alerter.no_market(detail=str(e))
+            _alert_once(pool, alerter, "no_market", detail=str(e))
             return {"ok": False, "reason": "нет в наличии (error 300)"}
         return {"ok": False, "reason": "покупка не удалась: %s" % e}
 
@@ -548,6 +796,10 @@ def try_replenish(cfg, providers, pool, alerter, log, actor):
             log("  куплен %s, но apply не прошёл: %s" % (uid, e))
             continue
         pool.mark_used(uid)
+        # F8: докупка = уходящий канал пары тоже оборвался в бою
+        old_row = _pool_row_by_host(pool, dead_host)
+        if old_row is not None:
+            pool.stability_bump_drop(old_row["provider"], old_row.get("country"))
         pool.log_event("replenish", actor=actor, to_uid=uid, result="ok",
                        detail="куплен %s (%s %s, %s), egress=%s cc=%s"
                        % (uid, r["price"], r["currency"], pick, ar["verify"]["egress_ip"],
@@ -580,7 +832,7 @@ def postbuy_check(cfg, pool, providers, bought, actor, log):
     for pxy in bought:
         uid = "%s:%s" % (pxy["provider"], pxy["ext_id"])
         row = pool.get(uid) or dict(pxy, uid=uid)
-        res = _probe(pool, providers, row, current_host)
+        res = _probe(pool, providers, row, current_host, cfg)
         blocked = (res.get("exit_cc") in probe_mod.HARD_BLOCK_CC
                    or str(res.get("disqualified") or "").startswith("blocked-cc"))
         if blocked:
@@ -592,11 +844,12 @@ def postbuy_check(cfg, pool, providers, bought, actor, log):
 
 
 # ------------------------------------------------- автопродление «якоря» (§6.3)
+# Охват — только текущий боевой. Прежний scope "current+reserve" опирался на роль
+# reserve и умер вместе с ней (П9, роли v2): ролей две — auto|off.
 DEFAULT_AUTO_PROLONG = {
     "enabled": True,        # тумблер: выключить — и продлевать будем только руками
     "days_before": 3,       # продлевать, когда до конца осталось не больше стольких дней
     "period_days": 30,      # на сколько продлевать за раз (у PROXY6 цена линейна: 4 ₽/сутки)
-    "scope": "current",     # "current" — только боевой; "current+reserve" — ещё и резерв
 }
 
 
@@ -614,22 +867,20 @@ def auto_prolong(cfg, providers, pool, alerter, log=print, actor="auto"):
     не требуют перелогинов, капч и подтверждений оплаты. Поэтому здоровый якорь
     продлеваем, а ротация остаётся аварийной мерой, а не расписанием.
 
-    Кого трогаем: только текущий боевой (и резерв, если scope это разрешает) и только
-    если он ЗДОРОВ — мёртвый продлевать бессмысленно, его заменит ротация.
+    Кого трогаем: только текущий боевой и только если он ЗДОРОВ — мёртвый
+    продлевать бессмысленно, его заменит ротация.
     Деньги идут через те же гейты §6.2 (тумблер, потолок цены, суточный лимит, остаток).
     """
     ap = auto_prolong_cfg(cfg)
     if not ap.get("enabled"):
         return {"ok": True, "skipped": "автопродление выключено тумблером"}
-    prov = providers.get("proxy6")
-    if prov is None or not prov.caps.get("prolong"):
-        return {"ok": False, "skipped": "нет провайдера с продлением"}
 
     current_host = apply_mod.current_upstream(apply_mod.load_json(cfg["singbox_config"]))
-    rows = [r for r in pool.list() if not r["gone"]]
+    # include_gone (ревью 1.3.0): после удаления ключа строки провайдера помечены
+    # gone, но боевой канал в sing-box живёт — без gone-строк главный C5-случай
+    # «продлить боевой нечем» давал молчаливый skip вместо события и письма
+    rows = pool.list(include_gone=True)
     targets = [r for r in rows if current_host and r["host"] == current_host]
-    if str(ap.get("scope")) == "current+reserve":
-        targets += [r for r in rows if r["role"] == "reserve" and r not in targets]
     if not targets:
         return {"ok": True, "skipped": "боевой прокси не найден в пуле"}
 
@@ -644,6 +895,20 @@ def auto_prolong(cfg, providers, pool, alerter, log=print, actor="auto"):
                 "пусть его заменит ротация" % uid)
             continue
         if pool.prolonged_today(uid):     # защита от повторов: крон может сработать не раз
+            continue
+        # C5: адаптер СТРОГО по провайдеру строки. Константа proxy6 при боевом от
+        # другого провайдера дёргала бы prolong с ЧУЖИМ ext_id в кабинете PROXY6
+        # (ext_id уникален только внутри провайдера). Нет адаптера — событие + алерт,
+        # а не молчаливый skip: иначе якорь истечёт незаметно.
+        prov = providers.get(row["provider"])
+        if prov is None or not prov.caps.get("prolong"):
+            log("  автопродление: у боевого %s нет ключа/адаптера провайдера %s — продлить нечем"
+                % (uid, row["provider"]))
+            pool.log_event("auto-prolong", actor=actor, to_uid=uid, result="no-provider",
+                           detail="нет ключа/адаптера %s — продление невозможно" % row["provider"])
+            alerter.prolong_failed(uid=uid, days_left=round(days, 1),
+                                   reason="нет ключа провайдера %s — боевой истечёт без продления"
+                                          % row["provider"])
             continue
         try:
             r = money_mod.prolong_with_limits(pool, prov, cfg, row=row,
@@ -678,7 +943,7 @@ def ensure_reserve(cfg, providers, pool, alerter, log, actor, min_reserve=1):
     try:
         sb = apply_mod.load_json(cfg["singbox_config"])
         current = apply_mod.current_upstream(sb)
-        have = len(selectable_candidates(pool, cfg, current))
+        have = len(selectable_candidates(pool, cfg, current, providers))
         if have >= min_reserve:
             log("  N+1: в пуле %d пригодных кандидатов (≥%d) — выбираю из пула, не покупаю" % (have, min_reserve))
             return {"ok": True, "have": have, "bought": False}
@@ -690,10 +955,10 @@ def ensure_reserve(cfg, providers, pool, alerter, log, actor, min_reserve=1):
         prov = providers.get("proxy6")
         if prov is None or not prov.caps.get("buy"):
             return {"ok": False, "have": have, "bought": False}
-        # порядок стран — умная оценка (репутация выхода), а не просто список из конфига
+        # порядок стран — умная оценка (репутация выхода + стабильность F8)
         version = int(lim["buy_version"])
         pick = None
-        for cc in money_mod.buy_candidates(cfg):
+        for cc in money_mod.buy_candidates(cfg, pool=pool):
             try:
                 if prov.getcount(cc, version) > 0:
                     pick = cc
@@ -805,8 +1070,13 @@ def _enter_emergency(cfg, pool, alerter, reason, log, actor, state_before):
     ok = emergency_on(cfg, log)
     pool.set_setting("automat_state", EMERGENCY)
     pool.set_setting("emergency_last_retry", _now_iso())
+    pool.set_setting("rotating_since", None)
     if state_before != EMERGENCY:
         pool.set_setting("emergency_since", _now_iso())
+        pool.set_setting("emergency_retry_n", "0")   # F6: backoff с начала (2 мин)
+        # авто-вход — не ручной: остаток emergency_manual от прежней ручной аварии
+        # сделал бы ЭТУ аварию несгораемой для автоматики (ревью 1.3.0)
+        pool.set_setting("emergency_manual", None)
         pool.log_event("emergency", actor=actor, result="on", detail=reason)
         alerter.emergency(reason=reason)             # письмо один раз при входе
     else:
@@ -814,9 +1084,20 @@ def _enter_emergency(cfg, pool, alerter, reason, log, actor, state_before):
     return ok
 
 
-def _leave_emergency(cfg, pool, alerter, verify, log, actor):
+def _leave_direct(cfg, pool, alerter, verify, log, actor, state_before=EMERGENCY):
+    """Снять прямой выход WAN — ЕДИНЫЙ путь для EMERGENCY и ROTATING (инвариант
+    флага): маршрут возвращается в tun0, флаг снимается, счётчики чистятся.
+    Письмо recovered — только про аварию: ROTATING входил без письма."""
     emergency_off(cfg, log)
     pool.set_setting("emergency_since", None)
+    pool.set_setting("rotating_since", None)
+    pool.set_setting("emergency_retry_n", None)
+    pool.set_setting("emergency_manual", None)
+    if state_before == ROTATING:
+        pool.log_event("rotating", actor=actor, result="off",
+                       detail="перебор завершён — рабочий выход egress=%s, прямой выход снят"
+                              % (verify or {}).get("egress_ip"))
+        return
     pool.log_event("emergency", actor=actor, result="off",
                    detail="восстановлен рабочий выход egress=%s" % (verify or {}).get("egress_ip"))
     alerter.recovered(new_ip=apply_mod.current_upstream(apply_mod.load_json(cfg["singbox_config"])),
@@ -825,16 +1106,31 @@ def _leave_emergency(cfg, pool, alerter, verify, log, actor):
 
 # ------------------------------------------------------------- ручные тумблеры
 def set_emergency(cfg, pool, alerter, on, log=print, actor="user"):
-    """Ручное вкл/выкл аварийного режима (CLI/панель)."""
+    """Ручное вкл/выкл аварийного режима (CLI/панель).
+
+    F7: ручная авария «залипает» — помечается emergency_manual, и автоматика её
+    не снимает (раньше снимала на первом же живом egress). Ручное снятие пишет
+    в журнал результат verify (приёмка §9 п.7): видно, что реально ожило."""
     if on:
         _enter_emergency(cfg, pool, alerter, "включён вручную", log, actor,
                          pool.get_setting("automat_state") or OK)
+        pool.set_setting("emergency_manual", "1")
         return {"ok": True, "state": EMERGENCY}
     emergency_off(cfg, log)
     pool.set_setting("automat_state", OK)
     pool.set_setting("emergency_since", None)
-    pool.log_event("emergency", actor=actor, result="off-manual", detail="выключен вручную")
-    return {"ok": True, "state": OK}
+    pool.set_setting("emergency_manual", None)
+    pool.set_setting("emergency_retry_n", None)
+    v = None
+    if os.name == "posix":
+        v = apply_mod.verify_egress()
+        pool.set_egress(v)
+    detail = "выключен вручную"
+    if v is not None:
+        detail += "; verify: " + ("egress=%s cc=%s ok" % (v["egress_ip"], v["exit_cc"])
+                                  if v["ok"] else "ПРОВАЛ (%s)" % v["why"])
+    pool.log_event("emergency", actor=actor, result="off-manual", detail=detail)
+    return {"ok": True, "state": OK, "verify": v}
 
 
 def _state(pool, result, state, action, detail):

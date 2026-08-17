@@ -19,6 +19,13 @@
   python deploy.py node1                 # агент на node1
   python deploy.py node1 --with-panel    # агент + веб-панель + systemd
   python deploy.py ru --dry-run          # показать план, не заливать
+  python deploy.py ru --with-panel --clean --keep-config   # обновить код на живом узле:
+                                         # config.json и secrets.json не трогаем
+
+Обновление УЗЛА, поставленного `setup.sh` со своим профилем (так поставлен node2):
+только `--keep-config` — иначе SERVERS ниже перезапишет ему server/role/subnet, а роль
+это привязка прокси в пуле. Плюс `--clean`, чтобы не перетереть secrets.json, который
+владелец заполнил в мастере /setup (ключ провайдера, 2FA, SMTP).
 """
 import argparse
 import json
@@ -51,6 +58,11 @@ def _load_servers():
 
 
 SERVERS.update(_load_servers())
+# Прежнее имя цели — чтобы старые команды не отвалились. Условно: в публичной
+# сборке SERVERS приходит из servers.json, и безусловный алиас ронял бы импорт
+# модуля KeyError'ом у пользователя без ключа "node2" (найдено на ревью Ф0).
+if "node2" in SERVERS:
+    SERVERS["ru"] = SERVERS["node2"]
 
 BASE_CONFIG = {
     "singbox_config": "/etc/sing-box/config.json",
@@ -84,6 +96,10 @@ MONEY_CONFIG = {
         # а страны с низкой оценкой автоматика сама не покупает.
         "whitelist": ["fi", "ee", "lv", "lt", "se", "de", "nl", "pl", "cz",
                       "at", "ch", "gb", "fr", "it", "es", "us", "ca"],
+        # СТРАТЕГИЯ (17.08): насколько сильно страна влияет на выбор. Переключается
+        # в панели, значения — country.STRATEGIES: whitelist (только избранные),
+        # reputation (по умолчанию), balanced, speed (решают замеры).
+        "strategy": "reputation",
     },
     # Автопродление «якоря» (решение владельца 15.08). Продление и покупка стоят
     # одинаково (4 ₽/сутки), но новый IP — холодный: перелогины, капчи, проверки
@@ -92,12 +108,20 @@ MONEY_CONFIG = {
         "enabled": True,
         "days_before": 3,      # продлеваем за 3 дня до конца, не в последний час
         "period_days": 30,     # 120 ₽ — влезает в лимит max_price_per_buy=150
-        "scope": "current",    # только боевой; "current+reserve" — ещё и резерв
     },
+    # Самообновление с GitHub (vpn/UPDATE-PLAN.md): auto переключается в панели,
+    # окно/частота/repo — по SSH. При редеплое блок НЕ перетирается (см. main).
+    "update": {"auto": True, "window": "04:00-06:00", "repo": "Enjoyment005/redut"},
+    # Обучение стабильности (F8, 1.3.0): порог — по объёму данных, не календарный.
+    # Вклад пары (провайдер, страна) в выбор покупки начинается с min_probes/min_days,
+    # полный вес — к full_probes/full_days. Правится только по SSH.
+    "stability": {"min_probes": 300, "min_days": 21, "full_probes": 1000, "full_days": 60},
 }
 
 OPT = "/opt/vpn-panel"
-AGENT_FILES = ["agent.py", "pool.py", "probe.py", "apply.py", "money.py",
+# update.py — ПЕРВЫМ: agent.py его импортирует, и на живом узле между заливкой
+# файлов есть окно, где тик крона (pool-refresh/heartbeat) поймал бы ImportError.
+AGENT_FILES = ["update.py", "agent.py", "pool.py", "probe.py", "apply.py", "money.py",
                "states.py", "alerts.py", "country.py",
                "providers/__init__.py", "providers/base.py",
                "providers/proxyline.py", "providers/proxy6.py"]
@@ -173,6 +197,11 @@ def main(argv=None):
     ap.add_argument("--clean", action="store_true",
                     help="чистая установка: секреты (провайдеры/SMTP/2FA/пароль) вводит владелец "
                          "в мастере панели /setup, а не сеются из .secrets.local.json")
+    ap.add_argument("--keep-config", action="store_true",
+                    help="не трогать /etc/vpn-panel/config.json на узле. Нужен для узлов, "
+                         "поставленных setup.sh со своим профилем (node2: server=node2, "
+                         "role=vpn-node2): запись SERVERS здесь сбила бы им имя и роль, "
+                         "а роль — это привязка прокси в пуле")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
 
@@ -200,22 +229,32 @@ def main(argv=None):
     sftp = c.open_sftp()
     for rel in files:
         sftp.put(os.path.join(PANEL_DIR, rel.replace("/", os.sep)), OPT + "/" + rel)
+    # Версия узла (vpn/UPDATE-PLAN.md Ф0): её показывают панель и `vpn-agent status`,
+    # с ней сверяется self-update. Без копии узел «не знает», что на нём работает.
+    ver_src = os.path.join(PANEL_DIR, os.pardir, "VERSION")
+    if os.path.isfile(ver_src):
+        sftp.put(ver_src, OPT + "/VERSION")
+    else:
+        print("  ⚠️ нет %s — версия узла останется неизвестной" % ver_src)
     # §6.2: лимиты трат правит владелец по SSH — редеплой их НЕ перетирает.
-    existing = {}
-    raw = run(c, "cat /etc/vpn-panel/config.json 2>/dev/null").strip()
-    if raw:
-        try:
-            existing = json.loads(raw)
-        except ValueError:
-            existing = {}
-    final_cfg = {**cfg, "panel_port": a.panel_port}
-    for k in ("money", "countries", "auto_prolong"):
-        if isinstance(existing.get(k), dict) and existing[k]:
-            final_cfg[k] = existing[k]
-            print("  config.json: сохранён настроенный владельцем блок '%s' (§6.2)" % k)
-    with sftp.open("/etc/vpn-panel/config.json", "w") as f:
-        json.dump(final_cfg, f, ensure_ascii=False, indent=2)
-    sftp.chmod("/etc/vpn-panel/config.json", 0o644)
+    if a.keep_config:
+        print("  config.json: оставлен как есть (--keep-config)")
+    else:
+        existing = {}
+        raw = run(c, "cat /etc/vpn-panel/config.json 2>/dev/null").strip()
+        if raw:
+            try:
+                existing = json.loads(raw)
+            except ValueError:
+                existing = {}
+        final_cfg = {**cfg, "panel_port": a.panel_port}
+        for k in ("money", "countries", "auto_prolong", "update", "stability"):
+            if isinstance(existing.get(k), dict) and existing[k]:
+                final_cfg[k] = existing[k]
+                print("  config.json: сохранён настроенный владельцем блок '%s' (§6.2)" % k)
+        with sftp.open("/etc/vpn-panel/config.json", "w") as f:
+            json.dump(final_cfg, f, ensure_ascii=False, indent=2)
+        sftp.chmod("/etc/vpn-panel/config.json", 0o644)
     # secrets.json: в чистой установке НЕ сеем (владелец введёт всё в мастере /setup);
     # иначе ключи провайдеров + SMTP берём из локального файла, а admin-блок (заведён на
     # сервере) сохраняем — иначе каждый деплой выбивал бы вход. Аналогично money/countries.
@@ -260,20 +299,42 @@ def main(argv=None):
         sftp.chmod("/usr/local/bin/singbox-watchdog.sh", 0o755)
     sftp.close()
 
-    # Кроны (идемпотентно): сторож */2, фоновая проба+резерв N+1 */6ч, пульс ежечасно (§6.3/§6.5)
+    # Кроны (идемпотентно, расписание E2 1.3.0): сторож */2; списки провайдеров */30
+    # (без проб); ПОЛНЫЙ прогон проб — раз в 2 ч (было */6 МИНУТ: молотилка 240
+    # прогонов/сутки, перекрывавшихся сами с собой, — дока при этом обещала «раз в
+    # 6 часов»); лёгкая метка egress для дашборда — */5; пульс ежечасно (§6.3/§6.5)
     crons = ["*/2 * * * * /usr/local/bin/singbox-watchdog.sh",
-             "*/6 * * * * /usr/local/bin/vpn-agent pool-refresh --probe",
+             "*/30 * * * * /usr/local/bin/vpn-agent pool-refresh",
+             "17 */2 * * * /usr/local/bin/vpn-agent pool-refresh --probe",
+             "*/5 * * * * /usr/local/bin/vpn-agent egress-mark",
              "0 * * * * /usr/local/bin/vpn-agent heartbeat-check",
              # раз в сутки утром: продлить боевой «якорь» до истечения (§6.3).
              # Смена IP стоит столько же, сколько продление, но новый адрес холодный —
              # прогретый бережём, ротация остаётся аварийной мерой.
-             "30 6 * * * /usr/local/bin/vpn-agent auto-prolong"]
+             "30 6 * * * /usr/local/bin/vpn-agent auto-prolong",
+             # раз в сутки: сверить версию с маяком GitHub; при auto=вкл и ночном
+             # окне — обновиться (окно/jitter считает агент, vpn/UPDATE-PLAN.md)
+             "41 4 * * * /usr/local/bin/vpn-agent self-update --cron"]
+    # Маркер 'vpn-agent pool-refresh' НАМЕРЕННО шире, чем 'pool-refresh --probe':
+    # он накрывает и СТАРУЮ строку */6 c --probe, и новую без — иначе после
+    # самообновления 1.2.0→1.3.0 старая шестиминутная молотилка осталась бы рядом
+    # с новой (🟠 ревью E2).
     strip = ("crontab -l 2>/dev/null | grep -v singbox-watchdog "
-             "| grep -v 'pool-refresh --probe' | grep -v 'vpn-agent heartbeat-check' "
-             "| grep -v 'vpn-agent auto-prolong'")
+             "| grep -v 'vpn-agent pool-refresh' | grep -v 'vpn-agent egress-mark' "
+             "| grep -v 'vpn-agent heartbeat-check' "
+             "| grep -v 'vpn-agent auto-prolong' | grep -v 'vpn-agent self-update'")
     add = "; ".join("echo '%s'" % ln for ln in crons)
     run(c, "( %s; %s ) | crontab -" % (strip, add))
     print("cron:", run(c, "crontab -l 2>/dev/null | grep -E 'watchdog|vpn-agent' | tr '\\n' '|'"))
+
+    # /opt/redut-src — цель ОТКАТА самообновления. Дерево без режима UPDATE (сборки
+    # до 1.2.0) откат не запустит (защита в update.py) — узел останется без отката.
+    stale = run(c, "test -f /opt/redut-src/setup.sh && ! grep -q UPDATE /opt/redut-src/setup.sh "
+                   "&& echo stale || true").strip()
+    if stale == "stale":
+        print("  ⚠️ /opt/redut-src — сборка без режима UPDATE (до 1.2.0): автооткат самообновления")
+        print("     её не запустит. Обнови дерево: на узле `UPDATE=1 bash <(curl … setup.sh)`,")
+        print("     либо перезалей исходники свежего тега в /opt/redut-src.")
 
     print("\nинициализация БД:", run(c, "vpn-agent pool-refresh", t=180).replace("\n", " | "))
     print("\n" + run(c, "vpn-agent status", t=60))

@@ -2,9 +2,9 @@
 """alerts.py — письма-алерты агента (§8/§10, §20 п.7). Только stdlib (smtplib).
 
 Настройки SMTP — в secrets.json, блок "smtp" (0600 на сервере, §13):
-    {"smtp": {"host": "mail.elofey.com", "port": 587,
-              "user": "admin@arpharey.com", "password": "…",
-              "from": "admin@arpharey.com", "to": "kolosunin@gmail.com"}}
+    {"smtp": {"host": "mail.example.com", "port": 587,
+              "user": "node@example.com", "password": "…",
+              "from": "node@example.com", "to": "owner@example.com"}}
 port 465 -> SMTPS (SSL), иначе STARTTLS (обычно 587).
 
 Философия: письмо — ВТОРИЧНО по отношению к ротации. SMTP не настроен, сервер
@@ -18,10 +18,18 @@ port 465 -> SMTPS (SSL), иначе STARTTLS (обычно 587).
 Секреты (ключи провайдеров) в теле письма маскируются переданным mask-callable —
 у PROXY6 ключ лежит в пути URL, светить его в почте нельзя (§15).
 """
+import re
 import smtplib
 import ssl
 from email.message import EmailMessage
-from email.utils import formatdate
+from email.utils import formatdate, formataddr
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _valid_email(x):
+    """Грубая проверка «это вообще e-mail?»: есть @ и точка в домене, без пробелов."""
+    return bool(_EMAIL_RE.match((x or "").strip()))
 
 
 def _stderr(msg):
@@ -54,9 +62,24 @@ class Alerter:
         subj = "[vpn-agent %s] %s" % (self.server, subject)
         try:
             body = self.mask(body)
+            # Envelope-from обязан быть НАСТОЯЩИМ адресом. Если оператор вписал в поле
+            # «from» отображаемое имя («От ВПНА»), а не e-mail, SMTP отклонит письмо
+            # (501 Invalid MAIL FROM) и все алерты молча пропадут. Берём валидный адрес:
+            # сам «from», иначе — логин SMTP (это реальный ящик). Ярлык оператора при
+            # этом сохраняем как display-name, чтобы подпись в письме не потерялась.
+            raw_from = (s.get("from") or "").strip()
+            login = (s.get("user") or "").strip()
+            if _valid_email(raw_from):
+                from_hdr = raw_from
+            elif _valid_email(login):
+                from_hdr = formataddr((raw_from, login)) if raw_from else login
+            else:
+                self.log("SMTP from-адрес «%s» невалиден, а валидного user для подмены нет "
+                         "— письмо «%s» не отправлено (это не ошибка)" % (raw_from, subject))
+                return False
             msg = EmailMessage()
             msg["Subject"] = subj
-            msg["From"] = s["from"]
+            msg["From"] = from_hdr
             msg["To"] = s["to"]
             msg["Date"] = formatdate(localtime=True)
             msg.set_content(body)
@@ -167,10 +190,20 @@ class Alerter:
             "Трафик клиентов переключён на ПРЯМОЙ выход через WAN сервера "
             "(вместо чёрной дыры в мёртвый tun0). Это НЕ обход блокировок — "
             "YouTube/Google из РФ снова недоступны, но связь у клиентов есть.\n\n"
-            "Агент повторяет попытку восстановиться раз в 15 минут. "
-            "Разберись с причиной (баланс/лимиты/провайдер) — по восстановлении "
-            "автомат сам вернётся в обычный режим." % reason)
+            "Агент повторяет попытку восстановиться с нарастающим интервалом "
+            "(2 → 5 → 10 → 15 → 30 минут). Разберись с причиной (баланс/лимиты/"
+            "провайдер) — по восстановлении автомат сам вернётся в обычный режим." % reason)
         return self._send("АВАРИЙНЫЙ РЕЖИМ — прямой выход через WAN", body)
+
+    def tg_degraded(self, *, streak, egress=None):
+        body = (
+            "⚠️ Канал жив, но api.telegram.org недоступен (%d проверок подряд).\n\n"
+            "  выход (ipify через tun0): %s — работает\n\n"
+            "Ротацию НЕ делаю: сам прокси жив, менять его из-за чужого сбоя — терять "
+            "прогретый IP. У клиентов может не работать Telegram; остальной интернет цел.\n"
+            "Если Telegram важен и не оживает — попробуй «Ротация» в панели вручную."
+            % (streak, egress or "?"))
+        return self._send("Telegram недоступен, канал жив (DEGRADED)", body)
 
     def recovered(self, *, new_ip, egress, cc):
         body = ("Аварийный режим снят — найден рабочий upstream.\n\n"

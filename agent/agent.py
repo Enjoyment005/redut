@@ -32,6 +32,7 @@ import pool as pool_mod             # noqa: E402
 import probe as probe_mod           # noqa: E402
 import states as states_mod         # noqa: E402
 import alerts as alerts_mod         # noqa: E402
+import update as update_mod         # noqa: E402
 from providers import make_providers, ProviderError  # noqa: E402
 
 ETC_CONFIG = "/etc/vpn-panel/config.json"
@@ -103,6 +104,7 @@ def fmt_days(date_end):
 def cmd_status(cfg, args):
     print("=== vpn-agent status ===")
     print("сервер: %s  роль пула: %s  конфиг: %s" % (cfg.get("server"), cfg.get("role"), cfg["_source"]))
+    print("сборка: Редут %s" % (update_mod.node_version() or "? (VERSION не найден — узел ставился до Ф0)"))
     print("subnet=%s gw=%s wan=%s dnsmasq=%s" % (cfg.get("subnet"), cfg.get("gw"),
                                                  cfg.get("wan"), cfg.get("has_dnsmasq")))
     sb = read_singbox(cfg)
@@ -177,10 +179,14 @@ def cmd_pool_refresh(cfg, args):
         print("Нет ключей провайдеров (secrets: %s)" % (src or "не найден"))
         return 1
     p = open_pool(cfg)
-    summary = p.refresh(providers, actor="user")
+    # active = провайдеры с ключом на диске (make_providers создаёт адаптер только при
+    # ключе) — строки осиротевших провайдеров уходят в gone (П7, 🔴 C2)
+    summary = p.refresh(providers, actor="user", active=set(providers))
     for name, s in summary["providers"].items():
         print("%-10s: всего %d, новых %d, обновлено %d, gone %d"
               % (name, s["total"], s["added"], s["updated"], s["gone"]))
+    for name, n in (summary.get("stale") or {}).items():
+        print("%-10s: ключа больше нет — %d строк помечено gone" % (name, n))
     for name, err in summary["errors"].items():
         print("%-10s: ОШИБКА — %s" % (name, err))
     for name, prov in providers.items():
@@ -198,17 +204,21 @@ def cmd_pool_refresh(cfg, args):
     # продолжала висеть СТАРАЯ ошибка (случай 15.08: авария снята в 09:56, а панель
     # ещё полчаса показывала «цепочка нарушена» с меткой 09:30).
     try:
-        p.set_egress(apply_mod.verify_egress())
+        v = apply_mod.verify_egress()
+        p.set_egress(v)
+        # DEGRADED от автоматики + снятие залипших SUSPECT/DEGRADED: сторож в этих
+        # сценариях rotate не зовёт (его проверка — ipify), синхронизируем здесь
+        states_mod.sync_degraded_state(p, v, alerter=_make_alerter(cfg, secrets))
     except Exception as e:
         print("egress-метка не обновлена (не критично): %s" % e)
 
     if getattr(args, "probe", False):
-        # cron */6ч: держим кандидатов проверенными заранее (§6.0) + N+1 резерв (§6.5)
+        # cron раз в 2 ч (E2): держим кандидатов проверенными заранее (§6.0) + N+1 (§6.5)
         current_host = apply_mod.current_upstream(read_singbox(cfg) or {})
-        rows = p.candidates(cfg.get("role"))
+        rows = p.candidates()
         ok = 0
         for row in rows:
-            res = _probe_one(p, cfg, providers, row, current_host)
+            res = _probe_one(p, cfg, providers, row, current_host, background=True)
             ok += 1 if res["ok"] else 0
         print("проба кандидатов: %d/%d ok" % (ok, len(rows)))
         alerter = _make_alerter(cfg, secrets)
@@ -217,19 +227,69 @@ def cmd_pool_refresh(cfg, args):
             print("N+1: докуплен резерв (%s)" % (rr.get("uids") or rr.get("reason")))
         else:
             print("N+1: резерв в норме (%s)" % (rr.get("have", "?")))
+        pr = p.prune()          # retention E1: probe_log 90 дн / event 180 дн, раз в сутки
+        if pr:
+            print("retention: probe_log −%d, event −%d" % (pr["probe_log"], pr["event"]))
     p.close()
     return 1 if summary["errors"] and not summary["providers"] else 0
 
 
-def _probe_one(p, cfg, providers, row, current_host):
-    """Проба одной записи + запись в БД. -> результат probe"""
+def cmd_egress_mark(cfg, args):
+    """Лёгкая метка выхода для дашборда (E2): ОДИН ipify-curl через tun0, без
+    Telegram. Крон каждые 5 мин — дашборд считает метку старше 15 мин протухшей.
+
+    «Зелёный маяк» = связь есть; здоровье Telegram — отдельная забота (полный
+    verify пишут pool-refresh раз в 30 мин, кнопка панели, apply и диагностика
+    ротации). Инвариант «никогда RU-выход» держим и здесь: geoip — дёшево."""
+    if os.name != "posix":
+        print("egress-mark доступен только на сервере (tun0)")
+        return 1
+    p = open_pool(cfg)
+    rc, ip = apply_mod.run_cmd(["curl", "-s", "--max-time", "10", "--interface", "tun0",
+                                probe_mod.IPIFY_URL], timeout=20)
+    ip = (ip or "").strip()
+    v = {"egress_ip": ip if probe_mod.looks_like_ip(ip) else None,
+         "exit_cc": None, "tg_code": None, "ok": False, "why": ""}
+    if v["egress_ip"]:
+        v["exit_cc"] = probe_mod.geo_country(v["egress_ip"])
+        if v["exit_cc"] in probe_mod.HARD_BLOCK_CC:
+            v["why"] = "страна выхода %s в жёстком блоке" % v["exit_cc"]
+        else:
+            v["ok"] = True
+    else:
+        v["why"] = "egress через tun0 пуст"
+    p.set_egress(v)
+    # лёгкая метка TG не меряет: только снимает залипший SUSPECT при живом выходе
+    states_mod.sync_degraded_state(p, v, light=True)
+    if v["ok"]:
+        # F8: время «в бою» пары боевого канала — приращением от прошлой живой метки
+        # (cap 10 мин: перерывы связи и простои узла временем боя не считаются)
+        host = apply_mod.current_upstream(read_singbox(cfg) or {})
+        row = next((r for r in p.list(include_gone=True) if r["host"] == host), None) if host else None
+        delta = states_mod.age_seconds(p.get_setting("battle_mark_at"))
+        if row is not None and delta is not None:
+            p.stability_bump_battle(row["provider"], row.get("country"), min(int(delta), 600))
+        p.set_setting("battle_mark_at", pool_mod.now_iso())
+    print("egress-mark: ip=%s cc=%s -> %s"
+          % (v["egress_ip"] or "—", v["exit_cc"] or "??", "ok" if v["ok"] else v["why"]))
+    p.close()
+    return 0
+
+
+def _probe_one(p, cfg, providers, row, current_host, background=False):
+    """Проба одной записи + запись в БД. -> результат probe
+
+    background=True — фоновый крон-прогон (F5): одиночный провал не инкрементит
+    fail_count, см. pool.record_probe."""
     check_cb = None
     prov = providers.get(row["provider"])
     if prov is not None and prov.caps.get("check"):
         check_cb = lambda: prov.check(row["ext_id"])  # noqa: E731
     res = probe_mod.probe(row, provider_check=check_cb)
-    res["score"] = probe_mod.score(row, res, is_current=(row["host"] == current_host))
-    p.record_probe(row["uid"], res)
+    is_cur = row["host"] == current_host
+    res["score"] = probe_mod.score(row, res, is_current=is_cur, cfg=cfg)
+    p.record_probe(row["uid"], res, is_current=is_cur, strategy=country_mod.strategy(cfg),
+                   background=background)
     return res
 
 
@@ -246,9 +306,9 @@ def cmd_probe(cfg, args):
             return 1
         rows = [row]
     else:
-        rows = p.candidates(cfg.get("role"))
+        rows = p.candidates()
         if not rows:
-            print("Кандидатов нет (пул пуст или все off/chrome/gone)")
+            print("Кандидатов нет (пул пуст или все off/gone)")
             p.close()
             return 0
     ok_count = 0
@@ -274,10 +334,6 @@ def cmd_apply(cfg, args):
     row = p.get(args.uid)
     if not row:
         print("uid %s не найден в пуле" % args.uid)
-        p.close()
-        return 1
-    if row["role"] == "chrome":
-        print("Роль chrome защищена — прокси занят расширением владельца (§5), apply отклонён")
         p.close()
         return 1
     secrets, _ = load_secrets()
@@ -346,6 +402,12 @@ def cmd_apply(cfg, args):
         p.close()
         return 1
     p.mark_used(row["uid"])
+    if row["role"] == "off":
+        # П9: успешный apply переводит off->auto — боевой канал должен быть виден
+        # selectable_candidates и подсчёту резерва
+        p.set_role(row["uid"], "auto")
+        p.log_event("role", actor="auto", to_uid=row["uid"], result="auto",
+                    detail="успешный apply переводит off->auto (П9)")
     p.log_event("apply", actor="user", from_uid=None, to_uid=row["uid"], result="ok",
                 detail=json.dumps({"old_ip": r["old_ip"], "new_ip": r["new_ip"],
                                    "verify": r["verify"]}, ensure_ascii=False))
@@ -436,7 +498,7 @@ def cmd_buy(cfg, args):
     if country and not country_mod.auto_allowed(country, True, cfg):
         print("⚠️ %s: %s. Покупаю, потому что страну указал ты явно."
               % (country, country_mod.explain(country)))
-    chosen = [country] if country else money_mod.buy_candidates(cfg)
+    chosen = [country] if country else money_mod.buy_candidates(cfg, pool=p)
 
     # рынок: первая страна белого списка с наличием (getcount), цена — getprice
     pick = avail = None
@@ -536,10 +598,6 @@ def cmd_drop(cfg, args):
         print("Провайдер %s не умеет удаление (только PROXY6)" % row["provider"])
         p.close()
         return 1
-    if row["role"] == "chrome":
-        print("Роль chrome защищена — удаление отклонено навсегда (§5)")
-        p.close()
-        return 1
     current_host = apply_mod.current_upstream(read_singbox(cfg) or {})
     pchk = None
     try:
@@ -550,12 +608,7 @@ def cmd_drop(cfg, args):
     if args.experiment:
         # Приёмочный эксперимент §6.4: намеренно удаляем ЗДОРОВЫЙ свежекупленный
         # прокси, чтобы измерить возврат средств. Health-гейты §6.4 п.1–2 не
-        # применяем (на то он и эксперимент), но chrome/reserve и «текущий
-        # upstream» остаются защищены.
-        if row["role"] == "reserve":
-            print("Роль reserve защищена — эксперимент отклонён")
-            p.close()
-            return 1
+        # применяем (на то он и эксперимент), но «текущий upstream» защищён.
         if current_host and row["host"] == current_host:
             print("Это ТЕКУЩИЙ upstream — эксперимент на нём запрещён")
             p.close()
@@ -627,8 +680,10 @@ def cmd_rotate(cfg, args):
     providers = make_providers(secrets)
     p = open_pool(cfg)
     alerter = _make_alerter(cfg, secrets)
+    # F3: кнопка панели (--reason panel) — тоже человек: rotations_last_hour считает
+    # только actor='auto', ручные запуски в антифлаппинг-лимит не попадают
     reason = args.reason or "manual"
-    actor = "user" if reason == "manual" else "auto"
+    actor = "user" if reason in ("manual", "panel") else "auto"
     r = states_mod.rotate(cfg, providers, p, alerter, reason=reason, actor=actor,
                           log=print, force=args.force)
     print("=> состояние: %s · действие: %s\n   %s" % (r["state"], r["action"], r["detail"]))
@@ -644,9 +699,9 @@ def cmd_auto_prolong(cfg, args):
     p = open_pool(cfg)
     alerter = _make_alerter(cfg, secrets)
     ap = states_mod.auto_prolong_cfg(cfg)
-    print("автопродление: %s, порог %s дн, период %s дн, охват %s"
+    print("автопродление: %s, порог %s дн, период %s дн, охват: боевой"
           % ("включено" if ap["enabled"] else "ВЫКЛЮЧЕНО",
-             ap["days_before"], ap["period_days"], ap["scope"]))
+             ap["days_before"], ap["period_days"]))
     r = states_mod.auto_prolong(cfg, providers, p, alerter, log=print, actor="auto")
     if r.get("skipped"):
         print("  пропуск: %s" % r["skipped"])
@@ -667,6 +722,62 @@ def cmd_emergency(cfg, args):
           % ("ВКЛючён — прямой выход через WAN" if args.state == "on" else "выключен", r["state"]))
     p.close()
     return 0
+
+
+def cmd_self_update(cfg, args):
+    """Система обновлений (vpn/UPDATE-PLAN.md).
+
+    По умолчанию (и с --check) только сверяет узел с маяком VERSION на GitHub и пишет
+    состояние/событие/письмо. --apply — скачать и установить (бэкап, verify, откат).
+    --cron — режим планировщика: jitter -> check -> в окно и при включённом авто — apply."""
+    if (args.apply_now or args.cron) and os.name != "posix":
+        print("Применение обновления меняет живой узел — только на сервере (Linux). "
+              "На dev-машине доступна только проверка: self-update --check.")
+        return 1
+    secrets, _ = load_secrets()
+    p = open_pool(cfg)
+    alerter = _make_alerter(cfg, secrets)
+    log = lambda m: print("  %s" % m)   # noqa: E731 — стиль лога агента
+    try:
+        if args.cron:
+            r = update_mod.cron_tick(cfg, pool=p, alerter=alerter, log=log)
+            c = r["check"]
+            if c["error"]:
+                print("Проверка не удалась: %s" % c["error"])
+                return 0        # сетевые беды — не авария крона, повтор завтра
+            if r["applied"] is not None:
+                a = r["applied"]
+                print("Итог: %s" % ("обновлён до %s" % a["to"] if a["ok"]
+                                    else "провал (%s), откат %s" % (a["why"], a["rolled_back"])))
+                return 0 if a["ok"] else 1
+            print("Обновление не применялось%s." % (": %s" % r["skip"] if r["skip"] else
+                                                    " (новых версий нет)"))
+            return 0
+        if args.apply_now:
+            r = update_mod.apply(cfg, pool=p, alerter=alerter, log=log,
+                                 target=args.to_version, manual=True)
+            if r["ok"]:
+                print("Узел обновлён: Редут %s -> %s." % (r["from"] or "?", r["to"]))
+                return 0
+            print("Обновление не применено: %s%s"
+                  % (r["why"], " (откат выполнен)" if r["rolled_back"] else ""))
+            return 1
+        r = update_mod.check(cfg, pool=p, alerter=alerter, log=log)
+        if r["error"]:
+            print("Проверка не удалась: %s" % r["error"])
+            return 1
+        if r["newer"] and r["bad"]:
+            print("Версия %s есть, но в чёрном списке (обновление на неё уже проваливалось) — "
+                  "автоматика её не тронет; руками: self-update --apply --version %s"
+                  % (r["remote"], r["remote"]))
+        elif r["newer"]:
+            print("Доступно обновление: Редут %s -> %s (поставить: self-update --apply)."
+                  % (r["local"] or "?", r["remote"]))
+        else:
+            print("Обновлений нет (узел %s, маяк %s)." % (r["local"] or "?", r["remote"]))
+        return 0
+    finally:
+        p.close()
 
 
 def cmd_heartbeat_check(cfg, args):
@@ -691,9 +802,11 @@ def main(argv=None):
     sub.add_parser("status", help="состояние сервера и пула")
     sp = sub.add_parser("list", help="пул из кэша")
     sp.add_argument("--all", action="store_true", help="включая gone")
-    sp = sub.add_parser("pool-refresh", help="обновить пул у провайдеров (merge, gone)")
+    sp = sub.add_parser("pool-refresh", help="обновить пул у провайдеров (merge, gone; cron */30 мин)")
     sp.add_argument("--probe", action="store_true",
-                    help="+ прогнать пробу кандидатов и докупить резерв N+1 (cron */6ч)")
+                    help="+ проба кандидатов, резерв N+1, retention (cron раз в 2 ч)")
+    sub.add_parser("egress-mark",
+                   help="лёгкая метка выхода для дашборда: ipify через tun0, без TG (cron */5 мин)")
     sp = sub.add_parser("probe", help="проба кандидата/всех кандидатов")
     sp.add_argument("uid", nargs="?", help="uid=provider:id; без uid — все кандидаты")
     sp = sub.add_parser("apply", help="применить кандидата (проба -> §9)")
@@ -722,6 +835,14 @@ def main(argv=None):
     sp.add_argument("state", choices=["on", "off"])
     sub.add_parser("heartbeat-check", help="проверить пульс агента (§6.3); письмо, если нет цикла >24ч")
     sub.add_parser("auto-prolong", help="⚠️ продлить боевой прокси до истечения (§6.3, деньги; крон раз в сутки)")
+    sp = sub.add_parser("self-update", help="обновления с GitHub (UPDATE-PLAN): проверить маяк / применить")
+    sp.add_argument("--check", action="store_true", help="только сверить версии (поведение по умолчанию)")
+    sp.add_argument("--apply", dest="apply_now", action="store_true",
+                    help="скачать и установить (бэкап -> UPDATE=1 setup.sh -> verify -> откат при провале)")
+    sp.add_argument("--version", dest="to_version",
+                    help="какую версию ставить (по умолчанию — свежая с маяка; строго новее узла)")
+    sp.add_argument("--cron", action="store_true",
+                    help="режим планировщика: jitter -> check -> apply при авто+окне (крон 04:41)")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -729,7 +850,8 @@ def main(argv=None):
                 "probe": cmd_probe, "apply": cmd_apply, "rollback": cmd_rollback,
                 "buy": cmd_buy, "prolong": cmd_prolong, "drop": cmd_drop,
                 "rotate": cmd_rotate, "emergency": cmd_emergency,
-                "heartbeat-check": cmd_heartbeat_check, "auto-prolong": cmd_auto_prolong}
+                "heartbeat-check": cmd_heartbeat_check, "auto-prolong": cmd_auto_prolong,
+                "self-update": cmd_self_update, "egress-mark": cmd_egress_mark}
     try:
         return handlers[args.cmd](cfg, args)
     except ProviderError as e:

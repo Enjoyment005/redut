@@ -21,8 +21,11 @@ def _in(days):
 
 class FakeProv:
     caps = {"prolong": True, "buy": True, "delete": True}
+    name = "proxy6"        # C5: money сверяет адаптер с провайдером строки
 
-    def __init__(self):
+    def __init__(self, name=None):
+        if name:
+            self.name = name
         self.calls = []
 
     def getprice(self, count, days, version):
@@ -89,16 +92,62 @@ class TestScope(Base):
         self.assertEqual(r["prolonged"][0]["uid"], "proxy6:1")
         self.assertEqual(self.prov.calls[0][1], 30, "период из конфига")
 
-    def test_scope_with_reserve(self):
+    def test_dead_scope_ignored(self):
+        # B6 (роли v2): scope "current+reserve" опирался на роль reserve и выпилен.
+        # Старое значение в конфиге не должно ни падать, ни продлевать лишнее.
         self.cfg["auto_prolong"]["scope"] = "current+reserve"
         self.run_it()
-        self.assertEqual(sorted(c[0] for c in self.prov.calls), ["1", "2"])
+        self.assertEqual([c[0] for c in self.prov.calls], ["1"], "только боевой, резерва больше нет")
 
     def test_disabled_toggle(self):
         self.cfg["auto_prolong"]["enabled"] = False
         r = self.run_it()
         self.assertEqual(self.prov.calls, [])
         self.assertIn("выключено", r["skipped"])
+
+
+class TestProviderMatch(Base):
+    """C5: адаптер строго по провайдеру строки — чужой ext_id не трогаем."""
+
+    def make_battle_proxyline(self):
+        """Боевой канал — от ProxyLine (host совпадает с current_upstream)."""
+        self.pool.conn.execute(
+            "INSERT INTO proxy(uid,provider,ext_id,host,role,gone,date_end,probe_ok,country)"
+            " VALUES('proxyline:7','proxyline','7','3.3.3.3','auto',0,?,1,'de')", (_in(2),))
+        self.pool.conn.commit()
+        states_mod.apply_mod.current_upstream = lambda sb: "3.3.3.3"
+
+    def test_no_adapter_for_battle_alerts_not_silent(self):
+        # боевой от proxyline, ключ есть только у proxy6: НЕ зовём proxy6.prolong
+        # с чужим ext_id=7 — событие + алерт вместо молчаливого skip
+        self.make_battle_proxyline()
+        r = states_mod.auto_prolong(self.cfg, {"proxy6": self.prov}, self.pool,
+                                    self.alerter, log=lambda *a: None)
+        self.assertEqual(self.prov.calls, [], "prolong с чужим ext_id не ушёл")
+        self.assertEqual(r["prolonged"], [])
+        self.assertEqual(self.alerter.sent[0][0], "failed")
+        ev = self.pool.conn.execute(
+            "SELECT result FROM event WHERE action='auto-prolong'").fetchone()
+        self.assertEqual(ev["result"], "no-provider")
+
+    def test_right_adapter_chosen_by_row_provider(self):
+        self.make_battle_proxyline()
+        pl = FakeProv(name="proxyline")
+        states_mod.auto_prolong(self.cfg, {"proxy6": self.prov, "proxyline": pl},
+                                self.pool, self.alerter, log=lambda *a: None)
+        self.assertEqual(self.prov.calls, [], "proxy6 не трогали")
+        self.assertEqual([c[0] for c in pl.calls], ["7"], "продлил адаптер ProxyLine")
+
+    def test_gone_battle_row_still_alerts(self):
+        # ревью 1.3.0: после удаления ключа строки провайдера gone, но боевой канал
+        # в sing-box живёт — алерт «продлить нечем» обязан уйти, а не молчаливый skip
+        self.make_battle_proxyline()
+        self.pool.conn.execute("UPDATE proxy SET gone=1 WHERE uid='proxyline:7'")
+        self.pool.conn.commit()
+        r = states_mod.auto_prolong(self.cfg, {"proxy6": self.prov}, self.pool,
+                                    self.alerter, log=lambda *a: None)
+        self.assertNotIn("skipped", r, "боевой найден даже gone-строкой")
+        self.assertEqual(self.alerter.sent[0][0], "failed")
 
 
 class TestTiming(Base):

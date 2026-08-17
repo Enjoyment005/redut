@@ -262,25 +262,41 @@ def patch_boot_script(path, old_ip, new_ip):
 
 
 def verify_egress(expect_host=None):
-    """§9.8: IP через tun0 есть, страна не в жёстком блоке, TG отвечает через tun0."""
+    """§9.8: IP через tun0 есть, страна не в жёстком блоке, TG отвечает через tun0.
+
+    why_kind (F1, 1.3.0) — машинный признак причины провала для машины состояний:
+      "no-ip"      — ipify через tun0 пуст (канал мёртв);
+      "blocked-cc" — страна выхода в жёстком блоке (подтверждена повтором);
+      "tg"         — ipify ЖИВ, мёртв только api.telegram.org (канал НЕ мёртв —
+                     states не имеет права ломать его ротацией, DEGRADED).
+    """
     rc, ip = run_cmd(["curl", "-s", "--max-time", str(VERIFY_TIMEOUT),
                       "--interface", "tun0", probe_mod.IPIFY_URL], timeout=VERIFY_TIMEOUT + 10)
     ip = ip.strip()
     out = {"egress_ip": ip if probe_mod.looks_like_ip(ip) else None,
-           "exit_cc": None, "tg_code": None, "ok": False, "why": ""}
+           "exit_cc": None, "tg_code": None, "ok": False, "why": "", "why_kind": ""}
     if not out["egress_ip"]:
-        out["why"] = "egress через tun0 пуст"
+        out["why"], out["why_kind"] = "egress через tun0 пуст", "no-ip"
         return out
     out["exit_cc"] = probe_mod.geo_country(out["egress_ip"])
     if out["exit_cc"] in probe_mod.HARD_BLOCK_CC:
-        out["why"] = "страна выхода %s в жёстком блоке" % out["exit_cc"]
-        return out
+        # F1: не карать по одиночному вердикту одной базы — повторный запрос ОБЕИХ;
+        # блок при подтверждении ЛЮБОЙ из них на повторе (строгость probe сохранена:
+        # он тоже блочит по любой из баз — ослабления «до консенсуса» нет).
+        geo2 = probe_mod.geo_country_consensus(out["egress_ip"])
+        if (geo2["cc"] in probe_mod.HARD_BLOCK_CC
+                or (geo2["alt"] or "") in probe_mod.HARD_BLOCK_CC):
+            out["why"] = "страна выхода %s в жёстком блоке" % out["exit_cc"]
+            out["why_kind"] = "blocked-cc"
+            return out
+        out["exit_cc"] = geo2["cc"] or out["exit_cc"]   # ложняк одной базы — едем дальше
     rc, code = run_cmd(["curl", "-s", "--max-time", str(VERIFY_TIMEOUT), "--interface", "tun0",
                         "-o", "/dev/null", "-w", "%{http_code}", probe_mod.TG_URL],
                        timeout=VERIFY_TIMEOUT + 10)
     out["tg_code"] = code if rc == 0 else "000"
     if not (code.isdigit() and 200 <= int(code) <= 499):
         out["why"] = "Telegram-проба через tun0 не прошла (код %s)" % (code or "000")
+        out["why_kind"] = "tg"
         return out
     out["ok"] = True
     return out

@@ -19,6 +19,13 @@
   POST /api/proxy/<uid>/role        {role}
   POST /api/rollback                откат из кольца
   GET  /api/events?limit=N          журнал
+  --- настройки (§12; лимиты трат по-прежнему только по SSH) ---
+  GET  /api/strategy                четыре стратегии выбора стран + предпросмотр на живых данных
+  POST /api/strategy                {strategy} — сменить правило (config.json, без рестарта)
+  --- ключи провайдеров (§12; сам ключ обратно не отдаётся никогда) ---
+  GET  /api/key/status              по провайдеру: задан ли ключ, хвост, баланс, живых в пуле
+  POST /api/key                     {provider, key, force?} — сменить/добавить/убрать ключ
+  POST /api/key/check               {provider} — живая проверка уже сохранённого ключа
   --- деньги (фаза 2, гейты money.py §6.2/§6.4) ---
   GET  /api/market                  getcountry+getprice: что и почём (PROXY6)
   GET  /api/money                   лимиты, траты за сутки, последние записи money
@@ -29,9 +36,16 @@
   POST /api/rotate                  запустить диагностику -> RETUNE/ROTATING/REPLENISH/EMERGENCY
   POST /api/emergency               {on: bool} — прямой выход через WAN вкл/выкл
   (состояние автомата + пульс — в GET /api/status: automat/emergency/heartbeat)
+  --- обновления с GitHub (vpn/UPDATE-PLAN.md) ---
+  GET  /api/update/status           версии узла/маяка, когда проверялось, авто вкл/выкл, ход установки
+  POST /api/update/check            сверить с маяком сейчас (отдельным процессом vpn-agent)
+  POST /api/update/apply            обновиться сейчас: транзиентный юнит systemd-run redut-update
+                                    (переживает рестарт самой панели в середине обновления)
+  POST /api/update/config           {auto: bool} — тумблер автообновления (config.json, точечно)
 """
 import json
 import os
+import re
 import ssl
 import subprocess
 import sys
@@ -50,6 +64,7 @@ import money as money_mod          # noqa: E402
 import pool as pool_mod            # noqa: E402
 import probe as probe_mod          # noqa: E402
 import states as states_mod        # noqa: E402
+import update as update_mod        # noqa: E402
 from providers import make_providers, ProviderError, PROVIDER_CLASSES  # noqa: E402
 from webpanel import auth, views    # noqa: E402
 from webpanel import clients as clients_mod   # noqa: E402
@@ -61,6 +76,8 @@ CERT = "/etc/vpn-panel/panel.crt"
 KEY = "/etc/vpn-panel/panel.key"
 
 _DB_LOCK = threading.Lock()        # sqlite из потоков http-сервера — сериализуем доступ
+_SECRETS_LOCK = threading.Lock()   # secrets.json правят и мастер, и экран ключей — по одному
+_CONFIG_LOCK = threading.Lock()    # config.json: панель правит из него ровно одну настройку
 
 
 def _has(row, col):
@@ -69,6 +86,29 @@ def _has(row, col):
         return col in row.keys()
     except AttributeError:
         return col in (row or {})
+
+
+def events_limit(qs, default=40, cap=500):
+    """limit из query /api/events: нечисловое значение — дефолт, не 500-я ошибка."""
+    try:
+        n = int((qs.get("limit") or [str(default)])[0])
+    except (TypeError, ValueError):
+        n = default
+    return max(1, min(n, cap))
+
+
+def pool_view_order(rows, cfg, cur=None):
+    """Порядок строк «Пула прокси» (П3): боевой — первым, дальше ровно как у ротации
+    при текущей стратегии (таблица и превью «выбрало бы» обязаны совпадать: превью
+    текущего не рассматривает). Без подъёма боевого колонка «качество» выглядела бы
+    неотсортированной: его отображаемая оценка включает +15 стикинеса, а ключ
+    ранжирования — нет (ревью 1.3.0). Строки вне ранжирования (чёрный список:
+    rating is None) — в конец, стабильно по uid."""
+    ranked = states_mod.rank_candidates(rows, cfg)
+    order = {r["uid"]: i for i, r in enumerate(ranked)}
+    return sorted(rows, key=lambda r: (not (cur and r["host"] == cur),
+                                       r["uid"] not in order,
+                                       order.get(r["uid"], 0), str(r["uid"])))
 
 
 def load_config():
@@ -140,6 +180,95 @@ def _first_channel_kick():
         print("[setup] подбор первого канала не удался: %s" % e, flush=True)
 
 
+def _pool_refresh_kick():
+    """После смены ключа: подтянуть пул нового кабинета (фоновый поток, отдельный процесс).
+
+    Ключ сменили — значит, скорее всего, сменился и кабинет: в пуле лежат прокси
+    предыдущего аккаунта. vpn-agent перечитает secrets.json сам и сольёт список заново.
+    Ошибки не роняют панель — только лог (как в _first_channel_kick)."""
+    try:
+        rc, out = _run_agent(["pool-refresh"], timeout=300)
+        print("[key] pool-refresh rc=%s: %s" % (rc, (out or "")[-300:].replace("\n", " | ")), flush=True)
+    except Exception as e:      # noqa: BLE001 — фон, панель жить должна
+        print("[key] pool-refresh не удался: %s" % e, flush=True)
+
+
+# ── ключи провайдеров: правка из панели (§12 POST /api/key) ──────────────────────────
+# Ключ ходит только в одну сторону: панель принимает новый и показывает хвост
+# (mask_key), но никогда не отдаёт сохранённый обратно — ни в API, ни в HTML.
+#
+# Набор символов узкий намеренно: ключ PROXY6 подставляется В ПУТЬ URL
+# (providers/proxy6: /api/{key}/{method}/), поэтому слеш, «?», «%» и пробел в нём —
+# это не «странный ключ», а испорченный запрос. Реальные ключи обоих провайдеров
+# укладываются в hex/буквы/цифры с дефисами; если провайдер однажды выдаст что-то
+# шире — расширять здесь, осознанно.
+_RE_API_KEY = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
+
+
+def mask_key(key):
+    """Хвост ключа для показа человеку: «77b5…78f6». Сам ключ наружу не уходит."""
+    k = str(key or "")
+    if not k:
+        return ""
+    if len(k) <= 8:
+        return "•" * len(k)
+    return "%s…%s" % (k[:4], k[-4:])
+
+
+def validate_key_format(key):
+    """-> (ключ_без_пробелов_по_краям, ошибка_или_None). Проверка ДО обращения к API (§15)."""
+    k = str(key or "").strip()
+    if not k:
+        return "", "пустой ключ"
+    if not _RE_API_KEY.match(k):
+        return k, ("ключ не похож на API-ключ: допустимы латинские буквы, цифры, точка, "
+                   "двоеточие, дефис и подчёркивание (8–128 символов). Проверь, не скопировалось "
+                   "ли вместе с ключом что-то лишнее")
+    return k, None
+
+
+def check_key(name, key):
+    """Живая проверка ключа у провайдера (balance) -> (ok, info).
+
+    info при успехе: {"balance", "currency"}; при отказе: {"error", "network"}.
+    network=True — провайдер недоступен с сервера (не «ключ плохой»), см. providers/base.
+    """
+    cls = PROVIDER_CLASSES.get(name)
+    if cls is None:
+        return False, {"error": "неизвестный провайдер %r" % name, "network": False}
+    try:
+        b = cls(key).balance()
+    except ProviderError as e:
+        return False, {"error": str(e), "network": bool(e.network)}
+    except Exception as e:      # noqa: BLE001 — чужой ответ не должен ронять панель
+        return False, {"error": "%s: %s" % (type(e).__name__, e), "network": False}
+    return True, {"balance": b.get("balance"), "currency": b.get("currency") or ""}
+
+
+def provider_keys(secrets):
+    """Имена провайдеров, у которых сейчас задан ключ."""
+    return {n for n in PROVIDER_CLASSES if ((secrets or {}).get(n) or {}).get("api_key")}
+
+
+def merge_key(secrets, name, key):
+    """Копия secrets с записанным (key) или убранным (key=None/"") ключом провайдера.
+
+    Остальные блоки — admin, smtp, второй провайдер — переносятся как есть; из блока
+    провайдера убираем только api_key, а если в нём больше ничего нет — и сам блок."""
+    data = dict(secrets or {})
+    block = dict(data.get(name) or {})
+    if key:
+        block["api_key"] = key
+        data[name] = block
+    else:
+        block.pop("api_key", None)
+        if block:
+            data[name] = block
+        else:
+            data.pop(name, None)
+    return data
+
+
 def _make_mask(secrets):
     """Маска секретов для тела писем (§15): ключи провайдеров, SMTP-пароль."""
     vals = []
@@ -193,6 +322,60 @@ class App:
         os.replace(tmp, path)
         self.reload_secrets()
 
+    def save_provider_key(self, name, key):
+        """Записать (key) или убрать (key=None) ключ провайдера, не трогая остальное.
+
+        Файл перечитываем с диска под локом, а не пишем копию из памяти: recovery-коды
+        вычёркивает auth.consume_recovery_code мимо этого объекта, и запись устаревшей
+        копии воскресила бы уже использованный код."""
+        with _SECRETS_LOCK:
+            data, _ = load_secrets()
+            if not data:
+                data = dict(self.secrets or {})
+            self.write_secrets(merge_key(data, name, key))
+
+    def save_strategy(self, name):
+        """Записать стратегию стран в config.json и применить без рестарта.
+
+        Правим ТОЧЕЧНО файл, из которого читали, а не выгружаем cfg целиком: load_config
+        подмешивает в память значения по умолчанию (пути к БД, кольцу, sing-box, порт) и
+        служебный `_source` — выгрузка зашила бы их в конфиг сервера навсегда.
+        Лимиты трат остаются недосягаемы из браузера (§6.2) — здесь только одна строка."""
+        if name not in country_mod.STRATEGIES:
+            raise ValueError("неизвестная стратегия %r" % name)
+        path = self.cfg.get("_source") or ETC_CONFIG
+        with _CONFIG_LOCK:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            data.setdefault("countries", {})["strategy"] = name
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            try:
+                os.chmod(tmp, 0o644)     # конфиг читает и агент из-под cron
+            except OSError:
+                pass
+            os.replace(tmp, path)
+            self.cfg.setdefault("countries", {})["strategy"] = name
+
+    def save_update_auto(self, on):
+        """Тумблер автообновления: точечная правка config.json (по образцу save_strategy —
+        cfg целиком не выгружаем, чтобы не зашить в файл подмешанные дефолты)."""
+        path = self.cfg.get("_source") or ETC_CONFIG
+        with _CONFIG_LOCK:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            data.setdefault("update", {})["auto"] = bool(on)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            try:
+                os.chmod(tmp, 0o644)     # конфиг читает и агент из-под cron
+            except OSError:
+                pass
+            os.replace(tmp, path)
+            self.cfg.setdefault("update", {})["auto"] = bool(on)
+
     def read_singbox(self):
         try:
             return apply_mod.load_json(self.cfg["singbox_config"])
@@ -207,9 +390,11 @@ class App:
         cb = (lambda: prov.check(row["ext_id"])) if prov and prov.caps.get("check") else None
         # сеть (curl) — вне лока (долго); запись в БД — под общим локом
         res = probe_mod.probe(row, provider_check=cb)
-        res["score"] = probe_mod.score(row, res, is_current=(row["host"] == self.current_host()))
+        is_cur = row["host"] == self.current_host()
+        res["score"] = probe_mod.score(row, res, is_current=is_cur, cfg=self.cfg)
         with _DB_LOCK:
-            self.pool.record_probe(row["uid"], res)
+            self.pool.record_probe(row["uid"], res, is_current=is_cur,
+                                   strategy=country_mod.strategy(self.cfg))
         return res
 
 
@@ -319,13 +504,16 @@ class Handler(BaseHTTPRequestHandler):
             with _DB_LOCK:
                 rows = APP.pool.list(include_gone=True)
             cur = APP.current_host()
+            # П3: боевой первым, дальше порядок перебора ротации при текущей стратегии
+            # (чек-лист приёмки: «порядок совпадает с превью „выбрало бы“»)
+            rows = pool_view_order(rows, APP.cfg, cur)
             return self._json(200, {"proxies": [self._pool_row(r, cur) for r in rows]})
         if path == "/api/events":
-            limit = int((qs.get("limit") or ["50"])[0])
+            limit = events_limit(qs)
             with _DB_LOCK:
                 evs = APP.pool.conn.execute(
                     "SELECT ts,actor,action,result,detail FROM event ORDER BY id DESC LIMIT ?",
-                    (min(limit, 500),)).fetchall()
+                    (limit,)).fetchall()
             return self._json(200, {"events": [dict(zip(("ts", "actor", "action", "result", "detail"), e))
                                                for e in evs]})
         if path == "/api/market":
@@ -338,8 +526,24 @@ class Handler(BaseHTTPRequestHandler):
                     " ORDER BY id DESC LIMIT 100").fetchall()
                 spent = APP.pool.spent_today("RUB")
                 buys = APP.pool.buys_today()
+                stab = APP.pool.stability_all()
+            # F8: надёжность пар (provider, страна) по опыту узла — для карточки «Деньги»
+            st_out = []
+            for s in stab:
+                total = int(s["probes_ok"] or 0) + int(s["probes_fail"] or 0)
+                if not total:
+                    continue
+                st_out.append({
+                    "provider": s["provider"], "country": s["country"], "probes": total,
+                    "days": int(money_mod._days_seen(s)),
+                    "rel_pct": round(100.0 * int(s["probes_ok"] or 0) / total),
+                    "drops": int(s["battle_drops"] or 0),
+                    "learning": not money_mod.stability_mature(s, APP.cfg),
+                    "bonus": money_mod.stability_bonus(s, APP.cfg)})
+            st_out.sort(key=lambda x: (-x["probes"], x["country"]))
             return self._json(200, {"limits": money_mod.limits(APP.cfg),
                                     "today": {"buys": buys, "spent_rub": spent, "day": day},
+                                    "stability": st_out,
                                     "rows": [dict(zip(("ts", "provider", "op", "uid", "price",
                                                        "currency", "balance_after"), r)) for r in rows]})
         if path == "/api/clients":
@@ -348,6 +552,12 @@ class Handler(BaseHTTPRequestHandler):
                                         "next_ip": clients_mod.next_free_ip(APP.cfg)})
             except clients_mod.ClientError as e:
                 return self._json(500, {"error": str(e)})
+        if path == "/api/key/status":
+            return self._json(200, self._key_status())
+        if path == "/api/strategy":
+            return self._json(200, self._strategy_state())
+        if path == "/api/update/status":
+            return self._json(200, self._update_status())
         parts = path.strip("/").split("/")   # api clients <name> config|qr
         if len(parts) == 4 and parts[:2] == ["api", "clients"]:
             name = unquote(parts[2])
@@ -425,7 +635,9 @@ class Handler(BaseHTTPRequestHandler):
     def _api_post(self, path):
         if path == "/api/pool/refresh":
             with _DB_LOCK:
-                summary = APP.pool.refresh(APP.providers, actor="user")
+                # active по ключам на диске (🔴 C2): осиротевшие провайдеры — gone
+                summary = APP.pool.refresh(APP.providers, actor="user",
+                                           active=provider_keys(APP.secrets))
                 for name, prov in APP.providers.items():
                     if name in summary["errors"]:
                         continue
@@ -453,12 +665,43 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": r["ok"], "bad_ip": r["bad_ip"], "good_ip": r["good_ip"],
                                     "egress": r["verify"]["egress_ip"]})
         if path == "/api/rotate":
-            # машина состояний §8 отдельным процессом (см. _agent_cmd)
-            rc, out = _run_agent(["rotate", "--reason", "panel"])
+            if os.name != "posix":
+                # dev-режим: короткий no-op цикл влезает в таймаут — как раньше
+                rc, out = _run_agent(["rotate", "--reason", "panel"])
+                with _DB_LOCK:
+                    st = APP.pool.get_setting("automat_state") or "OK"
+                    APP.pool.log_event("panel-rotate", actor="user", result=st, src_ip=self._client_ip())
+                return self._json(200, {"ok": rc == 0, "state": st, "output": (out or "")[-1500:]})
+            # F6: транзиентный юнит вместо _run_agent с таймаутом 240 с — цикл с 5
+            # кандидатами + apply + откат в таймаут не влезал, панель убивала агента
+            # посреди работы с непредсказуемым состоянием маршрутов. RuntimeMaxSec
+            # добивает зависший цикл (flock не держится вечно); коллизия имени юнита
+            # = «ротация уже идёт» (бесплатный дедуп повторных кликов); в argv юнита —
+            # только константы, никаких данных из тела запроса. UI поллит /api/status.
+            rc, out = apply_mod.run_cmd(["systemd-run", "--collect", "-p", "RuntimeMaxSec=900",
+                                         "--unit", "redut-rotate",
+                                         "/usr/local/bin/vpn-agent", "rotate", "--reason", "panel"])
+            busy = rc != 0 and "already" in (out or "").lower()
             with _DB_LOCK:
-                st = APP.pool.get_setting("automat_state") or "OK"
-                APP.pool.log_event("panel-rotate", actor="user", result=st, src_ip=self._client_ip())
-            return self._json(200, {"ok": rc == 0, "state": st, "output": (out or "")[-1500:]})
+                APP.pool.log_event("panel-rotate", actor="user",
+                                   result="started" if rc == 0 else ("busy" if busy else "fail"),
+                                   src_ip=self._client_ip())
+            if rc == 0:
+                return self._json(200, {"ok": True, "started": True})
+            if busy:
+                return self._json(200, {"ok": True, "started": False, "busy": True})
+            return self._json(500, {"error": "systemd-run не запустился: %s" % (out or "rc=%s" % rc)})
+        if path == "/api/automat":
+            # F7: пауза автоматики из панели (FROZEN) — тот же конвейер session+CSRF
+            body = json.loads(self._body() or b"{}") or {}
+            if not isinstance(body.get("frozen"), bool):
+                return self._json(400, {"error": "ожидаю {frozen: true|false}"})
+            with _DB_LOCK:
+                APP.pool.set_setting("automat_frozen", "1" if body["frozen"] else None)
+                APP.pool.log_event("automat-pause", actor="user",
+                                   result="on" if body["frozen"] else "off",
+                                   src_ip=self._client_ip())
+            return self._json(200, {"ok": True, "frozen": body["frozen"]})
         if path == "/api/emergency":
             body = json.loads(self._body() or b"{}") or {}
             on = bool(body.get("on"))
@@ -516,7 +759,274 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, r)
         if path == "/api/buy":
             return self._do_buy(json.loads(self._body() or b"{}") or {})
+        if path == "/api/key":
+            return self._do_key(json.loads(self._body() or b"{}") or {})
+        if path == "/api/key/check":
+            return self._do_key_check(json.loads(self._body() or b"{}") or {})
+        if path == "/api/strategy":
+            return self._do_strategy(json.loads(self._body() or b"{}") or {})
+        if path == "/api/update/check":
+            # Отдельным процессом vpn-agent (как rotate): та же кодовая дорожка, что у
+            # крона, свой conn к БД; заодно агент сам напишет событие/письмо при новинке.
+            rc, out = _run_agent(["self-update", "--check"], timeout=120)
+            res = self._update_status()
+            res.update({"ok": rc == 0, "output": (out or "")[-800:]})
+            return self._json(200, res)
+        if path == "/api/update/apply":
+            return self._do_update_apply()
+        if path == "/api/update/config":
+            body = json.loads(self._body() or b"{}") or {}
+            if not isinstance(body.get("auto"), bool):
+                return self._json(400, {"error": "ожидаю {auto: true|false}"})
+            APP.save_update_auto(body["auto"])
+            with _DB_LOCK:
+                APP.pool.log_event("update-auto", actor="user",
+                                   result="on" if body["auto"] else "off", src_ip=self._client_ip())
+            return self._json(200, self._update_status())
         self._json(404, {"error": "нет такого метода"})
+
+    def _do_update_apply(self):
+        """POST /api/update/apply: обновиться сейчас.
+
+        Запускаем ТРАНЗИЕНТНЫМ юнитом (systemd-run): установка перезапустит саму
+        панель, и работа, начатая в потоке этого сервера, погибла бы на середине.
+        Юнит живёт отдельно от панели, прогресс пишется в /run и state — карточка
+        дочитает исход после своего рестарта."""
+        if os.name != "posix":
+            return self._json(400, {"error": "обновление применяется только на сервере"})
+        st = self._update_status()
+        if st.get("applying"):
+            return self._json(409, {"error": "обновление уже идёт"})
+        if not st.get("latest"):
+            return self._json(400, {"error": "сначала «Проверить сейчас» — панель ещё не знает свежую версию"})
+        if not st.get("newer"):
+            return self._json(400, {"error": "обновляться не на что: узел уже на %s"
+                                             % (st.get("local") or "?")})
+        target = str(st["latest"])
+        rc, out = apply_mod.run_cmd(["systemd-run", "--unit", "redut-update", "--collect",
+                                     "/usr/local/bin/vpn-agent", "self-update",
+                                     "--apply", "--version", target])
+        with _DB_LOCK:
+            APP.pool.log_event("update-apply-start", actor="user", result=target,
+                               src_ip=self._client_ip())
+        if rc != 0:
+            return self._json(500, {"error": "systemd-run не запустился: %s" % (out or "rc=%s" % rc)})
+        return self._json(200, {"ok": True, "started": target})
+
+    # ------------------------------------------------ стратегия стран (§6.1)
+    def _strategy_state(self):
+        """GET /api/strategy: четыре стратегии + что изменится ПРЯМО СЕЙЧАС.
+
+        Абстрактное описание («репутация важнее скорости») человеку мало что говорит,
+        поэтому к каждой стратегии считаем два факта на живых данных: в каких странах
+        она разрешит автопокупку и какой прокси из нынешнего пула выбрала бы ротация.
+        Всё считается на месте, без обращений к провайдеру."""
+        cur_host = APP.current_host()
+        with _DB_LOCK:
+            rows = APP.pool.rotation_candidates(exclude_host=cur_host)
+        rows = [r for r in rows if r["provider"] in APP.providers]   # только активные (П7)
+        pool_cc = []
+        for r in rows:
+            cc = (r["exit_cc"] if _has(r, "exit_cc") and r["exit_cc"] else r["country"])
+            if cc and cc not in pool_cc:
+                pool_cc.append(cc)
+        out = []
+        for sid in country_mod.STRATEGIES:
+            cfg = dict(APP.cfg)
+            cfg["countries"] = dict(APP.cfg.get("countries") or {}, strategy=sid)
+            st = country_mod.strategy_info(name=sid)
+            top = states_mod.rank_candidates(rows, cfg)[:1]
+            with _DB_LOCK:   # F8: buy_candidates читает выученную стабильность из БД
+                buy = money_mod.buy_candidates(cfg, available=pool_cc, pool=APP.pool)[:8]
+            out.append({"id": sid, "title": st["title"], "short": st["short"], "desc": st["desc"],
+                        "current": sid == country_mod.strategy(APP.cfg),
+                        "buy": buy,
+                        "pick": (self._brief(top[0]) if top else None)})
+        return {"current": country_mod.strategy(APP.cfg), "strategies": out,
+                "whitelist": country_mod.whitelist(APP.cfg),
+                "blacklist": sorted(country_mod.blacklist(APP.cfg)),
+                "pool_size": len(rows)}
+
+    @staticmethod
+    def _brief(row):
+        """Кандидат одной строкой — для предпросмотра «кого выбрала бы стратегия»."""
+        cc = (row["exit_cc"] if _has(row, "exit_cc") and row["exit_cc"] else row["country"])
+        return {"uid": row["uid"], "host": row["host"], "cc": cc}
+
+    def _do_strategy(self, body):
+        """POST /api/strategy {strategy} — сменить правило выбора стран.
+
+        На УЖЕ работающий канал не влияет: правило применится при следующей смене
+        (ротация, «В бой», покупка). Чёрный список не трогает никакая стратегия."""
+        name = str(body.get("strategy") or "").strip().lower()
+        if name not in country_mod.STRATEGIES:
+            return self._json(400, {"error": "неизвестная стратегия"})
+        was = country_mod.strategy(APP.cfg)
+        if name != was:
+            APP.save_strategy(name)
+            with _DB_LOCK:
+                APP.pool.log_event("strategy", actor="user", result=name,
+                                   detail="было: %s" % was, src_ip=self._client_ip())
+        state = self._strategy_state()
+        state.update({"ok": True, "was": was, "changed": name != was})
+        return self._json(200, state)
+
+    # ------------------------------------------------ обновления (UPDATE-PLAN)
+    def _update_status(self):
+        """GET /api/update/status: версии и настройки — без сети (открытие страницы).
+
+        Живой поход к маяку — только по кнопке (POST /api/update/check) или по крону:
+        GitHub с опроса каждой загрузки дашборда нам ни к чему."""
+        u = update_mod.update_cfg(APP.cfg)
+        st = update_mod.load_state(APP.cfg)
+        local = update_mod.node_version()
+        latest = st.get("latest_seen")
+        bad = st.get("bad_versions") or []
+        live = update_mod.status_read()
+        applying = bool(live and live.get("phase") in
+                        ("check", "download", "backup", "install", "verify", "rollback"))
+        if os.name == "posix":
+            # На узле верим живым признакам, а не фазе в /run (могла остаться от kill -9):
+            # лок redut-update держат ОБА пути (кнопка через systemd-run и ночной крон) —
+            # без пробы лока крон-обновление было бы для панели невидимым (ревью 17.08).
+            lock_busy = False
+            try:
+                with apply_mod.Flock(update_mod.LOCK_PATH):
+                    pass
+            except apply_mod.ApplyError:
+                lock_busy = True
+            rc, act = apply_mod.run_cmd(["systemctl", "is-active", "redut-update"])
+            applying = lock_busy or (act or "").strip() in ("active", "activating")
+        return {"local": local, "latest": latest,
+                "newer": update_mod.is_newer(latest, local),
+                "bad": latest in bad, "bad_versions": bad,
+                "last_check": st.get("last_check"), "last_error": st.get("last_error"),
+                "last_apply": st.get("last_apply"), "live": live, "applying": applying,
+                "auto": u["auto"], "window": u["window"],
+                "window_ok": update_mod.window_covers_cron(u["window"]),
+                "repo": u["repo"]}
+
+    # ------------------------------------------------ ключи провайдеров (§12)
+    def _key_status(self):
+        """GET /api/key/status: задан ли ключ, его хвост, баланс из кэша, живых в пуле.
+
+        Живьём провайдера здесь не дёргаем — это открытие страницы. Проверка по кнопке:
+        POST /api/key/check."""
+        with _DB_LOCK:
+            rows = APP.pool.list(include_gone=True)
+            balances = {k.split(":", 1)[1]: v for k, v in
+                        APP.pool.conn.execute("SELECT key,value FROM setting WHERE key LIKE 'balance:%'")}
+        out = []
+        for name in PROVIDER_CLASSES:
+            key = ((APP.secrets or {}).get(name) or {}).get("api_key")
+            # без ключа не показываем ни «живых», ни баланс — панель их не видит (П7)
+            out.append({"provider": name, "set": bool(key), "masked": mask_key(key),
+                        "balance": (balances.get(name) or "") if key else "",
+                        "alive": len([r for r in rows if r["provider"] == name and not r["gone"]])
+                                 if key else 0})
+        return {"providers": out}
+
+    def _do_key(self, body):
+        """POST /api/key {provider, key, force?} — сменить, добавить или убрать ключ.
+
+        Ключ проверяется живьём (balance) ДО записи: отвергнутый провайдером не сохраняем.
+        «Нет связи» — не приговор ключу (у RU-хостера PROXY6 закрыт напрямую, приёмка 15.08):
+        отвечаем needs_force, и по подтверждению человека кладём ключ непроверенным — узел
+        достучится до API через собственный канал (providers/base, транспорт tun0).
+        Пустой key убирает ключ; последний оставшийся убрать нельзя — панель ослепнет.
+        """
+        name = str(body.get("provider") or "").strip()
+        if name not in PROVIDER_CLASSES:
+            return self._json(400, {"error": "неизвестный провайдер"})
+        raw = body.get("key")
+        if raw is None or not str(raw).strip():
+            return self._do_key_delete(name)
+        key, bad = validate_key_format(raw)
+        if bad:
+            return self._json(400, {"error": bad})
+        ok, info = check_key(name, key)
+        if not ok and not info.get("network"):
+            return self._json(400, {"error": "ключ не принят: %s" % info["error"]})
+        if not ok and not body.get("force"):
+            # провайдер недоступен с сервера — решает человек (сохранить без проверки?)
+            return self._json(200, {"ok": False, "saved": False, "needs_force": True,
+                                    "network": True, "error": info["error"]})
+        APP.save_provider_key(name, key)
+        if ok:
+            with _DB_LOCK:
+                APP.pool.set_setting("balance:%s" % name,
+                                     "%s %s" % (info.get("balance"), info.get("currency")))
+        with _DB_LOCK:
+            APP.pool.log_event("key-set", actor="user", result="ok" if ok else "unverified",
+                               detail=name, src_ip=self._client_ip())
+        # кабинет сменился — список прокси в кэше уже не про него
+        threading.Thread(target=_pool_refresh_kick, name="key-pool-refresh", daemon=True).start()
+        return self._json(200, {"ok": True, "saved": True, "verified": bool(ok),
+                                "provider": name, "masked": mask_key(key),
+                                "balance": info.get("balance"), "currency": info.get("currency"),
+                                "error": "" if ok else info["error"]})
+
+    def _do_key_delete(self, name):
+        """Убрать ключ провайдера (П7): его прокси помечаются gone (их больше некому
+        опросить и нечем продлить), кэш баланса убирается — как и обещает confirm в UI.
+        Боевой канал НЕ рвём (правило «держать IP»), только предупреждаем."""
+        # проверка «последнего ключа» и запись — под ОДНИМ локом по данным с диска
+        # (ревью 1.3.0): два одновременных удаления разных провайдеров иначе оба
+        # проходили проверку и оставляли панель слепой
+        with _SECRETS_LOCK:
+            data, _ = load_secrets()
+            if not data:
+                data = dict(APP.secrets or {})
+            if not ((data or {}).get(name) or {}).get("api_key"):
+                return self._json(400, {"error": "у %s и так нет ключа" % name})
+            if provider_keys(data) <= {name}:
+                return self._json(400, {"error": "это последний ключ: без него панель не увидит пул, "
+                                                 "не купит замену и не продлит боевой прокси. "
+                                                 "Сначала впиши рабочий ключ другого провайдера"})
+            APP.write_secrets(merge_key(data, name, None))
+        cur_host = APP.current_host()
+        with _DB_LOCK:
+            c = APP.pool.conn.execute(
+                "UPDATE proxy SET gone=1 WHERE provider=? AND gone=0", (name,))
+            marked = c.rowcount if c.rowcount and c.rowcount > 0 else 0
+            APP.pool.conn.execute("DELETE FROM setting WHERE key=?", ("balance:%s" % name,))
+            APP.pool.conn.commit()
+            battle = None
+            if cur_host:
+                battle = APP.pool.conn.execute(
+                    "SELECT uid FROM proxy WHERE provider=? AND host=?",
+                    (name, cur_host)).fetchone()
+            APP.pool.log_event("key-del", actor="user", result="ok",
+                               detail="%s: помечено gone %d, баланс убран%s"
+                               % (name, marked, "; боевой остаётся" if battle else ""),
+                               src_ip=self._client_ip())
+        warning = ""
+        if battle:
+            warning = ("Боевой канал принадлежит %s: он продолжает работать, но продление "
+                       "теперь невозможно — канал будет заменён по истечении срока" % name)
+        return self._json(200, {"ok": True, "deleted": True, "provider": name,
+                                "gone_marked": marked, "warning": warning})
+
+    def _do_key_check(self, body):
+        """POST /api/key/check {provider} — живая проверка уже сохранённого ключа."""
+        name = str(body.get("provider") or "").strip()
+        if name not in PROVIDER_CLASSES:
+            return self._json(400, {"error": "неизвестный провайдер"})
+        key = ((APP.secrets or {}).get(name) or {}).get("api_key")
+        if not key:
+            return self._json(400, {"error": "у %s не задан ключ" % name})
+        ok, info = check_key(name, key)
+        with _DB_LOCK:
+            if ok:
+                APP.pool.set_setting("balance:%s" % name,
+                                     "%s %s" % (info.get("balance"), info.get("currency")))
+            APP.pool.log_event("key-check", actor="user",
+                               result="ok" if ok else ("no-link" if info.get("network") else "fail"),
+                               detail="%s: %s" % (name, info.get("error", "")) if not ok else name,
+                               src_ip=self._client_ip())
+        return self._json(200, {"ok": ok, "provider": name, "balance": info.get("balance"),
+                                "currency": info.get("currency"), "network": info.get("network", False),
+                                "error": info.get("error", "")})
 
     # ------------------------------------------------ деньги (§6, гейты money.py)
     def _do_buy(self, body):
@@ -540,9 +1050,15 @@ class Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             return self._json(400, {"error": "period должен быть числом"})
         version = int(lim["buy_version"])
-        # страну назвали — берём её; нет — идём по умной оценке (лучшие страны первыми)
+        # страну назвали — берём её; нет — идём по умной оценке (репутация +
+        # выученная стабильность F8, лучшие страны первыми)
+        if country:
+            cands = [country]
+        else:
+            with _DB_LOCK:
+                cands = money_mod.buy_candidates(APP.cfg, pool=APP.pool)
         pick = None
-        for cc in ([country] if country else money_mod.buy_candidates(APP.cfg)):
+        for cc in cands:
             try:
                 if prov.getcount(cc, version) > 0:
                     pick = cc
@@ -564,7 +1080,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(409, {"error": "гейт трат: %s" % e})
         # §6.1 постфактум: реальная страна выхода (пробы — ВНЕ лока, они долгие)
         post = self._postbuy(prov, r["proxies"])
-        return self._json(200, {"ok": True, "recovered": r["recovered"], "price": r["price"],
+        return self._json(200, {"ok": True, "warning": warn,
+                                "recovered": r["recovered"], "price": r["price"],
                                 "currency": r["currency"], "balance_after": r["balance_after"],
                                 "order_id": r["order_id"], "country": r["country"],
                                 "uids": ["%s:%s" % (x["provider"], x["ext_id"]) for x in r["proxies"]],
@@ -624,8 +1141,6 @@ class Handler(BaseHTTPRequestHandler):
         prov = APP.providers.get(row["provider"])
         if prov is None or not prov.caps.get("delete"):
             return self._json(400, {"error": "провайдер %s не умеет удаление" % row["provider"]})
-        if row["role"] == "chrome":
-            return self._json(403, {"error": "роль chrome защищена от удаления (§5)"})
         cur = APP.current_host()
         pchk = None
         try:
@@ -641,8 +1156,6 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(200, {"ok": True, "deleted": n, "uid": row["uid"]})
 
     def _do_apply(self, row):
-        if row["role"] == "chrome":
-            return self._json(403, {"error": "роль chrome защищена (§5)"})
         res = APP.probe_row(row)
         if res["disqualified"] or not res["ok"]:
             with _DB_LOCK:
@@ -653,6 +1166,13 @@ class Handler(BaseHTTPRequestHandler):
         r = apply_mod.apply_candidate(APP.cfg, row, res, log=lambda m: None)
         with _DB_LOCK:
             APP.pool.mark_used(row["uid"])
+            # П9: ручное «В бой» для off разрешено, но успешный apply переводит off->auto —
+            # иначе боевой канал невидим selectable_candidates и подсчёту резерва (N+1
+            # решал бы «резерва нет» при живом боевом).
+            if row["role"] == "off":
+                APP.pool.set_role(row["uid"], "auto")
+                APP.pool.log_event("role", actor="auto", to_uid=row["uid"], result="auto",
+                                   detail="успешный apply переводит off->auto (П9)")
             APP.pool.log_event("apply", actor="user", to_uid=row["uid"], result="ok",
                                detail=json.dumps({"old_ip": r["old_ip"], "new_ip": r["new_ip"],
                                                   "verify": r["verify"]}, ensure_ascii=False),
@@ -765,19 +1285,20 @@ class Handler(BaseHTTPRequestHandler):
             key = (body.get(name) or "").strip()
             if not key:
                 continue
-            try:
-                bal = PROVIDER_CLASSES[name](key).balance()
-                res[name] = {"ok": True, "balance": bal.get("balance"), "currency": bal.get("currency")}
+            key, bad = validate_key_format(key)     # та же проверка, что и у экрана ключей
+            if bad:
+                res[name] = {"ok": False, "error": bad}
+                continue
+            ok, info = check_key(name, key)
+            if ok:
+                res[name] = {"ok": True, "balance": info["balance"], "currency": info["currency"]}
                 keys[name] = key
                 verified += 1
-            except ProviderError as e:
-                if e.network:
-                    res[name] = {"ok": False, "network": True, "saved_unverified": True, "error": str(e)}
-                    keys[name] = key
-                else:
-                    res[name] = {"ok": False, "error": str(e)}
-            except Exception as e:
-                res[name] = {"ok": False, "error": str(e)}
+            elif info["network"]:
+                res[name] = {"ok": False, "network": True, "saved_unverified": True, "error": info["error"]}
+                keys[name] = key
+            else:
+                res[name] = {"ok": False, "error": info["error"]}
         if not verified:
             for name, r in res.items():
                 r.pop("saved_unverified", None)     # без единого проверенного ключа не сохраняем ничего
@@ -797,6 +1318,13 @@ class Handler(BaseHTTPRequestHandler):
             smtp["port"] = int(smtp["port"] or 587)
         except (TypeError, ValueError):
             return self._json(400, {"error": "порт — число"})
+        # Адреса проверяем на входе, а не когда первый алерт молча не уйдёт (501 Invalid
+        # MAIL FROM): «from», если задан, и «to» должны быть настоящими e-mail, а не
+        # отображаемым именем вроде «От ВПНА».
+        if not alerts_mod._valid_email(smtp["to"]):
+            return self._json(400, {"error": "«to» — не похоже на e-mail адрес (например you@example.com)"})
+        if smtp.get("from") and not alerts_mod._valid_email(smtp["from"]):
+            return self._json(400, {"error": "«from» — не похоже на e-mail; впишите почтовый адрес или оставьте поле пустым"})
         APP.setup["smtp"] = smtp
         APP.setup["smtp_done"] = True
         return self._json(200, {"ok": True})
@@ -834,6 +1362,7 @@ class Handler(BaseHTTPRequestHandler):
     def _status(self):
         sb = APP.read_singbox() or {}
         out = {"server": APP.cfg.get("server"), "role": APP.cfg.get("role"),
+               "version": update_mod.node_version(),
                "subnet": APP.cfg.get("subnet"), "final": (sb.get("route") or {}).get("final"),
                "singbox": "?", "upstream": {}, "balances": {}, "egress": None,
                # белый список стран — дашборд предупреждает, если выход идёт мимо него
@@ -843,12 +1372,18 @@ class Handler(BaseHTTPRequestHandler):
                 out["upstream"]["socks_out"] = "%s:%s %s" % (o.get("server"), o.get("server_port"), o.get("type"))
             if o.get("tag") == "http-tg":
                 out["upstream"]["http_tg"] = "%s:%s %s" % (o.get("server"), o.get("server_port"), o.get("type"))
+        out["rotate_busy"] = False
         if os.name == "posix":
             rc, act = apply_mod.run_cmd(["systemctl", "is-active", "sing-box"])
             out["singbox"] = act or "?"
+            # F6: ротация из панели идёт транзиентным юнитом — фронт поллит её ход
+            rc, ract = apply_mod.run_cmd(["systemctl", "is-active", "redut-rotate"])
+            out["rotate_busy"] = (ract or "").strip() in ("active", "activating")
         with _DB_LOCK:
             rows = APP.pool.list(include_gone=True)
-            out["pool_alive"] = len([r for r in rows if not r["gone"]])
+            # только провайдеры с ключом: осиротевший пул — не «живой» (П7)
+            out["pool_alive"] = len([r for r in rows
+                                     if not r["gone"] and r["provider"] in APP.providers])
             for k, v in APP.pool.conn.execute("SELECT key,value FROM setting WHERE key LIKE 'balance:%'"):
                 out["balances"][k.split(":", 1)[1]] = v
             # автомат состояний (§8) + пульс (§6.3)
@@ -866,6 +1401,10 @@ class Handler(BaseHTTPRequestHandler):
         out["cc_tier"] = country_mod.tier(out.get("egress_cc"), True, APP.cfg)
         out["cc_hint"] = country_mod.explain(out.get("egress_cc"), True, APP.cfg)
         out["cc_blacklist"] = sorted(country_mod.blacklist(APP.cfg))
+        st = country_mod.strategy_info(APP.cfg)
+        out["strategy"] = st["id"]
+        out["strategy_title"] = st["title"]
+        out["strategy_short"] = st["short"]
         out["auto_prolong"] = states_mod.auto_prolong_cfg(APP.cfg)
         return out
 
@@ -873,13 +1412,26 @@ class Handler(BaseHTTPRequestHandler):
         days = probe_mod.days_left(r["date_end"])
         cc = r["exit_cc"] if _has(r, "exit_cc") and r["exit_cc"] else r["country"]
         agree = True if not _has(r, "geo_agree") or r["geo_agree"] is None else bool(r["geo_agree"])
+        # П1: строка запрещённой страны прячется фронтом. Проверяем ВСЕ ТРИ известные
+        # страны строки — probe дисквалифицирует по любой из geoip-баз (probe.py),
+        # отображение должно совпадать с автоматикой, иначе строка «только по второй
+        # базе в блоке» просочится в таблицу.
+        blocked = any(country_mod.is_blocked(x, APP.cfg) for x in (
+            r["exit_cc"] if _has(r, "exit_cc") else None,
+            r["exit_cc_alt"] if _has(r, "exit_cc_alt") else None,
+            r["country"]))
+        is_cur = bool(cur and r["host"] == cur)
+        # П3: оценка на лету под текущую стратегию (колонка score в БД — лишь
+        # последний замер той стратегии, что была активна в момент пробы)
+        live_score, _ = probe_mod.score_from_row(r, APP.cfg, is_current=is_cur)
         return {"uid": r["uid"], "provider": r["provider"], "country": r["country"],
+                "provider_active": r["provider"] in APP.providers,
                 "host": r["host"], "port_socks5": r["port_socks5"], "port_http": r["port_http"],
-                "role": r["role"], "score": r["score"], "gone": r["gone"],
+                "role": r["role"], "score": live_score, "gone": r["gone"], "blocked": blocked,
                 "socks_ok": r["socks_ok"], "http_ok": r["http_ok"], "tg_ok": r["tg_ok"],
                 "days": None if days is None else round(days),
                 "last_probe": (r["last_probe_at"] or "")[5:16],
-                "is_current": bool(cur and r["host"] == cur),
+                "is_current": is_cur,
                 # умная оценка страны (§6.1): что показать человеку и почему
                 "exit_cc": r["exit_cc"] if _has(r, "exit_cc") else None,
                 "exit_cc_alt": r["exit_cc_alt"] if _has(r, "exit_cc_alt") else None,

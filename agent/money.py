@@ -28,7 +28,7 @@ import re
 import secrets as _secrets
 
 import country as country_mod
-from providers.base import ProviderError, HARD_BLOCK_CC, DEFAULT_WHITELIST_CC
+from providers.base import ProviderError
 
 # Дефолтные рамки трат (§6.2). В бою перекрываются config['money'] на сервере.
 # Значения консервативные под текущий баланс PROXY6 (~928 RUB на 2026-08-13).
@@ -50,6 +50,76 @@ class SpendDenied(Exception):
     отличается от ProviderError, чтобы вызывающий показал причину, а не «провайдер лёг»."""
 
 
+# --- Обучение стабильности (F8, П6): история -> решения о покупке -----------------
+# Порог обучения — не календарный, а по ОБЪЁМУ данных: до min_probes/min_days вклад
+# нулевой (незнание не наказываем и не награждаем), полный вес — к full_probes/full_days.
+# Скачок на пороге мал по построению (maturity на пороге ≈ 0.1 -> бонус ≤ ±2 балла).
+# Правятся по SSH через config['stability'] — как денежные лимиты.
+DEFAULT_STABILITY = {
+    "min_probes": 300,     # вклад начинается с этого объёма проб по паре
+    "min_days": 21,        # ...и возраста пары в днях
+    "full_probes": 1000,   # полный вес maturity
+    "full_days": 60,
+    "beta_prior": 5.0,     # β-сглаживание к 0.5: (ok+prior)/(total+2*prior)
+    "bonus_scale": 40.0,   # 40*(reliability-0.5)*maturity
+    "drop_penalty": 5.0,   # −5*min(drop_rate, drop_cap)
+    "drop_cap": 2.0,       # обрывов в час боя, больше не наказываем
+    "bonus_cap": 20.0,     # clamp ±20
+}
+
+
+def stability_cfg(cfg):
+    m = dict(DEFAULT_STABILITY)
+    m.update((cfg or {}).get("stability") or {})
+    return m
+
+
+def _days_seen(agg, now=None):
+    fs = (agg or {}).get("first_seen")
+    if not fs:
+        return 0.0
+    try:
+        dt = datetime.datetime.fromisoformat(str(fs).replace(" ", "T"))
+    except ValueError:
+        return 0.0
+    return max(0.0, ((now or datetime.datetime.now()) - dt).total_seconds() / 86400.0)
+
+
+def stability_mature(agg, cfg=None, now=None):
+    """Достаточно ли данных, чтобы пара (provider, страна) влияла на покупку."""
+    if not agg:
+        return False
+    sc = stability_cfg(cfg)
+    total = int(agg.get("probes_ok") or 0) + int(agg.get("probes_fail") or 0)
+    return total >= int(sc["min_probes"]) and _days_seen(agg, now) >= float(sc["min_days"])
+
+
+def stability_bonus(agg, cfg=None, now=None):
+    """F8: бонус пары (provider, паспортная страна) к рейтингу страны при покупке.
+
+    reliability = (ok+prior)/(total+2*prior)   — β-сглаживание: малые выборки не кричат
+    drop_rate   = drops / max(battle_seconds/3600, 1)  — обрывов в час боя
+    maturity    = min(1, total/full_probes) * min(1, days/full_days)
+    bonus       = clamp(scale*(reliability-0.5)*maturity − penalty*min(drop_rate, cap), ±bonus_cap)
+    До порога обучения — ровно 0. В оценку живых проб (probe.score) бонус НЕ идёт:
+    живой замер лучше любой истории."""
+    if not stability_mature(agg, cfg, now):
+        return 0.0
+    sc = stability_cfg(cfg)
+    ok = int(agg.get("probes_ok") or 0)
+    total = ok + int(agg.get("probes_fail") or 0)
+    prior = float(sc["beta_prior"])
+    reliability = (ok + prior) / (total + 2 * prior)
+    hours = max(int(agg.get("battle_seconds") or 0) / 3600.0, 1.0)
+    drop_rate = int(agg.get("battle_drops") or 0) / hours
+    maturity = (min(1.0, total / float(sc["full_probes"]))
+                * min(1.0, _days_seen(agg, now) / float(sc["full_days"])))
+    bonus = (float(sc["bonus_scale"]) * (reliability - 0.5) * maturity
+             - float(sc["drop_penalty"]) * min(drop_rate, float(sc["drop_cap"])))
+    cap = float(sc["bonus_cap"])
+    return round(max(-cap, min(cap, bonus)), 2)
+
+
 # ------------------------------------------------------------------- настройки
 def limits(cfg):
     m = dict(DEFAULT_LIMITS)
@@ -60,24 +130,43 @@ def limits(cfg):
 def whitelist(cfg):
     """Предпочитаемые страны трат — «начни отсюда», НЕ жёсткий фильтр (с 2026-08-15).
 
-    Чёрный список вычищаем всегда, даже если кто-то впишет его в конфиг (§6.1,
-    предохранитель в коде). Провайдер проверит ещё раз.
+    Исключение — стратегия «только избранные» (17.08): при ней этот же список работает
+    как фильтр покупок, поэтому источник у него один — country.whitelist (там же
+    вычищается чёрный список, §6.1). Провайдер проверит ещё раз.
     """
-    cc = ((cfg or {}).get("countries") or {}).get("whitelist")
-    wl = [str(c).strip().lower() for c in cc] if cc else list(DEFAULT_WHITELIST_CC)
-    return [c for c in wl if c and not country_mod.is_blocked(c, cfg)]
+    return country_mod.whitelist(cfg)
 
 
-def buy_candidates(cfg, available=None):
+def buy_candidates(cfg, available=None, pool=None, provider="proxy6"):
     """Порядок перебора стран при авто-покупке.
 
     Сначала предпочитаемые из конфига, затем всё остальное, что есть у провайдера,
-    и всё это пересортировано умной оценкой (country_mod.rank). Страны с оценкой ниже
-    порога автоматика сама не покупает — их берут только по явной просьбе человека.
+    и всё это пересортировано умной оценкой. Страны с оценкой ниже порога автоматика
+    сама не покупает — их берут только по явной просьбе человека.
+
+    Что именно отсеет `auto_allowed` и как сильно перемешается список, решает
+    выбранная стратегия стран (country.STRATEGIES): «только избранные» оставит здесь
+    ровно `countries.whitelist`, «скорость» не переставит ничего и не отсеет никого,
+    кроме чёрного списка. Сам порядок «предпочитаемые вперёд» осмыслен и без стратегий:
+    список по умолчанию отсортирован по возрастанию задержки из РФ.
+
+    pool (F8): при переданном пуле к рейтингу страны добавляется бонус выученной
+    стабильности пары (provider, страна). Приоритеты не переопределяются: чёрный
+    список (rating is None) отсекается ДО бонуса, auto_allowed бонусом не обходится.
     """
     pref = whitelist(cfg)
     rest = [c for c in (available or []) if c not in pref]
-    ranked = country_mod.rank(list(pref) + list(rest), cfg)
+    out = []
+    for i, cc in enumerate(list(pref) + list(rest)):
+        c = country_mod.norm(cc)
+        r = country_mod.rating(c, True, cfg)
+        if r is None:
+            continue                    # чёрный список — до и вне бонуса
+        b = 0.0
+        if pool is not None:
+            b = stability_bonus(pool.stability_get(provider, c), cfg)
+        out.append((-(r + b), i, c))
+    ranked = [c for _, _, c in sorted(out)]
     return [c for c in ranked if country_mod.auto_allowed(c, True, cfg)]
 
 
@@ -238,6 +327,11 @@ def prolong_with_limits(pool, provider, cfg, *, row, days, actor="auto", src_ip=
         raise SpendDenied("траты выключены тумблером buy_enabled — продление недоступно (§6.2)")
 
     pname, ext_id, uid = row["provider"], row["ext_id"], row["uid"]
+    # Пояс безопасности (ревью 1.3.0): адаптер обязан совпадать с провайдером строки —
+    # ext_id уникален только внутри провайдера, чужой адаптер продлил бы чужой прокси.
+    if getattr(provider, "name", None) != pname:
+        raise SpendDenied("адаптер %r не совпадает с провайдером строки %r — продление отклонено"
+                          % (getattr(provider, "name", None), pname))
     price = None
     currency = lim["currency"] if pname == "proxy6" else "USD"
     if pname == "proxy6":
@@ -279,12 +373,12 @@ def can_delete(row, cfg, *, current_host=None, provider_check=None, min_fail=2):
     """§6.4: удаляем ТОЛЬКО если выполнены ВСЕ условия. -> (ok: bool, reason: str).
 
     provider_check — результат check?ids= провайдера (True|False|None). Требуется
-    именно False (труп подтверждён провайдером); True/None не проходят."""
+    именно False (труп подтверждён провайдером); True/None не проходят.
+    Ролевого гейта больше нет (П9, роли v2): ролей две, off/auto оба удаляемы —
+    человек в панели хозяин; остаются гейты «не боевой», провалы и check."""
     lim = limits(cfg)
     if not lim.get("delete_enabled"):
         return False, "тумблер удаления выключен (delete_enabled=false, §6.4 п.5)"
-    if row.get("role") in ("chrome", "reserve"):
-        return False, "роль %s защищена от удаления (§6.4 п.4)" % row.get("role")
     if current_host and row.get("host") == current_host:
         return False, "это ТЕКУЩИЙ upstream — сначала замена и verify (§6.4 п.3)"
     if int(row.get("fail_count") or 0) < min_fail:
@@ -299,10 +393,7 @@ def delete_and_record(pool, provider, row, *, actor="auto", src_ip="",
                       price=None, currency=None, balance_after=None, note=""):
     """Удаление по ЯВНОМУ ext_id (delete?descr= запрещён навсегда, §5) + запись.
 
-    Гейты §6.4 проверяет ВЫЗЫВАЮЩИЙ через can_delete(); здесь — механика и факт.
-    Роль chrome защищена дополнительным предохранителем и тут."""
-    if row.get("role") == "chrome":
-        raise SpendDenied("роль chrome защищена от удаления навсегда (§5)")
+    Гейты §6.4 проверяет ВЫЗЫВАЮЩИЙ через can_delete(); здесь — механика и факт."""
     n = provider.delete(row["ext_id"])       # ТОЛЬКО ids — descr в запрос не попадает
     pool.record_money(row["provider"], "delete", row["uid"], price,
                       currency or "RUB", balance_after, None, row.get("descr"))

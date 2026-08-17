@@ -26,7 +26,9 @@ OPT = "/opt/vpn-panel"
 ETC = "/etc/vpn-panel"
 VAR = "/var/lib/vpn-panel"
 
-AGENT_FILES = ["agent.py", "pool.py", "probe.py", "apply.py", "money.py",
+# update.py — ПЕРВЫМ: agent.py его импортирует, и на живом узле между копиями
+# файлов есть окно, где тик крона (pool-refresh/heartbeat) поймал бы ImportError.
+AGENT_FILES = ["update.py", "agent.py", "pool.py", "probe.py", "apply.py", "money.py",
                "states.py", "alerts.py", "country.py",
                "providers/__init__.py", "providers/base.py",
                "providers/proxyline.py", "providers/proxy6.py"]
@@ -67,18 +69,37 @@ DEFAULTS = {
         "blacklist": [],
         "whitelist": ["fi", "ee", "lv", "lt", "se", "de", "nl", "pl", "cz",
                       "at", "ch", "gb", "fr", "it", "es", "us", "ca"],
+        # насколько сильно страна влияет на выбор; переключается в панели
+        # (country.STRATEGIES: whitelist | reputation | balanced | speed)
+        "strategy": "reputation",
     },
-    "auto_prolong": {"enabled": True, "days_before": 3, "period_days": 30, "scope": "current"},
+    "auto_prolong": {"enabled": True, "days_before": 3, "period_days": 30},
+    # Самообновление с GitHub (vpn/UPDATE-PLAN.md): auto переключается в панели,
+    # окно/частота/repo — по SSH (repo подменяют только для обкатки на форке, Р9).
+    "update": {"auto": True, "window": "04:00-06:00", "repo": "Enjoyment005/redut"},
+    # Обучение стабильности (F8, 1.3.0): порог по объёму данных; правится по SSH.
+    "stability": {"min_probes": 300, "min_days": 21, "full_probes": 1000, "full_days": 60},
 }
 
+# Расписание E2 (1.3.0): списки провайдеров */30 (без проб); полный прогон проб —
+# раз в 2 ч (было */6 МИНУТ — молотилка, перекрывавшая сама себя); лёгкая метка
+# egress (*/5) держит дашборд свежим.
 CRONS = [
     "*/2 * * * * /usr/local/bin/singbox-watchdog.sh",
-    "*/6 * * * * /usr/local/bin/vpn-agent pool-refresh --probe",
+    "*/30 * * * * /usr/local/bin/vpn-agent pool-refresh",
+    "17 */2 * * * /usr/local/bin/vpn-agent pool-refresh --probe",
+    "*/5 * * * * /usr/local/bin/vpn-agent egress-mark",
     "0 * * * * /usr/local/bin/vpn-agent heartbeat-check",
     "30 6 * * * /usr/local/bin/vpn-agent auto-prolong",
+    # раз в сутки: сверить версию с маяком GitHub; при auto=вкл и ночном окне —
+    # обновиться (jitter и окно считает сам агент, vpn/UPDATE-PLAN.md Ф1/Ф3)
+    "41 4 * * * /usr/local/bin/vpn-agent self-update --cron",
 ]
-CRON_MARK = ("singbox-watchdog", "pool-refresh --probe", "vpn-agent heartbeat-check",
-             "vpn-agent auto-prolong")
+# Маркер 'vpn-agent pool-refresh' НАМЕРЕННО шире 'pool-refresh --probe': накрывает
+# и старую строку */6 с --probe (самообновление 1.2.0→1.3.0 обязано её убрать,
+# иначе молотилка удвоится — 🟠 ревью E2), и новую без проб.
+CRON_MARK = ("singbox-watchdog", "vpn-agent pool-refresh", "vpn-agent egress-mark",
+             "vpn-agent heartbeat-check", "vpn-agent auto-prolong", "vpn-agent self-update")
 
 
 def sh(cmd, check=False):
@@ -110,6 +131,22 @@ def copy_files(src, with_panel=True):
     return len(files)
 
 
+def copy_version(src):
+    """Копия VERSION из корня репозитория -> /opt/vpn-panel/VERSION.
+
+    По ней узел знает, какая сборка на нём РЕАЛЬНО работает: её показывают панель
+    и `vpn-agent status`, с ней сверяется самообновление (vpn/UPDATE-PLAN.md Ф0).
+    Раньше версия не копировалась вовсе — узел мог годами жить с панелью одной
+    сборки при исходниках другой, и по самому узлу этого было не видно."""
+    ver = os.path.join(os.path.dirname(os.path.abspath(src)), "VERSION")
+    if not os.path.isfile(ver):
+        print("  ⚠️ рядом с %s нет VERSION — версия узла останется неизвестной" % src)
+        return None
+    shutil.copy2(ver, os.path.join(OPT, "VERSION"))
+    with open(ver, encoding="utf-8") as f:
+        return f.read().strip() or None
+
+
 def write_config(name, net, port, subnet, wg_port, dnsmasq):
     """Конфиг агента. Блоки, настроенные владельцем, сохраняем как есть."""
     cfg = {
@@ -132,15 +169,19 @@ def write_config(name, net, port, subnet, wg_port, dnsmasq):
         try:
             with open(path, encoding="utf-8") as f:
                 old = json.load(f)
-            for k in ("money", "countries", "auto_prolong"):
+            for k in ("money", "countries", "auto_prolong", "update", "stability"):
                 if isinstance(old.get(k), dict) and old[k]:
                     cfg[k] = old[k]
                     print("  config.json: сохранён настроенный блок '%s'" % k)
         except (ValueError, OSError):
             pass
-    with open(path, "w", encoding="utf-8") as f:
+    # Атомарно (tmp + replace): kill/питание посреди записи оставили бы усечённый
+    # config.json — не стартует ни панель, ни агент, ни самообновление (ревью 17.08).
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
-    os.chmod(path, 0o644)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
 
 
 def ensure_secrets():
@@ -241,7 +282,8 @@ def main():
     net = detect_net()
     print("  сеть: интерфейс %s, шлюз %s, адрес %s" % (net["wan"], net["gw"], net["server_ip"]))
     n = copy_files(a.src, with_panel)
-    print("  скопировано файлов: %d" % n)
+    ver = copy_version(a.src)
+    print("  скопировано файлов: %d%s" % (n, ("  (сборка Редут %s)" % ver) if ver else ""))
     write_config(a.name, net, a.port, a.subnet, a.wg_port, a.dnsmasq)
     fresh = ensure_secrets()
 

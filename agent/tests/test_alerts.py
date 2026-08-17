@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """alerts.py: форматирование писем, маскировка секретов, тихий фолбэк без SMTP."""
 import unittest
+from unittest import mock
 
 import _ctx  # noqa: F401
 import alerts
@@ -98,6 +99,84 @@ class TestFormatting(unittest.TestCase):
         subj, body = a.sent[0]
         self.assertNotIn("SECRETKEY", body)
         self.assertIn("****", body)
+
+
+class _FakeSMTP:
+    """Заглушка SMTP: перехватывает send_message, ни одного сетевого вызова."""
+    last = None
+
+    def __init__(self, host, port, timeout=None):
+        self.host, self.port = host, port
+        self.sent = []
+        _FakeSMTP.last = self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def ehlo(self):
+        pass
+
+    def starttls(self, context=None):
+        pass
+
+    def login(self, user, password):
+        self.login_user = user
+
+    def send_message(self, msg):
+        self.sent.append(msg)
+
+
+class TestEnvelopeFrom(unittest.TestCase):
+    """Фикс приёмки node2 (17.08): display-name в «from» -> фолбэк на user (реальный ящик).
+
+    Иначе SMTP отвечает 501 Invalid MAIL FROM и все алерты молча пропадают.
+    """
+
+    def test_valid_email_helper(self):
+        self.assertTrue(alerts._valid_email("user@example.com"))
+        self.assertTrue(alerts._valid_email("  a@b.co  "))       # пробелы обрезаются
+        self.assertFalse(alerts._valid_email("От ВПНА"))          # отображаемое имя, не адрес
+        self.assertFalse(alerts._valid_email("no-at-sign"))
+        self.assertFalse(alerts._valid_email("a@b"))              # нет точки в домене
+        self.assertFalse(alerts._valid_email(""))
+        self.assertFalse(alerts._valid_email(None))
+
+    @staticmethod
+    def _envelope_from(msg):
+        # ровно то, что smtplib.send_message извлечёт как MAIL FROM из заголовка From
+        import email.utils
+        return email.utils.getaddresses([msg["From"]])[0][1]
+
+    def test_display_name_from_falls_back_to_user(self):
+        smtp = {"host": "h", "port": 587, "user": "box@example.com", "password": "x",
+                "from": "От ВПНА", "to": "to@example.com"}
+        a = alerts.Alerter(smtp=smtp, server="test", log=lambda m: None)
+        self.assertTrue(a.configured)                             # «from» непустой -> configured
+        with mock.patch.object(alerts.smtplib, "SMTP", _FakeSMTP):
+            self.assertTrue(a._send("тест", "тело"))
+        msg = _FakeSMTP.last.sent[0]
+        self.assertEqual(self._envelope_from(msg), "box@example.com")  # envelope — реальный ящик
+        self.assertIn("box@example.com", msg["From"])                 # ярлык сохранён как display-name
+
+    def test_valid_from_used_as_is(self):
+        smtp = {"host": "h", "port": 587, "user": "box@example.com",
+                "from": "real@example.com", "to": "to@example.com"}
+        a = alerts.Alerter(smtp=smtp, server="test", log=lambda m: None)
+        with mock.patch.object(alerts.smtplib, "SMTP", _FakeSMTP):
+            self.assertTrue(a._send("тест", "тело"))
+        self.assertEqual(_FakeSMTP.last.sent[0]["From"], "real@example.com")
+
+    def test_invalid_from_and_no_user_logs_and_returns_false(self):
+        logs = []
+        smtp = {"host": "h", "from": "От ВПНА", "to": "to@example.com"}  # user отсутствует
+        a = alerts.Alerter(smtp=smtp, server="test", log=logs.append)
+        self.assertTrue(a.configured)
+        with mock.patch.object(alerts.smtplib, "SMTP", _FakeSMTP):
+            self.assertFalse(a._send("тест", "тело"))            # не шлём и НЕ бросаем
+        self.assertTrue(any("from" in m.lower() for m in logs))
 
 
 if __name__ == "__main__":

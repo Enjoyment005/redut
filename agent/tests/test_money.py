@@ -264,6 +264,15 @@ class TestProlong(Base):
         with self.assertRaises(money.SpendDenied):
             money.prolong_with_limits(self.pool, prov, cfg(buy_enabled=False), row=row, days=30)
 
+    def test_provider_mismatch_denied(self):
+        # C5 (ревью 1.3.0): адаптер proxy6 против строки proxyline — ext_id чужой,
+        # продление отклоняется ДО обращения к API
+        prov = FakeProxy6()
+        row = {"provider": "proxyline", "ext_id": "50", "uid": "proxyline:50", "descr": ""}
+        with self.assertRaises(money.SpendDenied):
+            money.prolong_with_limits(self.pool, prov, cfg(max_price_per_buy=200), row=row, days=30)
+        self.assertEqual(self.money_rows("prolong"), [], "денег не записано — траты не было")
+
 
 class TestCanDelete(unittest.TestCase):
     def row(self, **kw):
@@ -282,11 +291,12 @@ class TestCanDelete(unittest.TestCase):
                                    current_host="9.9.9.9", provider_check=False)
         self.assertTrue(ok, why)
 
-    def test_chrome_reserve_protected(self):
-        for role in ("chrome", "reserve"):
-            ok, _ = money.can_delete(self.row(role=role), cfg(delete_enabled=True),
-                                     current_host="9.9.9.9", provider_check=False)
-            self.assertFalse(ok)
+    def test_off_role_deletable_by_human(self):
+        # П9 (роли v2): ролевого гейта нет — off/auto оба удаляемы (человек — хозяин);
+        # защита боевого/провалов/check остаётся
+        ok, why = money.can_delete(self.row(role="off"), cfg(delete_enabled=True),
+                                   current_host="9.9.9.9", provider_check=False)
+        self.assertTrue(ok, why)
 
     def test_current_upstream_protected(self):
         ok, why = money.can_delete(self.row(), cfg(delete_enabled=True),
@@ -307,14 +317,6 @@ class TestCanDelete(unittest.TestCase):
 
 
 class TestDeleteRecord(Base):
-    def test_chrome_guard(self):
-        prov = FakeProxy6()
-        row = {"role": "chrome", "provider": "proxy6", "ext_id": "50", "uid": "proxy6:50",
-               "descr": "", "host": "1.2.3.4"}
-        with self.assertRaises(money.SpendDenied):
-            money.delete_and_record(self.pool, prov, row)
-        self.assertEqual(prov.delete_calls, 0, "chrome не должен доходить до provider.delete")
-
     def test_records_money(self):
         prov = FakeProxy6()
         row = {"role": "auto", "provider": "proxy6", "ext_id": "50", "uid": "proxy6:50",

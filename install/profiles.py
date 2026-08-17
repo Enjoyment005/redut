@@ -81,6 +81,22 @@ def build_profile(name, host, root_pw, overrides=None):
     return p
 
 
+def effective_wg_ip(profile, subnet):
+    """Адрес сервера в wg0 для ДЕЙСТВУЮЩЕЙ подсети.
+
+    Явный wg_ip профиля осмыслен только в его родной подсети. Если узел живёт
+    в другой (SUBNET= при установке или UPDATE=1 читает подсеть с живого узла),
+    берём .1 действующей — на этом допущении стоит вся система (DNS клиентов,
+    dnsmasq listen-address, конфиг панели). Иначе обновление узла node2
+    (подсеть 10.10.10.0/24) профилем node1 (wg_ip 10.8.0.1) прописало бы wg0
+    адрес чужой подсети и после ребута у клиентов умер бы DNS (ревью Ф2).
+    """
+    first = (subnet or "").split("/")[0].rsplit(".", 1)[0] + ".1"
+    if subnet and (profile or {}).get("subnet") != subnet:
+        return first
+    return (profile or {}).get("wg_ip") or first
+
+
 def _shq(v):
     """Безопасно закавычить значение для params.sh (одинарные кавычки)."""
     s = str(v)

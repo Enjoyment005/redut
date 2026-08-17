@@ -149,9 +149,8 @@ class TestPoolAutomat(unittest.TestCase):
         self._add(3, "3.3.3.3", probe_ok=1, score=70.0)   # текущий
         self.assertEqual(self.pool.reserve_count(current_host="3.3.3.3"), 1)
 
-    def test_off_and_chrome_not_candidates(self):
+    def test_off_not_candidate(self):
         self._add(1, "1.1.1.1", role="off")
-        self._add(2, "2.2.2.2", role="chrome")
         self._add(3, "3.3.3.3", role="auto")
         hosts = {c["host"] for c in self.pool.rotation_candidates()}
         self.assertEqual(hosts, {"3.3.3.3"})

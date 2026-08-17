@@ -23,7 +23,23 @@
 #   PANEL_PORT=8443      порт веб-панели
 #   SUBNET=10.8.0.0/24   клиентская подсеть
 #   CLIENTS=phone1       клиенты через запятую (или число: client1..N)
+#   PROFILE=<имя>        базовый профиль из install/profiles.py (по умолчанию — профиль
+#                        с именем узла, если есть, иначе первый по алфавиту)
+#   CLEANUP=1            чистка следов кроном 0 */3 (0 = выключить, напр. на тест-стенде)
+#   UPDATE=1             режим ОБНОВЛЕНИЯ уже установленного узла: имя/подсеть/порты
+#                        читаются из живого /etc/vpn-panel/config.json (NAME/SUBNET/
+#                        CLIENTS игнорируются), клиенты не добавляются, решение о
+#                        чистке следов — по текущему крону. Этим путём ходит и
+#                        самообновление (vpn-agent self-update, план vpn/UPDATE-PLAN.md)
 set -euo pipefail
+
+# Полный PATH: при запуске из крона (самообновление) PATH урезан до /usr/bin:/bin,
+# и iptables/ipset/sysctl из sbin молча «не находились» бы (ревью 17.08).
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Явность переменных запоминаем ДО дефолтов — по ней ниже включается режим
+# обновления, когда узел уже установлен, а параметров человек не передал.
+_NAME_SET="${NAME+x}"; _SUBNET_SET="${SUBNET+x}"; _CLIENTS_SET="${CLIENTS+x}"; _UPDATE_SET="${UPDATE+x}"
 
 REPO="${REPO:-Enjoyment005/redut}"
 BRANCH="${BRANCH:-main}"
@@ -36,6 +52,73 @@ WORKDIR="/opt/redut-src"
 say()  { printf '\n\033[1;36m▸ %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[1;32m✔\033[0m %s\n' "$*"; }
 die()  { printf '\n\033[1;31m✖ %s\033[0m\n' "$*" >&2; exit 1; }
+
+# ── 0a. UPDATE=1 — обновление УЖЕ установленного узла ────────────────────────
+# Повторный прогон установки корректно обновляет узел только при ТОЧНОМ повторе
+# переменных первой установки: дефолтный NAME=node1 переименовал бы узел (а роль —
+# это привязка прокси в пуле, та же грабля, что у deploy.py до --keep-config),
+# CLIENTS=phone1 дописал бы лишнего клиента. Поэтому в режиме обновления параметры
+# читаются из живого /etc/vpn-panel/config.json, клиенты не добавляются вовсе
+# (существующих сохраняет install.sh §4), а выбор владельца по чистке следов
+# не переигрывается (смотрим текущий крон). Секреты, канал, cert не трогаются —
+# это гарантии идемпотентного инсталлятора, режим их только не портит параметрами.
+# Узел уже установлен, а параметры установки не заданы? Голый повторный прогон
+# переустановил бы его ДЕФОЛТАМИ (NAME=node1, SUBNET=10.8.0.0/24, CLIENTS=phone1) —
+# включаем режим обновления сами (ревью 17.08). Отключить: явно UPDATE=0.
+if [ -z "$_UPDATE_SET" ] && [ -f /etc/vpn-panel/config.json ] \
+   && [ -z "$_NAME_SET$_SUBNET_SET$_CLIENTS_SET" ]; then
+    UPDATE=1
+    printf '  \033[1;33m!\033[0m узел уже установлен, а NAME/SUBNET/CLIENTS не заданы — включаю режим обновления (UPDATE=1)\n'
+fi
+UPDATE="${UPDATE:-0}"
+export UPDATE                       # решение видят и python-хередоки (§3: секреты профиля)
+OLD_VER=""
+if [ "$UPDATE" = "1" ]; then
+    CFG_LIVE=/etc/vpn-panel/config.json
+    [ -f "$CFG_LIVE" ] || die "UPDATE=1, а $CFG_LIVE нет — узел не установлен (запусти без UPDATE)"
+    command -v python3 >/dev/null || die "UPDATE=1: нужен python3 (на установленном узле он есть)"
+    upd_vars="$(python3 - "$CFG_LIVE" <<'PY'
+import json, shlex, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        c = json.load(f)
+except (ValueError, OSError) as e:
+    sys.exit("config.json не прочитать/не разобрать как JSON: %s" % e)
+def need(key):
+    v = c.get(key)
+    if v in (None, ""):
+        sys.exit("в config.json нет «%s» — не зная параметров узла, обновляться нельзя" % key)
+    return v
+try:
+    panel_port = int(c.get("panel_port") or 8443)
+except (TypeError, ValueError):
+    sys.exit("panel_port в config.json не число: %r" % (c.get("panel_port"),))
+print("NAME=%s" % shlex.quote(str(need("server"))))
+print("SUBNET=%s" % shlex.quote(str(need("subnet"))))
+print("PANEL_PORT=%d" % panel_port)
+print("UPD_WG_PORT=%s" % shlex.quote(str(c.get("wg_port") or "")))
+print("UPD_DNSMASQ=%s" % ("1" if c.get("has_dnsmasq") else "0"))
+PY
+)" || die "не разобрать $CFG_LIVE"
+    eval "$upd_vars"
+    # Порт wg: ЖИВОЙ узел главнее записи — исторически setup.sh не передавал порт
+    # панели, и config.json мог хранить дефолт 51820 при другом фактическом порте;
+    # смена порта на обновлении отвалила бы всех клиентов (Endpoint=IP:старый).
+    wgp_live="$(sed -n 's/^ListenPort *= *//p' /etc/wireguard/wg0.conf 2>/dev/null | head -1 | tr -d ' \r')"
+    case "$wgp_live" in
+        ""|*[!0-9]*) : ;;
+        *) UPD_WG_PORT="$wgp_live" ;;
+    esac
+    export UPD_WG_PORT UPD_DNSMASQ
+    CLIENTS=""                      # никого не добавлять; §4 install.sh сохранит существующих
+    OLD_VER="$(cat /opt/vpn-panel/VERSION 2>/dev/null || true)"
+    if [ -z "${CLEANUP:-}" ]; then  # выбор владельца по чистке следов не переигрываем
+        # ^[^#] — закомментированная строка чистки не считается включённой
+        if crontab -l 2>/dev/null | grep -q '^[^#].*server_cleanup\.sh'; then CLEANUP=1; else CLEANUP=0; fi
+    fi
+    export CLEANUP
+    say "Режим обновления: узел «$NAME» (сеть $SUBNET, панель :$PANEL_PORT, wg-порт ${UPD_WG_PORT:-по профилю}, dnsmasq=$UPD_DNSMASQ, чистка=$CLEANUP, сейчас Редут ${OLD_VER:-?})"
+fi
 
 # ── 0. Проверки окружения ───────────────────────────────────────────────────
 say "Проверяю сервер"
@@ -130,10 +213,30 @@ for i, n in enumerate(names):
         clients.append({"name": n, "addr": "%s.%d" % (base, 2 + i)})
 
 # Имя базового профиля не хардкодим: в разных сборках оно своё, а нам нужны лишь
-# его дефолты (порт wg, версия sing-box, параметры локального SOCKS).
-profile_name = os.environ.get("PROFILE") or sorted(profiles.PROFILES)[0]
-p = profiles.build_profile(profile_name, server_ip, "", {"subnet": subnet})
+# его дефолты (порт wg, версия sing-box, параметры локального SOCKS). Если профиль
+# с именем узла существует — берём его (как bootstrap.py: --profile по умолчанию
+# равен --name); это важно при UPDATE=1, чтобы узел не получил чужие дефолты.
+profile_name = os.environ.get("PROFILE") or (name if name in profiles.PROFILES
+                                             else sorted(profiles.PROFILES)[0])
+ov = {"subnet": subnet,
+      # wg_ip профиля осмыслен только в его родной подсети: в чужой берём .1
+      # действующей, иначе wg0/dnsmasq получили бы адрес не из подсети узла
+      # (ловилось при UPDATE=1 узла, чьё имя не совпадает с профилем; ревью Ф2)
+      "wg_ip": profiles.effective_wg_ip(profiles.PROFILES.get(profile_name, {}), subnet)}
+# Режим обновления (UPDATE=1): dnsmasq и порт wg — с живого узла, не из профиля,
+# иначе обновление молча переключило бы DNS-схему клиентов или порт WireGuard.
+if os.environ.get("UPD_DNSMASQ") in ("0", "1"):
+    ov["dnsmasq"] = os.environ["UPD_DNSMASQ"] == "1"
+if (os.environ.get("UPD_WG_PORT") or "").isdigit():
+    ov["wg_port"] = int(os.environ["UPD_WG_PORT"])
+p = profiles.build_profile(profile_name, server_ip, "", ov)
 p["name"], p["role"], p["clients"] = name, "vpn-%s" % name, clients
+if os.environ.get("UPDATE") == "1":
+    # Чужие секреты профиля обновлению не нужны: живой канал сохранит install.sh §5
+    # (пустой upstream не «подарит» узлу чужой), а пустой пароль SOCKS5 заставит §8
+    # СОХРАНИТЬ уже сгенерированный /etc/microsocks.env, вместо перезаписи паролем профиля.
+    p["upstream"] = {"host": "", "socks": 0, "http": 0, "user": "", "pass": ""}
+    p["microsocks"] = dict(p.get("microsocks") or {"port": 1080, "user": "proxyuser"}, **{"pass": ""})
 sys.stdout.write(profiles.render_params(p, {"gw": gw, "wan": wan, "server_ip": server_ip}))
 PY
 chmod 600 "$WORKDIR/install/params.sh"
@@ -152,8 +255,18 @@ fi
 
 # ── 5. Агент и веб-панель ───────────────────────────────────────────────────
 say "Ставлю агента и веб-панель"
+# Панели нужно знать про dnsmasq: иначе новым клиентам, выданным через панель, проставляется
+# DNS 1.1.1.1 вместо адреса dnsmasq — и белый список РФ у них не наполняется (найдено на node2
+# 2026-08-17). Флаг берём из уже сгенерированного params.sh (профиль решает, вкл dnsmasq или нет).
+DNSMASQ_FLAG=""
+grep -q "^DNSMASQ='1'$" "$WORKDIR/install/params.sh" 2>/dev/null && DNSMASQ_FLAG="--dnsmasq"
+# Порт wg — из params.sh (профиль или UPDATE-режим): иначе config.json панели получил бы
+# дефолт 51820 даже там, где узел слушает другой порт.
+WG_PORT_ARG=""
+wgp="$(sed -n "s/^WG_PORT='\{0,1\}\([0-9]*\)'\{0,1\}$/\1/p" "$WORKDIR/install/params.sh" 2>/dev/null | head -1 || true)"
+[ -n "$wgp" ] && WG_PORT_ARG="--wg-port $wgp"
 out="$(python3 "$WORKDIR/install/setup_panel.py" --src "$WORKDIR/agent" \
-        --name "$NAME" --port "$PANEL_PORT" --subnet "$SUBNET")"
+        --name "$NAME" --port "$PANEL_PORT" --subnet "$SUBNET" $DNSMASQ_FLAG $WG_PORT_ARG)"
 echo "$out" | grep -v '^{' | sed 's/^/  /' || true
 json="$(echo "$out" | tail -1)"
 SERVER_IP="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('server_ip',''))" "$json")"
@@ -250,6 +363,10 @@ else
     printf '\033[1;33m  Узел поднят с замечаниями — смотри отметки выше\033[0m\n'
 fi
 printf '\033[1;36m══════════════════════════════════════════════════════════\033[0m\n\n'
+if [ "$UPDATE" = "1" ]; then
+    NEW_VER="$(cat "$WORKDIR/VERSION" 2>/dev/null || true)"
+    printf '  Обновление узла «%s»: Редут %s → %s\n\n' "$NAME" "${OLD_VER:-?}" "${NEW_VER:-?}"
+fi
 if [ "$FRESH" = "True" ]; then
     printf '  Открой в браузере и пройди мастер первого входа:\n\n'
     printf '      \033[1;97mhttps://%s:%s/setup\033[0m\n\n' "$SERVER_IP" "$PANEL_PORT"

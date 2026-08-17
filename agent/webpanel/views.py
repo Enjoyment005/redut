@@ -56,6 +56,10 @@ background-size:14px 1px,1px 14px;background-repeat:no-repeat}
 color:var(--cyan);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .card>h2::before{content:'';width:6px;height:6px;border-radius:1px;background:var(--cyan);box-shadow:0 0 9px var(--cyan);flex:none}
 .card>h2 .r{margin-left:auto;display:flex;gap:7px;align-items:center}
+/* сворачиваемые карточки (П2/П4): заголовок кликабелен, тело прячется */
+.card.fold>h2{cursor:pointer;user-select:none}
+.card.fold>h2 .arr{color:var(--mut);font:600 12px/1 var(--mono)}
+.card.folded .fold-body{display:none}
 h1{font-size:18px;margin:0}
 .sub{color:var(--mut);font:400 12px/1.5 var(--mono)}
 
@@ -219,7 +223,9 @@ _DASH_HTML = """
       <span class="btnq"><button class="btn a" onclick="doRotate()">Ротация</button><i class="q" tabindex="0"
         data-h="Автоматическая починка. Панель проверяет текущий прокси и, если он мёртв, по порядку: подстраивает настройки → переключается на живой из пула → докупает новый (в рамках лимитов) → как крайняя мера включает аварийный режим. Может сменить прокси и потратить деньги. Если всё и так работает — ничего не делает.">?</i></span>
       <span class="btnq"><button class="btn r" id="embtn" onclick="doEmergency()">Аварийный режим</button><i class="q" tabindex="0"
-        data-h="Спасательный круг, когда прокси мёртв. Трафик клиентов идёт напрямую через сервер: интернет появляется, но выход — с российского IP, то есть блокировки НЕ обходятся. Смысл в том, чтобы связь не молчала, пока чинится прокси. Нажми ещё раз, чтобы вернуть трафик на прокси.">?</i></span>
+        data-h="Спасательный круг, когда прокси мёртв. Трафик клиентов идёт напрямую через сервер: интернет появляется, но выход — с российского IP, то есть блокировки НЕ обходятся. Включённая вручную авария держится, пока сам её не снимешь — автоматика её не отменит. Нажми ещё раз, чтобы вернуть трафик на прокси.">?</i></span>
+      <span class="btnq"><button class="btn s" id="frbtn" onclick="doFreeze()">⏸ Пауза автоматики</button><i class="q" tabindex="0"
+        data-h="Пока пауза включена, сторож ничего не меняет сам: не переключает прокси, не покупает, не включает аварию. Полезно на время ручных работ. Не забудь снять — на паузе узел сам не чинится.">?</i></span>
       <span class="btnq"><button class="btn r" onclick="rollback()">Откат</button><i class="q" tabindex="0"
         data-h="Машина времени на один шаг: возвращает предыдущий рабочий конфиг из резервных копий. Нужен, если после смены прокси стало хуже, а автоматический откат не сработал.">?</i></span>
       <form method="POST" action="/logout" style="display:inline"><input type="hidden" name="csrf" value="__CSRF__">
@@ -257,9 +263,12 @@ _DASH_HTML = """
       только когда старый действительно умер.</div>
     <div class="grid" id="money"></div>
     <div id="marketbox" class="sub" style="margin-top:9px"></div>
+    <div id="stabbox" class="sub" style="margin-top:6px"></div>
     <div class="field" style="margin-top:12px">
-      <div><label>страна <i class="q" tabindex="0" data-h="Двухбуквенный код: fi — Финляндия, de — Германия, nl — Нидерланды. Пусто — панель выберет сама из белого списка.">?</i></label>
-        <input id="buycc" style="width:130px" placeholder="fi" autocomplete="off"></div>
+      <div><label>страна <i class="q" tabindex="0" data-h="Список — страны из белого списка; «есть в продаже» появляется после кнопки «Что есть в продаже». Первый пункт — панель выберет сама. «Другая страна…» открывает свободный ввод кода (fi, de, nl…) — решение на тебе, сервер всё равно не пропустит запрещённые.">?</i></label>
+        <select id="buycc" style="width:220px" onchange="buyccChange(this)"><option value="">— панель выберет сама —</option></select></div>
+      <div id="buyccfreebox" style="display:none"><label>код страны</label>
+        <input id="buyccfree" style="width:100px" placeholder="fi" autocomplete="off"></div>
       <div><label>на сколько дней</label><input id="buyperiod" style="width:110px" placeholder="7" autocomplete="off"></div>
       <button class="btn g" onclick="buy()">Купить прокси</button>
       <span class="pill warn">спишутся реальные деньги</span>
@@ -279,25 +288,26 @@ _DASH_HTML = """
     <div class="scroll"><table id="pool"><thead><tr>
       <th>прокси</th><th>страна<i class="q" tabindex="0" data-h="Фактическая страна выхода по geoip и её оценка. Если провайдер продал прокси как одну страну, а выход из другой — панель покажет обе.">?</i></th>
       <th>адрес</th>
-      <th>качество<i class="q" tabindex="0" data-h="Число — оценка по последней проверке (больше = лучше; учитывает скорость, Telegram, репутацию страны). Три галочки — работает ли обычный интернет, http-канал и Telegram.">?</i></th>
+      <th>качество<i class="q" tabindex="0" data-h="Число — оценка с учётом ТЕКУЩЕЙ стратегии (больше = лучше; замеры последней проверки + вес страны по стратегии). Сменишь стратегию — числа и порядок пересчитаются сразу, без новой проверки. Три галочки — работает ли обычный интернет, http-канал и Telegram.">?</i></th>
       <th>срок</th>
-      <th>роль<i class="q" tabindex="0" data-h="auto — панель распоряжается сама; reserve — держим про запас; chrome — занят браузером, не трогать; off — выключен; vpn-ru / vpn-node1 — закреплён за конкретным сервером.">?</i></th>
+      <th>роль<i class="q" tabindex="0" data-h="auto — панель распоряжается сама (ротация, продление, резерв); off — автоматика не трогает: не ставит боевым и не удаляет. Человек может отправить off «В бой» вручную — после успеха роль сама станет auto.">?</i></th>
       <th></th></tr></thead><tbody></tbody></table></div>
+    <div class="sub" id="poolhidden" style="margin-top:8px"></div>
     <div class="ex" style="margin-top:10px"><b>Тест</b> — проверить, безопасно. <b>В бой</b> — сделать боевым
       (проверка → переключение → проверка → автооткат). <b>Продлить</b> и <b>Удалить</b> — деньги;
-      удаление проходит проверки на сервере, боевой и запасной прокси удалить нельзя.</div>
+      удаление проходит проверки на сервере, боевой прокси удалить нельзя.</div>
   </div>
 
   <div class="card">
     <h2>Кто подключён<span class="r">
-      <input id="cname" style="width:180px" placeholder="имя, например phone-vadim" autocomplete="off">
+      <input id="cname" style="width:180px" placeholder="имя, например phone-mine" autocomplete="off">
       <button class="btn g" onclick="addClient()">Выдать доступ</button></span></h2>
     <div class="ex">Каждому устройству — свой профиль. Нажми «Выдать доступ» → появится строка → <b>«Скачать»</b>
       даёт файл для компьютера, <b>«QR»</b> — картинку для телефона. На устройстве нужно приложение
       <b>WireGuard</b> (бесплатное, есть в App Store и Google Play): в нём «+» → «Сканировать QR-код»
       или «Импорт из файла».</div>
     <div id="qstart" class="steps" style="display:none">
-      <div class="step"><b>шаг 1</b>Придумай имя устройства (латиницей, например <span class="mono">phone-vadim</span>) и нажми «Выдать доступ».</div>
+      <div class="step"><b>шаг 1</b>Придумай имя устройства (латиницей, например <span class="mono">phone-mine</span>) и нажми «Выдать доступ».</div>
       <div class="step"><b>шаг 2</b>Установи на устройство приложение WireGuard из магазина приложений.</div>
       <div class="step"><b>шаг 3</b>Телефон — нажми «QR» и отсканируй. Компьютер — «Скачать» и открой файл в WireGuard.</div>
     </div>
@@ -310,12 +320,64 @@ _DASH_HTML = """
     </div>
   </div>
 
+  <div class="card fold folded" id="card_strategy">
+    <h2 onclick="toggleFold('strategy')">Стратегия выбора стран<span class="r"><span class="sub" id="stnow"></span><span class="arr" id="fa_strategy">▸</span></span></h2>
+    <div class="fold-body">
+    <div class="ex">Прокси бывают в разных странах, и они не равноценны: из Финляндии банк пустит
+      без вопросов, а из Нигерии тот же банк покажет капчу и откажет в оплате — зато нигерийский
+      прокси может быть быстрее и дешевле. <b>Стратегия — это правило, как панели выбирать между
+      «приличной страной» и «хорошими замерами»</b>: она решает, где автоматике разрешено покупать
+      и в каком порядке перебирать прокси из пула.<br>
+      <b>Россия, Украина и Беларусь запрещены при любой стратегии</b> — это запрет в коде, а не
+      настройка.<br>
+      Смена правила <b>не трогает текущий канал</b>: он продолжит работать, а новое правило
+      сработает при следующей смене — ротации, кнопке «В бой» или покупке.</div>
+    <div class="sub" id="stmeta" style="margin-bottom:4px"></div>
+    <div id="strategies"></div>
+    </div>
+  </div>
+
   <div class="card">
-    <h2>Журнал событий</h2>
+    <h2>Ключи провайдеров прокси<span class="r">
+      <button class="btn s tiny" onclick="loadKeys()">Обновить</button></span></h2>
+    <div class="ex">Зарубежные прокси панель покупает и продлевает <b>в твоём кабинете у провайдера</b>,
+      и для этого ей нужен оттуда <b>API-ключ</b>. Здесь его можно вписать или заменить — например,
+      если завёл другой кабинет, сменил провайдера или ключ куда-то утёк. <b>Заходить на сервер по SSH
+      не нужно.</b><br>
+      <b>Где взять:</b> личный кабинет провайдера → раздел «API» → скопировать ключ. Панель проверит его
+      сразу и покажет твой баланс, если ключ рабочий.<br>
+      <b>Обратно ключ не показывается</b> — только несколько первых и последних символов, чтобы отличить
+      один от другого. Хранится он на сервере в файле <span class="mono">/etc/vpn-panel/secrets.json</span>,
+      закрытом от всех, кроме root.</div>
+    <div id="keys"></div>
+    <div class="ex warn" style="margin-top:11px">Новый ключ начинает работать сразу — <b>и для автоматики
+      тоже</b>: следующая покупка или продление пойдут уже через новый кабинет. Прокси старого кабинета
+      панель перестанет видеть, поэтому после смены ключа она сама заново спросит список прокси
+      (это занимает до минуты).</div>
+  </div>
+
+  <div class="card">
+    <h2>Обновления<span class="r">
+      <button class="btn s tiny" onclick="checkUpd(this)">Проверить сейчас</button></span></h2>
+    <div class="ex">«Редут» умеет обновлять сам себя: раз в сутки узел сверяет свою версию с последним
+      выпуском в официальном репозитории на GitHub и, если вышла новая, ночью скачивает её и
+      переустанавливается своим же установщиком. <b>Обновление ничего не теряет</b>: доступы устройств,
+      пароль панели, ключи провайдеров и рабочий прокси остаются как были — это то же самое повторное
+      выполнение команды установки, только автоматом. Если после обновления узел сам себе не понравится
+      (панель не встала, связь пропала) — он <b>откатится на прежнюю версию</b> и напишет письмо.</div>
+    <div class="grid" id="upd"></div>
+    <div id="updbox" class="sub" style="margin-top:9px"></div>
+    <div id="updact" style="margin-top:11px"></div>
+  </div>
+
+  <div class="card fold folded" id="card_events">
+    <h2 onclick="toggleFold('events')">Журнал событий<span class="r"><span class="arr" id="fa_events">▸</span></span></h2>
+    <div class="fold-body">
     <div class="ex">Кто и что делал: смена прокси, покупки, выдача доступов, срабатывания автоматики.
       Строка <span class="mono">actor=agent</span> — действовала автоматика, <span class="mono">actor=web</span> — человек из панели.</div>
     <div class="scroll"><table id="events"><thead><tr>
       <th>время</th><th>кто</th><th>действие</th><th>итог</th><th>подробности</th></tr></thead><tbody></tbody></table></div>
+    </div>
   </div>
 
   <details>
@@ -355,7 +417,7 @@ _DASH_HTML = """
 <div id="toast"></div>
 <script>
 const CSRF=__CSRFJS__;
-function esc(s){return (s==null?'':''+s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function esc(s){return (s==null?'':''+s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function toast(t,cls){const d=document.createElement('div');d.className='msg '+(cls||'');d.textContent=t;
   document.getElementById('toast').appendChild(d);setTimeout(()=>d.remove(),9000)}
 /* ── подсказки: одно облачко на всю страницу, позиционируем сами ──
@@ -385,6 +447,24 @@ function toggleEx(){const off=document.body.classList.toggle('noex');
   document.getElementById('exbtn').textContent=off?'💡 Объяснения: выкл':'💡 Объяснения: вкл'}
 (function(){try{if(localStorage.getItem('vpnpanel-ex')==='0'){document.body.classList.add('noex');
   document.getElementById('exbtn').textContent='💡 Объяснения: выкл'}}catch(e){}})();
+/* ── сворачивание карточек (П2/П4): дефолт — свернуто, состояние в localStorage.
+   Свернутая карточка НЕ дёргает свой API (reloadAll идёт через loadFold) —
+   запрос уходит при разворачивании. ── */
+const FOLDS={events:{def:1,load:()=>loadEvents()},strategy:{def:1,load:()=>loadStrategy()}};
+const FOLD_MEM={}; /* фолбэк на сессию, когда localStorage запрещён — иначе карточки не развернуть вовсе */
+function isFolded(id){try{const v=localStorage.getItem('vpnpanel-fold-'+id);
+  if(v==='0')return false;if(v==='1')return true}catch(e){}
+  if(id in FOLD_MEM)return FOLD_MEM[id];
+  return !!FOLDS[id].def}
+function applyFold(id){const c=document.getElementById('card_'+id);
+  if(c)c.classList.toggle('folded',isFolded(id));
+  const a=document.getElementById('fa_'+id);if(a)a.textContent=isFolded(id)?'▸':'▾'}
+async function toggleFold(id){const to=!isFolded(id);FOLD_MEM[id]=to;
+  try{localStorage.setItem('vpnpanel-fold-'+id,to?'1':'0')}catch(e){}
+  applyFold(id);
+  if(!isFolded(id))try{await FOLDS[id].load()}catch(e){toast(e.message,'bad')}}
+async function loadFold(id){if(!isFolded(id))await FOLDS[id].load()}
+(function(){for(const id in FOLDS)applyFold(id)})();
 async function api(path,opts){opts=opts||{};opts.headers=Object.assign({'X-CSRF-Token':CSRF},opts.headers||{});
   const r=await fetch(path,opts);const t=await r.text();let j;try{j=JSON.parse(t)}catch(e){j={error:t}}
   if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
@@ -428,10 +508,23 @@ function beacon(s,clients){
   if(s.emergency){cls='b-bad';ttl='Аварийный режим включён';
     txt='Клиенты в интернете, но выходят с российского IP самого сервера — блокировки НЕ обходятся. '+
         'Это временно: нажми «Ротация», чтобы вернуться на зарубежный прокси, потом сними аварию.'+who}
+  else if(s.automat==='ROTATING'){cls='b-warn';ttl='Перебираю пул прокси';
+    txt='Боевой прокси умер — панель перебирает запасные из пула (это НЕ авария). На время перебора '+
+        'клиенты выходят напрямую через сервер, с российского IP. Обычно занимает пару минут; '+
+        'вмешиваться не нужно.'+who}
+  else if(s.automat==='DEGRADED'){cls='b-warn';ttl='Канал жив, Telegram недоступен';
+    txt='Интернет через прокси работает'+(s.egress?(' (выход '+esc(s.egress)+')'):'')+', но api.telegram.org не отвечает — '+
+        'у клиентов может молчать Telegram. Прокси менять не из-за чего: он жив, сбой на стороне Telegram/провайдера.'+who}
+  else if(s.automat==='SUSPECT'){cls='b-warn';ttl='Перепроверяю сбой';
+    txt='Первая проверка выхода не прошла — панель подтверждает сбой повторной, прежде чем что-то менять. '+
+        'Единичный сетевой чих аварией не считается.'+who}
   else if(window.__EGBUSY){cls='b-warn';ttl='Проверяю выход…';
     txt='Спрашиваю у внешнего сайта, какой IP видно с сервера. Это занимает несколько секунд.'+who}
   else if(!s.egress_at){cls='b-warn';ttl='Состояние ещё не проверялось';
     txt='Панель ни разу не спрашивала, какой IP видят сайты. Нажми «Проверить выход» — это безопасно.'+who}
+  else if(!s.egress_ok&&s.egress&&/^Telegram/.test(s.egress_why||'')){cls='b-warn';ttl='Канал жив, Telegram недоступен';
+    txt='Выход в интернет работает ('+esc(s.egress)+'), но api.telegram.org не отвечает — у клиентов может молчать '+
+        'Telegram. Прокси жив, менять его не из-за чего.'+when+who}
   else if(s.egress_ok){const w=ccWarn(s);cls=w?'b-warn':'b-ok';ttl=w?'Работает, но страна выхода необычная':'Всё работает';
     txt='Трафик выходит в интернет через прокси '+esc(s.egress)+(s.egress_cc?(' — '+country(s.egress_cc)):'')+
         '. Именно этот IP видят сайты.'+when+who+w+
@@ -444,16 +537,24 @@ function beacon(s,clients){
         (s.egress_why?(' ('+esc(s.egress_why)+')'):'')+'. Нажми «Ротация» — панель сама переберёт варианты.'+when+who}
   if(cls==='b-ok'&&s.frozen){cls='b-warn';ttl='Работает, но автоматика на паузе';
     txt='Сейчас связь есть, однако сама чинить себя панель не будет — переключать прокси придётся руками.'+when+who}
+  else if(s.frozen&&cls!=='b-ok'){ttl+=' · автоматика на паузе';
+    txt+=' ⏸ Автоматика на паузе: сама не починится, пока паузу не снимешь (кнопка сверху).'}
   b.className='beacon '+cls;
   b.innerHTML='<div class="dot"></div><div><div class="ttl">'+ttl+'</div><div class="txt">'+txt+'</div></div>'}
 
 async function loadStatus(){const s=await api('/api/status');window.__S=s;
   document.getElementById('subline').textContent=
-    'узел '+s.role+' · сеть '+s.subnet+' · sing-box '+s.singbox+' · прокси в пуле: '+s.pool_alive;
+    'узел '+s.role+' · Редут '+(s.version||'?')+' · сеть '+s.subnet+' · sing-box '+s.singbox+' · прокси в пуле: '+s.pool_alive;
+  /* заголовок свернутой карточки стратегий: название активной — из статуса,
+     дорогой GET /api/strategy при этом не дёргается (П4) */
+  const sn=document.getElementById('stnow');if(sn)sn.textContent=s.strategy_title||'';
+  fillBuyCC();
   document.getElementById('ts').textContent='обновлено '+new Date().toLocaleTimeString('ru-RU');
   const cur=s.upstream||{};
+  const AUTL={ROTATING:'перебор пула',DEGRADED:'TG недоступен, канал жив',SUSPECT:'перепроверяю сбой'};
   const aut=s.emergency?('<span class="bad">АВАРИЯ'+(s.emergency_since?(' с '+esc(s.emergency_since)):'')+'</span>')
-    :(s.frozen?'<span class="warn">на паузе</span>':'<span class="ok">'+esc(s.automat||'OK')+'</span>');
+    :(AUTL[s.automat]?('<span class="warn">'+AUTL[s.automat]+'</span>')
+    :(s.frozen?'<span class="warn">на паузе</span>':'<span class="ok">'+esc(s.automat||'OK')+'</span>'));
   document.getElementById('status').innerHTML=[
     tile('автоматика',aut,'Сторож проверяет связь и, если прокси умер, сам переключает на живой или докупает новый. «На паузе» — не вмешивается.'),
     tile('прокси на выходе',esc(cur.socks_out||'?'),'Зарубежный прокси, через который сервер выпускает трафик наружу. Технически — SOCKS5-upstream.'),
@@ -471,11 +572,24 @@ async function loadStatus(){const s=await api('/api/status');window.__S=s;
   ].join('');
   const eb=document.getElementById('embtn');
   if(eb){eb.textContent=s.emergency?'Снять аварию':'Аварийный режим';eb.className='btn '+(s.emergency?'g':'r');}
+  const fb=document.getElementById('frbtn');
+  if(fb){fb.textContent=s.frozen?'▶ Возобновить автоматику':'⏸ Пауза автоматики';
+    fb.className='btn '+(s.frozen?'a':'s')}
   beacon(s,window.__CN);
   maybeRecheck(s)}
 
+/* F7: пауза автоматики (FROZEN) — сторож ничего не делает сам, пока не снимешь */
+async function doFreeze(){const to=!((window.__S||{}).frozen);
+  if(!confirm(to?'Поставить автоматику на паузу?\\n\\nСторож перестанет сам переключать прокси, покупать и включать аварийный режим. Узел будет чиниться только руками, пока паузу не снимешь.'
+    :'Возобновить автоматику?\\n\\nСторож снова будет сам чинить канал: переключать прокси, докупать и включать аварийный режим при необходимости.'))return;
+  try{const r=await api('/api/automat',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({frozen:to})});
+    toast(r.frozen?'Автоматика на паузе — не забудь снять после работ':'Автоматика снова работает',r.frozen?'warn':'ok');
+    await loadStatus()}catch(e){toast(e.message,'bad')}}
+
 /* Сама перепроверяет выход, если метка отсутствует или протухла.
-   Зачем: метку пишут агент (раз в 6 мин) и действия человека. Если узел сам починился
+   Зачем: метку пишут агент (egress-mark раз в 5 мин, полный verify раз в 30 мин) и
+   действия человека. Если узел сам починился
    между записями, в панели висела бы старая ошибка — так и случилось 15.08, когда
    «цепочка нарушена» держалась ещё полчаса после того, как всё заработало.
    Не чаще раза в 2 минуты, чтобы не устраивать шторм проб. */
@@ -487,8 +601,16 @@ function maybeRecheck(s){
   if(нет||старая||плохая){window.__EGLAST=now;egress(true)}}
 
 async function loadPool(){const rows=(await api('/api/pool')).proxies;const tb=document.querySelector('#pool tbody');tb.innerHTML='';
-  for(const p of rows){const tr=document.createElement('tr');if(p.is_current)tr.className='cur';
-    const roles=['auto','chrome','vpn-ru','vpn-node1','reserve','off'];
+  /* П1: строки запрещённых стран не рендерим вовсе — только счётчик под таблицей,
+     чтобы купленное не исчезало молча. Исключение: заблокированный боевой виден всегда. */
+  const hidden=rows.filter(p=>p.blocked&&!p.is_current);
+  const shown=rows.filter(p=>!p.blocked||p.is_current);
+  const hb=document.getElementById('poolhidden');
+  if(hb)hb.textContent=hidden.length?('скрыто '+hidden.length+' '+(hidden.length===1?'прокси':'прокси')+
+    ' из запрещённых стран ('+hidden.map(p=>country(p.exit_cc||p.country)).join(', ')+') — панель их не использует'):'';
+  for(const p of shown){const tr=document.createElement('tr');if(p.is_current)tr.className='cur';
+    const roles=['auto','off'];
+    const inact=!p.provider_active;
     const cc=p.exit_cc||p.country;
     const id=esc(p.uid).replace(/^proxy6:|^proxyline:/,'');
     const sold=(p.exit_cc&&p.country&&p.exit_cc!=p.country)?'продан как '+esc(country(p.country)):'';
@@ -508,14 +630,16 @@ async function loadPool(){const rows=(await api('/api/pool')).proxies;const tb=d
       '<td><select data-uid="'+esc(p.uid)+'" onchange="setRole(this)">'+
         roles.map(r=>'<option'+(r==p.role?' selected':'')+'>'+r+'</option>').join('')+'</select></td>'+
       '<td><button class="btn s tiny" onclick="probe(this,\\''+esc(p.uid)+'\\')" title="Проверить прокси — безопасно, ничего не меняет">Тест</button> '+
-        '<button class="btn g tiny" onclick="apply(this,\\''+esc(p.uid)+'\\')"'+(p.role=='chrome'?' disabled':'')+
-        ' title="Сделать боевым: проверка → переключение → проверка → автооткат при провале">В бой</button> '+
-        '<button class="btn a tiny" onclick="prolong(this,\\''+esc(p.uid)+'\\')" title="Продлить аренду — тратит деньги">Продлить</button> '+
-        '<button class="btn r tiny" onclick="del(this,\\''+esc(p.uid)+'\\')"'+((p.role=='chrome'||p.role=='reserve'||p.provider!='proxy6')?' disabled':'')+
+        '<button class="btn g tiny" onclick="apply(this,\\''+esc(p.uid)+'\\')"'+(inact?' disabled':'')+
+        ' title="'+(inact?'У провайдера нет ключа — панель не управляет этим прокси':'Сделать боевым: проверка → переключение → проверка → автооткат при провале. Для off после успеха роль станет auto')+'">В бой</button> '+
+        '<button class="btn a tiny" onclick="prolong(this,\\''+esc(p.uid)+'\\')"'+(inact?' disabled':'')+
+        ' title="'+(inact?'У провайдера нет ключа — продлить нечем':'Продлить аренду — тратит деньги')+'">Продлить</button> '+
+        '<button class="btn r tiny" onclick="del(this,\\''+esc(p.uid)+'\\')"'+((p.provider!='proxy6'||inact)?' disabled':'')+
         ' title="Удалить навсегда">Удалить</button></td>';
     tb.appendChild(tr)}
   if(!rows.length)tb.innerHTML='<tr><td colspan="7" class="mut">пул пуст — панель ещё не знает ни одного прокси. '+
-    'Если ключ провайдера уже введён, нажми «Обновить пул».</td></tr>'}
+    'Если ключ провайдера уже введён, нажми «Обновить пул»; если нет — впиши его ниже, в разделе '+
+    '«Ключи провайдеров прокси».</td></tr>'}
 
 async function loadEvents(){const evs=(await api('/api/events?limit=40')).events;const tb=document.querySelector('#events tbody');tb.innerHTML='';
   for(const e of evs){const tr=document.createElement('tr');
@@ -525,6 +649,13 @@ async function loadEvents(){const evs=(await api('/api/events?limit=40')).events
   if(!evs.length)tb.innerHTML='<tr><td colspan="5" class="mut">событий пока нет</td></tr>'}
 
 async function loadMoney(){try{const m=await api('/api/money');const L=m.limits||{},t=m.today||{};
+  /* F8: чему узел научился — надёжность пар (провайдер, страна) по своему опыту */
+  const st=(m.stability||[]);const sb=document.getElementById('stabbox');
+  if(sb)sb.innerHTML=st.length?('Надёжность по опыту узла: '+st.map(x=>{
+    const lbl=country(x.country)+(x.provider!=='proxy6'?(' ('+esc(x.provider)+')'):'')+' '+x.rel_pct+'% ('+
+      x.probes+' проб, '+x.days+' дн'+(x.drops?(', обрывов '+x.drops):'')+')';
+    return x.learning?('<span class="mut" title="данных ещё мало — пара не влияет на выбор покупки">'+esc(lbl)+' · учусь</span>')
+      :('<span title="бонус к выбору страны при покупке: '+esc(''+x.bonus)+'">'+esc(lbl)+'</span>')}).join(' · ')):'';
   document.getElementById('money').innerHTML=[
     tile('покупок сегодня',(t.buys||0)+' из '+L.max_buys_per_day,'Больше этого числа панель за сутки не купит — ни сама, ни по кнопке.'),
     tile('потрачено сегодня',(t.spent_rub||0)+' / '+L.max_spend_per_day+' ₽','Дневной потолок трат.'),
@@ -534,7 +665,14 @@ async function loadMoney(){try{const m=await api('/api/money');const L=m.limits|
       ' / '+(L.delete_enabled?'<span class="warn">разрешено</span>':'запрещено'),
       'Тумблеры в конфиге на сервере. Пока покупка запрещена, автоматика не потратит ни рубля.'),
     apTile(),
+    stTile(),
   ].join('')}catch(e){}}
+/* какое правило выбора стран сейчас действует — подробности в карточке ниже */
+function stTile(){const s=window.__S||{};
+  return tile('стратегия стран',esc(s.strategy_title||'—'),
+    (s.strategy_short?(s.strategy_short+'. '):'')+
+    'Правило, как панель выбирает между надёжной страной и хорошими замерами: где ей разрешено '+
+    'покупать и в каком порядке перебирать пул. Меняется в карточке «Стратегия выбора стран» ниже.')}
 /* автопродление «якоря» — состояние берём из /api/status */
 function apTile(){const a=(window.__S||{}).auto_prolong;
   if(!a)return tile('автопродление','<span class="mut">—</span>','Панель ещё не сообщила настройки.');
@@ -545,18 +683,43 @@ function apTile(){const a=(window.__S||{}).auto_prolong;
     'сколько продление, но новый IP «холодный»: сайты начинают требовать перелогины, капчи и подтверждения оплаты. '+
     'Если продлить не выйдет (лимит, баланс, сбой у провайдера) — придёт письмо, молча истечь не даст.')}
 
-async function market(){toast('Спрашиваю провайдера, что есть в продаже…');try{const m=await api('/api/market');const box=document.getElementById('marketbox');
+async function market(){toast('Спрашиваю провайдера, что есть в продаже…');try{const m=await api('/api/market');window.__MARKET=m;const box=document.getElementById('marketbox');
   const pr=m.price?('цена '+m.price.price+' '+m.price.currency+' за 1 шт × '+m.period+' дн · баланс '+m.price.balance):(m.price_error||'цена недоступна');
-  box.textContent='Доступные страны ('+(m.available||[]).length+'): '+((m.available||[]).join(', ')||'—')+' · '+pr;
+  box.textContent=(m.country_error?('рынок недоступен ('+m.country_error+') · '):
+    ('Доступные страны ('+(m.available||[]).length+'): '+((m.available||[]).join(', ')||'—')+' · '))+pr;
+  fillBuyCC();
   toast('Список обновлён','ok')}catch(e){toast(e.message,'bad')}}
 
-async function buy(){const cc=document.getElementById('buycc').value.trim().toLowerCase();const per=document.getElementById('buyperiod').value.trim();
+/* ── форма покупки (A5): select из белого списка + свободный фолбэк ──
+   Опции — белый список (после «Что есть в продаже» помечаются доступные);
+   при недоступном рынке — полный словарь стран минус чёрный список;
+   «другая страна…» открывает свободный ввод (сервер валидирует сам). */
+function buyccChange(sel){document.getElementById('buyccfreebox').style.display=(sel.value==='__other__')?'':'none'}
+function fillBuyCC(){const s=window.__S||{};const m=window.__MARKET||null;
+  const sel=document.getElementById('buycc');if(!sel)return;
+  if(document.activeElement===sel)return; /* не пересобирать открытый список под руками (loadStatus идёт каждые 30 с) */
+  const cur=sel.value;
+  const bl=new Set(s.cc_blacklist||[]);
+  let list=(s.cc_whitelist||[]).filter(c=>!bl.has(c));
+  let suffix='';
+  if(m&&m.country_error){list=Object.keys(CC).filter(c=>!bl.has(c));suffix=' · рынок недоступен, страна не проверена'}
+  const avail=(m&&!m.country_error)?new Set(m.available||[]):null;
+  const opts=['<option value="">— панель выберет сама —</option>'];
+  for(const c of list)opts.push('<option value="'+esc(c)+'"'+(cur===c?' selected':'')+'>'+
+    esc(country(c))+(avail&&avail.has(c)?' · есть в продаже':'')+esc(suffix)+'</option>');
+  opts.push('<option value="__other__"'+(cur==='__other__'?' selected':'')+'>другая страна…</option>');
+  sel.innerHTML=opts.join('')}
+
+async function buy(){const _sel=document.getElementById('buycc');
+  const cc=(_sel.value==='__other__'?(document.getElementById('buyccfree').value||''):_sel.value).trim().toLowerCase();
+  const per=document.getElementById('buyperiod').value.trim();
   if(!confirm('Купить прокси'+(cc?(' в стране '+cc):' (страну выберет панель)')+(per?(', на '+per+' дн'):'')+'?\\n\\n'+
     'Спишутся РЕАЛЬНЫЕ деньги с баланса у провайдера. После покупки панель сама проверит, из какой страны реально выходит прокси.'))return;
   toast('Покупаю: узнаю цену → покупка → проверка…');try{const b={};if(cc)b.country=cc;if(per)b.period=parseInt(per);
     const r=await api('/api/buy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
     const pc=(r.postcheck||[]).map(x=>x.uid+' страна выхода '+(x.exit_cc||'?')+(x.blocked?' → заблокирован, роль off':' → годен')).join('; ');
-    toast('Куплено: '+(r.uids||[]).join(',')+' за '+r.price+' '+r.currency+(r.recovered?' (восстановлено по описанию)':'')+'. '+pc,'ok');await reloadAll()}
+    toast('Куплено: '+(r.uids||[]).join(',')+' за '+r.price+' '+r.currency+(r.recovered?' (восстановлено по описанию)':'')+'. '+pc+
+      (r.warning?(' ⚠️ '+r.warning):''),r.warning?'warn':'ok');await reloadAll()}
   catch(e){toast('покупка: '+e.message,'bad');await reloadAll()}}
 
 async function prolong(btn,uid){const d=prompt('На сколько дней продлить '+uid+'?\\nСпишутся реальные деньги.','30');if(!d)return;
@@ -565,11 +728,176 @@ async function prolong(btn,uid){const d=prompt('На сколько дней п�
     toast('Продлён '+uid+' на '+r.days+' дн · '+r.price+' '+r.currency+' · действует до '+(r.date_end||'?'),'ok');await reloadAll()}catch(e){toast(e.message,'bad')}btn.disabled=false}
 
 async function del(btn,uid){if(!confirm('Удалить прокси '+uid+' НАВСЕГДА?\\n\\nСервер пропустит удаление, только если: удаление разрешено тумблером, '+
-    'прокси не боевой и не запасной, он дважды провалил проверку и сам провайдер считает его нерабочим.'))return;
+    'прокси не боевой, он дважды провалил проверку и сам провайдер считает его нерабочим.'))return;
   btn.disabled=true;toast('Удаляю '+uid+'…');try{const r=await api('/api/proxy/'+encodeURIComponent(uid)+'/delete',{method:'POST'});
     toast('Удалено: '+r.deleted+' ('+uid+')','ok');await reloadAll()}catch(e){toast('удаление: '+e.message,'bad')}btn.disabled=false}
 
-async function reloadAll(){try{await loadStatus();await loadMoney();await loadPool();await loadClients();await loadEvents()}catch(e){toast(e.message,'bad')}}
+/* ── стратегия выбора стран: правило «страна против замеров» ──
+   Тексты стратегий приходят с сервера (country.STRATEGIES) — там же, где сама логика,
+   чтобы описание в панели не разошлось с поведением. */
+async function loadStrategy(){try{const r=await api('/api/strategy');
+  document.getElementById('stmeta').textContent='пул для выбора: '+r.pool_size+' шт · запрещено навсегда: '+
+    (r.blacklist||[]).map(country).join(', ');
+  document.getElementById('strategies').innerHTML=(r.strategies||[]).map(s=>{
+    const cc=(s.buy||[]).map(country).join(', ')||'—';
+    const pick=s.pick?(esc(s.pick.host)+(s.pick.cc?(' · '+country(s.pick.cc)):'')):'пул пуст';
+    return '<div class="step" style="margin-top:10px'+(s.current?';border-color:rgba(5,255,161,.45);background:rgba(5,255,161,.05)':'')+'">'+
+      '<b>'+esc(s.title)+'</b>'+
+      (s.current?'<span class="pill ok">включена сейчас</span>':'<span class="pill">'+esc(s.short)+'</span>')+
+      '<div class="sub" style="margin-top:7px;white-space:normal">'+esc(s.desc)+'</div>'+
+      '<div class="sub" style="margin-top:7px;white-space:normal">Сейчас с ней: докупать разрешено в '+
+        esc(cc)+'; из нынешнего пула выбрало бы <b>'+pick+'</b></div>'+
+      (s.current?'':'<div style="margin-top:9px"><button class="btn g" onclick="setStrategy(\\''+esc(s.id)+
+        '\\',\\''+esc(s.title)+'\\')">Включить</button></div>')+
+      '</div>'}).join('')}
+  catch(e){document.getElementById('strategies').innerHTML='<span class="bad">'+esc(e.message)+'</span>'}}
+
+async function setStrategy(id,title){
+  if(!confirm('Включить стратегию «'+title+'»?\\n\\nТекущий канал продолжит работать — правило применится '+
+    'при следующей смене прокси (ротация, «В бой», покупка). Числа и порядок в таблице пула '+
+    'пересчитаются сразу, без новой проверки.'))return;
+  try{const r=await api('/api/strategy',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({strategy:id})});
+    toast(r.changed?('Стратегия: «'+title+'» включена'):'Эта стратегия и так была включена','ok');
+    await loadStrategy();await loadStatus();await loadMoney();await loadPool()}
+  catch(e){toast('стратегия: '+e.message,'bad')}}
+
+/* ── ключи провайдеров: вписать или заменить прямо здесь ──
+   Сам ключ панель обратно не отдаёт: показываем только хвост, который приходит с сервера. */
+const PROV={
+  proxy6:{t:'PROXY6',h:'Основной провайдер: панель умеет у него всё — купить, продлить, удалить; цены в рублях. '+
+    'Ключ: кабинет proxy6.net → раздел «API». Если в кабинете включено ограничение API по IP, впиши туда адрес '+
+    'этого сервера, иначе провайдер ответит «доступ с неверного IP».'},
+  proxyline:{t:'ProxyLine',h:'Запасной провайдер: через API панель умеет только продлевать (купить и удалить нельзя), '+
+    'цены в долларах. Ключ: кабинет panel.proxyline.net → раздел «API».'}};
+async function loadKeys(){try{const r=await api('/api/key/status');
+  document.getElementById('keys').innerHTML=(r.providers||[]).map(p=>{const m=PROV[p.provider]||{};
+    return '<div class="step" style="margin-top:10px">'+
+      '<b>'+esc(m.t||p.provider)+'</b>'+
+      (p.set?('<span class="pill ok">ключ задан · '+esc(p.masked)+'</span>')
+            :('<span class="pill warn">ключ не задан</span>'))+
+      ' <span class="pill">прокси в пуле: '+p.alive+'</span>'+
+      (p.balance?(' <span class="pill">баланс '+esc(p.balance)+'</span>'):'')+
+      '<div class="sub" style="margin-top:7px;white-space:normal">'+esc(m.h||'')+'</div>'+
+      '<div class="field" style="margin-top:9px">'+
+        '<div style="flex:1;min-width:230px"><label>'+(p.set?'заменить ключ':'вписать ключ')+'</label>'+
+        '<input id="k_'+esc(p.provider)+'" autocomplete="off" placeholder="вставь ключ из кабинета"></div>'+
+        '<button class="btn g" onclick="saveKey(\\''+esc(p.provider)+'\\')">Сохранить</button>'+
+        (p.set?('<button class="btn s" onclick="checkKey(\\''+esc(p.provider)+'\\')" '+
+                 'title="Спросить у провайдера баланс этим ключом — безопасно, ничего не меняет">Проверить</button>'+
+                '<button class="btn r" onclick="delKey(\\''+esc(p.provider)+'\\')">Убрать</button>'):'')+
+      '</div></div>'}).join('')||'<span class="mut">провайдеры не заданы</span>'}
+  catch(e){document.getElementById('keys').innerHTML='<span class="bad">'+esc(e.message)+'</span>'}}
+
+async function saveKey(p){const el=document.getElementById('k_'+p);const k=(el.value||'').trim();
+  if(!k)return toast('вставь ключ в поле слева от кнопки','bad');
+  if(!confirm('Сохранить новый ключ '+p+'?\\n\\nПанель сразу проверит его у провайдера. Дальше все покупки '+
+    'и продления — и твои, и автоматики — пойдут через этот кабинет.'))return;
+  const body=JSON.stringify({provider:p,key:k});
+  toast('Проверяю ключ у провайдера…');
+  try{let r=await api('/api/key',{method:'POST',headers:{'Content-Type':'application/json'},body:body});
+    if(r.needs_force){
+      if(!confirm('Провайдер сейчас не отвечает серверу, поэтому проверить ключ не вышло:\\n\\n'+(r.error||'')+
+        '\\n\\nСохранить ключ без проверки? Узел умеет ходить к API провайдера через собственный зарубежный '+
+        'канал — тогда ключ заработает сам, как только канал поднимется.'))return;
+      r=await api('/api/key',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({provider:p,key:k,force:true})})}
+    el.value='';
+    toast(r.verified?('Ключ '+p+' сохранён и проверен — баланс '+r.balance+' '+(r.currency||''))
+                    :('Ключ '+p+' сохранён без проверки: '+(r.error||'провайдер недоступен')),r.verified?'ok':'warn');
+    await loadKeys();await loadStatus()}
+  catch(e){toast('ключ: '+e.message,'bad')}}
+
+async function checkKey(p){toast('Спрашиваю у '+p+' баланс этим ключом…');
+  try{const r=await api('/api/key/check',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({provider:p})});
+    toast(r.ok?('Ключ '+p+' рабочий — баланс '+r.balance+' '+(r.currency||''))
+              :('Ключ '+p+' не сработал: '+(r.error||'')+
+                (r.network?' Похоже на недоступность сервиса с сервера, а не на плохой ключ.':'')),r.ok?'ok':'bad');
+    await loadKeys();if(r.ok)await loadStatus()}catch(e){toast(e.message,'bad')}}
+
+async function delKey(p){if(!confirm('Убрать ключ '+p+' из панели?\\n\\nПанель перестанет видеть прокси этого '+
+    'провайдера, покупать и продлевать у него. Сам кабинет и уже оплаченные прокси никуда не денутся. '+
+    'Последний оставшийся ключ убрать нельзя — без него панель слепа.'))return;
+  try{const r=await api('/api/key',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({provider:p,key:''})});
+    toast('Ключ '+p+' убран'+(r.gone_marked?(': '+r.gone_marked+' его прокси скрыты из пула'):'')+
+      (r.warning?('. ⚠️ '+r.warning):''),r.warning?'warn':'ok');
+    await loadKeys();await loadPool();await loadStatus()}catch(e){toast(e.message,'bad')}}
+
+/* ── обновления с GitHub (UPDATE-PLAN): версия узла против маяка ── */
+function updWhen(ts){return ts?esc(String(ts).replace('T',' ')):'ещё не проверялось'}
+const UPD_PH={check:'проверяю версию',download:'скачиваю выпуск',backup:'откладываю прежнюю сборку',
+  install:'устанавливаю (пара минут)',verify:'проверяю узел после установки',rollback:'ОТКАТЫВАЮСЬ на прежнюю версию'};
+async function loadUpd(){let r;try{r=await api('/api/update/status')}
+  catch(e){ /* панель могла перезапускаться посреди обновления — тихо пробуем ещё */
+    if(window.__UPDBUSY&&!window.__UPDPOLL){window.__UPDPOLL=1;
+      setTimeout(async()=>{window.__UPDPOLL=0;try{await loadUpd()}catch(_){}},3000);return}
+    document.getElementById('upd').innerHTML='<span class="bad">'+esc(e.message)+'</span>';return}
+  window.__UPD=r;
+  const live=r.live||{};const busy=!!r.applying;
+  const tiles=[
+    tile('на узле','Редут '+esc(r.local||'?'),'Версия сборки, которая работает прямо сейчас.'),
+    tile('последний выпуск',
+      r.latest?('Редут '+esc(r.latest)+' '+(r.newer?(r.bad?'<span class="pill bad">проблемный</span>':'<span class="pill warn">новее</span>')
+        :(r.local===r.latest?'<span class="pill ok">он и стоит</span>'
+          :(r.local?'<span class="pill">старее узла</span>':'<span class="pill warn">версия узла неизвестна</span>'))))
+              :'<span class="mut">ещё не проверялось</span>',
+      'Что лежит в официальном репозитории (файл VERSION на GitHub). Проверка идёт раз в сутки и по кнопке.'),
+    tile('проверялось',updWhen(r.last_check)+(r.last_error?' <span class="bad">ошибка</span>':''),
+      'Когда узел последний раз спрашивал GitHub. Разовая ошибка сети не страшна — следующая проверка по расписанию.'),
+    tile('автообновление',(r.auto?'<span class="ok">включено</span>':'<span class="warn">выключено</span>')+
+      '<div class="sub" style="font-size:10px">окно '+esc(r.window||'')+' по времени сервера'+
+      (r.auto&&r.window_ok===false?' <span class="bad">не накрывает время проверки 04:41–05:06 — авто не сработает!</span>':'')+'</div>',
+      'Включено — узел сам ставит новую версию ночью, в указанное окно. Выключено — только письмо о новинке, обновлять руками. Окно правится в /etc/vpn-panel/config.json (update.window).'),
+  ];
+  document.getElementById('upd').innerHTML=tiles.join('');
+  const box=document.getElementById('updbox');
+  const la=r.last_apply||null;
+  if(busy){box.innerHTML='<span class="warn">Идёт обновление: '+esc(UPD_PH[live.phase]||live.phase||'работаю')+'…</span> <span class="mut">панель может ненадолго перезапуститься — карточка сама дочитает итог</span>'}
+  else if(r.last_error){box.innerHTML='<span class="warn">Последняя проверка не удалась: '+esc(r.last_error)+'</span>'}
+  else if(r.newer&&r.bad){box.innerHTML='<span class="bad">Версия '+esc(r.latest)+' в чёрном списке: обновление на неё уже проваливалось и было откатано. Автоматика её не тронет.</span>'}
+  else if(r.newer){box.innerHTML='<span class="warn">Доступна версия '+esc(r.latest)+'.</span> '+(r.auto?'Узел сам обновится в окно '+esc(r.window)+'.':'Автообновление выключено — обнови вручную.')}
+  else if(la&&!la.ok){box.innerHTML='<span class="mut">Последняя попытка '+updWhen(la.ts)+': '+esc(la.from||'?')+' → '+esc(la.to||'?')+' не прошла ('+esc(la.why||'')+'), '+(la.rolled_back?'откат выполнен':'откат НЕ подтвердился — глянь узел руками')+'.</span>'}
+  else{box.textContent=''}
+  const act=document.getElementById('updact');
+  if(busy){act.innerHTML=''}
+  else{let b='';
+    if(r.newer&&!r.bad)b='<button class="btn g" onclick="applyUpd(this)">Обновить сейчас до '+esc(r.latest)+'</button> ';
+    else if(r.newer&&r.bad)b='<button class="btn r" onclick="applyUpd(this)" title="Прошлая попытка провалилась и была откатана. Ставить повторно имеет смысл, только если понимаешь, что тогда пошло не так.">Поставить '+esc(r.latest)+' несмотря на прошлый провал</button> ';
+    b+='<button class="btn s" onclick="toggleAuto()">'+(r.auto?'Выключить':'Включить')+' автообновление</button>';
+    act.innerHTML=b}
+  const wasBusy=window.__UPDBUSY;window.__UPDBUSY=busy;
+  if(!busy&&wasBusy){ /* обновление только что закончилось — показать итог */
+    if(live.phase==='done'){toast('Узел обновлён до '+esc(live.to||r.local||'')+' ✓','ok');await loadStatus()}
+    else if(live.phase==='failed'){toast('Обновление не прошло: '+esc(live.why||'')+(live.rolled_back?' — откат выполнен, узел на прежней версии':' — откат не подтвердился!'),live.rolled_back?'warn':'bad')}}
+  if(busy&&!window.__UPDPOLL){window.__UPDPOLL=1;
+    setTimeout(async()=>{window.__UPDPOLL=0;try{await loadUpd()}catch(_){}},3000)}}
+async function checkUpd(btn){if(btn)btn.disabled=true;toast('Спрашиваю GitHub, какая версия последняя…');
+  try{const r=await api('/api/update/check',{method:'POST'});
+    if(!r.ok){toast('Проверка не отработала: '+((r.output||'').split('\\n').pop()||'см. журнал узла'),'bad')}
+    else toast(r.last_error?('Проверка не удалась: '+r.last_error)
+         :(r.newer?('Доступна версия '+r.latest+' (у узла '+(r.local||'?')+')'):'Обновлений нет — стоит последняя версия'),
+      r.last_error?'bad':(r.newer?'warn':'ok'));
+    await loadUpd()}
+  catch(e){toast('проверка обновлений: '+e.message,'bad')}
+  finally{if(btn)btn.disabled=false}}
+async function applyUpd(btn){const r0=window.__UPD||{};
+  if(!confirm('Обновить узел до версии '+(r0.latest||'?')+' прямо сейчас?\\n\\nУзел скачает выпуск с GitHub и переустановит сам себя тем же установщиком: доступы устройств, ключи, пароль панели и рабочий канал сохранятся. Панель на несколько секунд перезапустится. Если что-то главное не поднимется — узел сам откатится на текущую версию.'))return;
+  if(btn)btn.disabled=true;toast('Запускаю обновление…');
+  try{const r=await api('/api/update/apply',{method:'POST'});
+    toast('Обновление до '+(r.started||'')+' запущено. Карточка покажет ход; панель может на минуту перестать отвечать — это нормально.','warn');
+    window.__UPDBUSY=1;await loadUpd()}
+  catch(e){toast('обновление: '+e.message,'bad');if(btn)btn.disabled=false}}
+async function toggleAuto(){const r0=window.__UPD||{};const to=!r0.auto;
+  if(!confirm(to?('Включить автообновление?\\n\\nУзел будет сам ставить новые версии ночью (окно '+(r0.window||'04:00-06:00')+' по времени сервера), с проверкой после установки и автооткатом при провале.')
+               :'Выключить автообновление?\\n\\nУзел будет только сообщать о новых версиях (письмо и эта карточка), а обновлять придётся вручную.'))return;
+  try{await api('/api/update/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auto:to})});
+    toast(to?'Автообновление включено':'Автообновление выключено — узел будет только сообщать о новинках','ok');
+    await loadUpd()}
+  catch(e){toast('настройка: '+e.message,'bad')}}
+
+async function reloadAll(){try{await loadStatus();await loadMoney();await loadPool();await loadClients();await loadFold('strategy');await loadKeys();await loadUpd();await loadFold('events')}catch(e){toast(e.message,'bad')}}
 
 function ago(ts){if(!ts)return '<span class="mut">ещё ни разу</span>';const d=Math.floor(Date.now()/1000)-ts;
   if(d<0)return '<span class="ok">только что</span>';
@@ -644,9 +972,19 @@ async function setRole(sel){try{await api('/api/proxy/'+encodeURIComponent(sel.d
 async function doRotate(){if(!confirm('Запустить автоматическую починку?\\n\\nПанель проверит текущий прокси и по порядку попробует: '+
     'подстроить настройки → переключиться на живой из пула → докупить новый (если разрешено лимитами) → включить аварийный режим. '+
     'Может сменить прокси и потратить деньги.'))return;
-  toast('Диагностика и починка (до минуты)…');
+  toast('Запускаю диагностику и починку в фоне…');
   try{const r=await api('/api/rotate',{method:'POST'});
-    toast('Итог: '+r.state+(r.output?('\\n'+r.output):''),r.state=='OK'?'ok':(r.state=='EMERGENCY'?'bad':'warn'));await reloadAll()}
+    if(r.state!==undefined){ /* dev-режим: агент отработал синхронно */
+      toast('Итог: '+r.state+(r.output?('\\n'+r.output):''),r.state=='OK'?'ok':(r.state=='EMERGENCY'?'bad':'warn'));
+      await reloadAll();return}
+    if(r.busy)toast('Ротация уже идёт — жду её итог','warn');
+    /* F6: ротация идёт транзиентным юнитом — поллим статус до завершения */
+    let s=null;
+    for(let n=0;n<200;n++){await new Promise(res=>setTimeout(res,3000));
+      try{s=await api('/api/status');window.__S=s;if(!s.rotate_busy)break}catch(e){}}
+    const st=(s&&s.automat)||'?';
+    toast('Итог починки: '+st,st=='OK'?'ok':(st=='EMERGENCY'?'bad':'warn'));
+    await reloadAll()}
   catch(e){toast('починка: '+e.message,'bad');await reloadAll()}}
 
 async function doEmergency(){let cur=false;try{cur=(await api('/api/status')).emergency}catch(e){}

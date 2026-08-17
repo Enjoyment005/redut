@@ -62,16 +62,16 @@ class TestPool(unittest.TestCase):
         self.assertIn("proxyline:12345", uids)
 
     def test_default_roles(self):
+        # П9 (роли v2): оба провайдера по умолчанию auto — деление на «резерв» умерло
         self.pool.refresh({"proxy6": FakeProvider("proxy6", p6_items()),
                            "proxyline": FakeProvider("proxyline", pl_items())})
         self.assertEqual(self.pool.get("proxy6:21")["role"], "auto")
-        self.assertEqual(self.pool.get("proxyline:12345")["role"], "reserve",
-                         "ProxyLine — статический резерв (§5)")
+        self.assertEqual(self.pool.get("proxyline:12345")["role"], "auto")
 
     def test_merge_preserves_role_and_marks_gone(self):
         items = p6_items()
         self.pool.refresh({"proxy6": FakeProvider("proxy6", items)})
-        self.pool.set_role("proxy6:21", "chrome")
+        self.pool.set_role("proxy6:21", "off")
         # второй refresh: запись 21 пропала из выдачи, у 11 сменился пароль
         rest = [dict(it) for it in items if it["ext_id"] != "21"]
         for it in rest:
@@ -80,13 +80,13 @@ class TestPool(unittest.TestCase):
         self.pool.refresh({"proxy6": FakeProvider("proxy6", rest)})
         gone_row = self.pool.get("proxy6:21")
         self.assertEqual(gone_row["gone"], 1, "пропавшие помечаются gone, не удаляются")
-        self.assertEqual(gone_row["role"], "chrome", "роль переживает merge")
+        self.assertEqual(gone_row["role"], "off", "роль переживает merge")
         self.assertEqual(self.pool.get("proxy6:11")["password"], "новый")
-        # третий refresh: 21 вернулся -> gone снимается, роль всё ещё chrome
+        # третий refresh: 21 вернулся -> gone снимается, роль всё ещё off
         self.pool.refresh({"proxy6": FakeProvider("proxy6", items)})
         back = self.pool.get("proxy6:21")
         self.assertEqual(back["gone"], 0)
-        self.assertEqual(back["role"], "chrome")
+        self.assertEqual(back["role"], "off")
 
     def test_provider_error_keeps_cache(self):
         self.pool.refresh({"proxy6": FakeProvider("proxy6", p6_items())})
@@ -109,13 +109,11 @@ class TestPool(unittest.TestCase):
         self.assertEqual(row["exit_cc"], "fi")
         self.assertEqual(row["score"], 130.0)
 
-    def test_candidates_exclude_off_chrome_gone(self):
+    def test_candidates_exclude_off_and_gone(self):
         self.pool.refresh({"proxy6": FakeProvider("proxy6", p6_items())})
         self.pool.set_role("proxy6:11", "off")
-        self.pool.set_role("proxy6:14", "chrome")
         uids = {r["uid"] for r in self.pool.candidates()}
-        self.assertNotIn("proxy6:11", uids)
-        self.assertNotIn("proxy6:14", uids, "chrome автоматика не трогает (§5)")
+        self.assertNotIn("proxy6:11", uids, "off автоматика не трогает (П9)")
         self.assertIn("proxy6:21", uids)
 
     def test_bad_role_rejected(self):
@@ -123,10 +121,128 @@ class TestPool(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.pool.set_role("proxy6:21", "admin'; DROP TABLE proxy;--")
 
+    def test_old_roles_rejected_now(self):
+        # старых ролей больше нет: селектор и API принимают только auto|off
+        self.pool.refresh({"proxy6": FakeProvider("proxy6", p6_items())})
+        for role in ("chrome", "reserve", "vpn-ru", "vpn-node1"):
+            with self.assertRaises(ValueError):
+                self.pool.set_role("proxy6:21", role)
+
     def test_events_written(self):
         self.pool.refresh({"proxy6": FakeProvider("proxy6", p6_items())})
         n = self.pool.conn.execute("SELECT COUNT(*) FROM event WHERE action='pool-refresh'").fetchone()[0]
         self.assertEqual(n, 1)
+
+
+class TestRolesV2Migration(unittest.TestCase):
+    """П9: миграция ролей к auto|off — снапшот, маркер, идемпотентность."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmpdir.name, "state.db")
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def seed_old_roles(self):
+        """База «старой сборки»: роли из шести, маркера roles_v2 нет."""
+        p = pool_mod.Pool(self.db, server="test")
+        p.refresh({"proxy6": FakeProvider("proxy6", p6_items()),
+                   "proxyline": FakeProvider("proxyline", pl_items())})
+        p.conn.execute("UPDATE proxy SET role='chrome' WHERE uid='proxy6:21'")
+        p.conn.execute("UPDATE proxy SET role='reserve' WHERE uid='proxyline:12345'")
+        p.conn.execute("UPDATE proxy SET role='vpn-ru' WHERE uid='proxy6:11'")
+        p.conn.execute("DELETE FROM setting WHERE key='roles_v2'")
+        p.conn.commit()
+        p.close()
+
+    def test_migrates_and_snapshots(self):
+        self.seed_old_roles()
+        p = pool_mod.Pool(self.db, server="test")     # коннект = миграция
+        self.assertEqual(p.get("proxy6:21")["role"], "off", "chrome -> off")
+        self.assertEqual(p.get("proxyline:12345")["role"], "auto", "reserve -> auto")
+        self.assertEqual(p.get("proxy6:11")["role"], "auto", "vpn-* -> auto")
+        self.assertEqual(p.get_setting("roles_v2"), "1")
+        self.assertTrue(os.path.exists(self.db + ".pre-roles-v2"),
+                        "миграция необратима — снапшот обязателен")
+        n = p.conn.execute(
+            "SELECT COUNT(*) FROM event WHERE action='role-migrate'").fetchone()[0]
+        self.assertEqual(n, 1)
+        p.close()
+        # снапшот содержит СТАРЫЕ роли
+        snap = sqlite3.connect(self.db + ".pre-roles-v2")
+        old = snap.execute("SELECT role FROM proxy WHERE uid='proxy6:21'").fetchone()[0]
+        snap.close()
+        self.assertEqual(old, "chrome")
+
+    def test_idempotent_by_marker(self):
+        self.seed_old_roles()
+        pool_mod.Pool(self.db, server="test").close()
+        os.unlink(self.db + ".pre-roles-v2")
+        p = pool_mod.Pool(self.db, server="test")     # повторный коннект
+        self.assertFalse(os.path.exists(self.db + ".pre-roles-v2"),
+                         "по маркеру миграция не гоняется повторно")
+        n = p.conn.execute(
+            "SELECT COUNT(*) FROM event WHERE action='role-migrate'").fetchone()[0]
+        self.assertEqual(n, 1, "событие пишется один раз")
+        p.close()
+
+    def test_fresh_db_no_snapshot_no_event(self):
+        p = pool_mod.Pool(self.db, server="test")
+        self.assertEqual(p.get_setting("roles_v2"), "1")
+        self.assertFalse(os.path.exists(self.db + ".pre-roles-v2"),
+                         "нечего мигрировать — нечего и снапшотить")
+        n = p.conn.execute(
+            "SELECT COUNT(*) FROM event WHERE action='role-migrate'").fetchone()[0]
+        self.assertEqual(n, 0, "событие только при rowcount > 0")
+        p.close()
+
+
+class TestRefreshActiveCleanup(unittest.TestCase):
+    """П7 (🔴 C2): уборка осиротевших провайдеров — по ключам на диске, не по словарю."""
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.pool = pool_mod.Pool(self.db, server="test")
+        self.pool.refresh({"proxy6": FakeProvider("proxy6", p6_items()),
+                           "proxyline": FakeProvider("proxyline", pl_items())})
+
+    def tearDown(self):
+        self.pool.close()
+        os.unlink(self.db)
+
+    def alive_providers(self):
+        return {r["provider"] for r in self.pool.list(include_gone=False)}
+
+    def test_subset_refresh_does_not_bury_other_provider(self):
+        # кейс 🔴 C2: покупка у proxy6 зовёт refresh({"proxy6": …}) БЕЗ active —
+        # строки ProxyLine обязаны остаться живыми
+        self.pool.refresh({"proxy6": FakeProvider("proxy6", p6_items())})
+        self.assertIn("proxyline", self.alive_providers())
+
+    def test_active_both_keys_keeps_both(self):
+        # покупка при живых двух ключах: даже если active передали — оба живы
+        self.pool.refresh({"proxy6": FakeProvider("proxy6", p6_items())},
+                          active={"proxy6", "proxyline"})
+        self.assertIn("proxyline", self.alive_providers())
+
+    def test_orphan_provider_marked_gone(self):
+        # ключ ProxyLine удалён: полный refresh с active={proxy6} хоронит его строки
+        s = self.pool.refresh({"proxy6": FakeProvider("proxy6", p6_items())},
+                              active={"proxy6"})
+        self.assertNotIn("proxyline", self.alive_providers())
+        self.assertIn("proxy6", self.alive_providers())
+        self.assertGreater(s["stale"].get("proxyline", 0), 0)
+
+    def test_provider_error_with_key_not_buried(self):
+        # ошибка API при ЖИВОМ ключе — не повод хоронить кэш (§10)
+        s = self.pool.refresh({"proxy6": FakeProvider("proxy6", error=RuntimeError("API лёг")),
+                               "proxyline": FakeProvider("proxyline", pl_items())},
+                              active={"proxy6", "proxyline"})
+        self.assertIn("proxy6", self.alive_providers())
+        self.assertIn("proxy6", s["errors"])
+        self.assertEqual(s["stale"], {})
 
 
 if __name__ == "__main__":

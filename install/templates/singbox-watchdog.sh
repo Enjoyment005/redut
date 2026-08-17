@@ -27,8 +27,11 @@ throttled_log(){ # $1=stamp-файл $2=сообщение
 
 # Аварийный режим агента: он владеет маршрутами (middleman -> WAN). Сторож ничего
 # не «чинит» (иначе вернул бы default в мёртвый tun0 и убил бы прямой выход) —
-# только даёт агенту повторить попытку восстановиться (агент троттлит до 15 мин, §8).
+# только даёт агенту повторить попытку восстановиться (агент сам держит backoff, §8/F6).
 if [ -f /run/vpn-agent-emergency ]; then
+    # маркеры двух-провалов начинают с чистого листа после выхода из аварии (F1):
+    # иначе довесок с тиков до аварии превратил бы первый же чих в «2-й подряд»
+    rm -f /run/singbox-wd.upfail /run/singbox-wd.sbfail
     if [ -x "$AGENT" ]; then "$AGENT" rotate --reason watchdog >> "$LOG" 2>&1; fi
     exit 0
 fi
@@ -67,22 +70,44 @@ PY
         UPOUT=$(curl -s --max-time 10 --socks5-hostname "$UHOST:$UPORT" --proxy-user "$UUSER:$UPASS" https://api.ipify.org 2>/dev/null)
     fi
     if is_ip "$UPOUT"; then
-        log "tun0 egress dead, upstream $UHOST:$UPORT ALIVE -> restart sing-box"
-        systemctl restart sing-box; sleep 5
-        $IP route replace default dev tun0 table middleman
+        # F2 (ревью 1.3.0): «прокси жив, tun0 мёртв» — рестарт может НЕ лечить
+        # (sing-box не поднимает tun0). Раньше сторож молча рестартил каждые 2 мин
+        # вечно и агента не звал — предохранитель F2 в rotate голодал. Считаем
+        # безуспешные попытки; с 3-й подряд зовём агента (файл-счётчик в /run,
+        # сбрасывается ребутом и любым здоровым тиком).
+        N=$(cat /run/singbox-wd.sbfail 2>/dev/null || echo 0); N=$((N+1))
+        echo "$N" > /run/singbox-wd.sbfail
+        if [ "$N" -ge 3 ] && [ -x "$AGENT" ]; then
+            log "tun0 egress dead, upstream $UHOST:$UPORT ALIVE, рестарт не лечит ($N подряд) -> vpn-agent rotate (F2)"
+            "$AGENT" rotate --reason watchdog >> "$LOG" 2>&1
+        else
+            log "tun0 egress dead, upstream $UHOST:$UPORT ALIVE -> restart sing-box ($N)"
+            systemctl restart sing-box; sleep 5
+            $IP route replace default dev tun0 table middleman
+        fi
+        rm -f /run/singbox-wd.upfail          # виноват был sing-box, не upstream
         REPAIRED=1
     else
-        # upstream МЁРТВ -> рестарт sing-box не поможет. Зовём агента (§1, §8): под своим
-        # flock он проведёт диагностику по порядку и сам решит RETUNE/ротация/докупка/авария
-        # (сеть сервера мертва -> он НЕ покупает, только алерт). Свои лимиты держит сам.
-        if [ -x "$AGENT" ]; then
-            log "tun0 egress dead И upstream $UHOST:$UPORT НЕДОСТУПЕН -> vpn-agent rotate (§8)"
+        # upstream МЁРТВ -> рестарт sing-box не поможет. F1 (1.3.0): требуем 2 ПОДРЯД
+        # провала (маркер в /run: сбрасывается ребутом и любым здоровым тиком) —
+        # единичный сетевой чих не должен дёргать ротацию. Цена: обнаружение
+        # реального обрыва замедляется на ~2 мин (осознанно).
+        if [ ! -f /run/singbox-wd.upfail ]; then
+            touch /run/singbox-wd.upfail
+            log "tun0 egress dead И upstream $UHOST:$UPORT недоступен — жду подтверждения следующим тиком (F1)"
+        elif [ -x "$AGENT" ]; then
+            # 2-й провал подряд: зовём агента (§1, §8) — под своим flock он проведёт
+            # диагностику по порядку и сам решит RETUNE/ротация/докупка/авария
+            # (сеть сервера мертва -> он НЕ покупает, только алерт). Лимиты держит сам.
+            log "tun0 egress dead И upstream $UHOST:$UPORT НЕДОСТУПЕН (2-й тик подряд) -> vpn-agent rotate (§8)"
             "$AGENT" rotate --reason watchdog >> "$LOG" 2>&1
         else
             throttled_log upwarn "tun0 egress dead И upstream $UHOST:$UPORT НЕДОСТУПЕН, а vpn-agent не установлен -> пропускаю"
         fi
         REPAIRED=1
     fi
+else
+    rm -f /run/singbox-wd.upfail /run/singbox-wd.sbfail   # здоровый тик сбрасывает маркеры (F1/F2)
 fi
 # Heartbeat 'ok' раз в час (только если всё здорово и ремонта не было)
 if [ "$REPAIRED" = "0" ]; then

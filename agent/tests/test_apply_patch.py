@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Пересборка config.json от эталона vadim/README.md §5.3 (§7.3, §9.3)."""
+"""Пересборка config.json от эталона node2/README.md §5.3 (§7.3, §9.3)."""
 import copy
 import unittest
 

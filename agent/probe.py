@@ -170,14 +170,16 @@ def probe(proxy, provider_check=None, latency_runs=3):
         "provider_check": None,
     }
 
-    # 0. (PROXY6) check?ids= — 1 дешёвый запрос отсеивает труп (§7.2 п.5)
+    # 0. (PROXY6) check?ids= — ПОДСКАЗКА, не приговор (F4, 1.3.0): API провайдера
+    # иногда врёт/лагает, а живой прокси терять из-за этого нельзя. false больше
+    # не дисквалифицирует сам по себе — матрицу гоняем всё равно; дисквалификация
+    # только если И матрица мертва (пометка в disq различает эти случаи).
+    provider_dead = False
     if provider_check is not None:
         try:
             alive = bool(provider_check())
             res["provider_check"] = alive
-            if not alive:
-                res["disqualified"] = "provider-check-dead"
-                return res
+            provider_dead = not alive
         except Exception as e:
             res["provider_check"] = "error: %s" % e  # ошибка API не блокирует пробу
 
@@ -199,7 +201,9 @@ def probe(proxy, provider_check=None, latency_runs=3):
     res["http_port"] = ph if ph in http_ports else (http_ports[0] if http_ports else None)
 
     if not socks_ports and not http_ports:
-        res["disqualified"] = "no-combo"  # не работает ни одна комбинация — дисквалификация
+        # не работает ни одна комбинация — дисквалификация (+пометка, если и
+        # провайдер считает его трупом: п.2 гейта удаления §6.4 останется честным)
+        res["disqualified"] = "provider-check-dead+no-combo" if provider_dead else "no-combo"
         return res
 
     # основная комбинация: как socks-out (§7.3 — SOCKS5 предпочтителен)
@@ -233,34 +237,97 @@ def probe(proxy, provider_check=None, latency_runs=3):
     return res
 
 
-def score(row, res, is_current=False):
-    """Скоринг §7.4. None = дисквалификация."""
-    if not res.get("ok"):
-        return None
+def _score_core(vals, cfg=None, is_current=False):
+    """Единая математика скоринга §7.4 — ОДИН источник истины (П3).
+
+    vals: ok, latency_ms, fail_count, tg_ok, socks_ok, http_ok, kind, ip_version,
+    date_end, exit_cc, country, geo_agree.
+    -> (полная_оценка, базовая_часть_без_странового_вклада) или (None, None).
+    Базовая часть нужна rank_candidates: в режимах country_first страна — отдельный
+    первичный ключ, и полная оценка удвоила бы её вес.
+    """
+    if not vals.get("ok"):
+        return None, None
     s = 100.0
-    if res.get("latency_ms") is not None:
-        s -= min(res["latency_ms"] / 10.0, 40.0)
-    s -= int(row.get("fail_count") or 0) * 15  # история провалов до этой пробы
-    if res.get("tg_ok"):
+    if vals.get("latency_ms") is not None:
+        s -= min(vals["latency_ms"] / 10.0, 40.0)
+    s -= int(vals.get("fail_count") or 0) * 15  # история провалов до этой пробы
+    if vals.get("tg_ok"):
         s += 20
-    if res.get("socks_ok") and res.get("http_ok"):
+    if vals.get("socks_ok") and vals.get("http_ok"):
         s += 15  # есть куда откатиться без смены IP (RETUNE)
-    if row.get("kind") == "dedicated" and int(row.get("ip_version") or 4) == 4:
+    if vals.get("kind") == "dedicated" and int(vals.get("ip_version") or 4) == 4:
         s += 10
-    elif row.get("kind") == "shared":
+    elif vals.get("kind") == "shared":
         s -= 20
     if is_current:
         s += 15  # стикинес: не дёргаться зря
-    days = days_left(row.get("date_end"))
+    days = days_left(vals.get("date_end"))
     if days is not None and days < 2:
         s -= 30
-    # умная оценка страны (2026-08-15): репутация выхода + сходимость geoip-баз.
+    base = s
+    # умная оценка страны (2026-08-15): репутация выхода + сходимость geoip-баз,
+    # помноженные на вес выбранной стратегии (2026-08-17; у «скорости» вес 0).
     # Чёрный список сюда не доходит — он отсекается дисквалификацией выше.
-    cr = country.rating(res.get("exit_cc") or row.get("country"),
-                        res.get("geo_agree", True))
+    cr = country.rating(vals.get("exit_cc") or vals.get("country"),
+                        vals.get("geo_agree", True), cfg)
     if cr is not None:
         s += cr
-    return round(s, 1)
+    return round(s, 1), round(base, 1)
+
+
+def score(row, res, is_current=False, cfg=None):
+    """Скоринг §7.4 после живой пробы. None = дисквалификация.
+
+    cfg нужен только политике стран: чёрный список из конфига и **вес страны по
+    выбранной стратегии** (country.rating). Без cfg действуют значения по умолчанию.
+    Делегирует _score_core — та же формула, что у score_from_row (П3)."""
+    vals = {
+        "ok": res.get("ok"), "latency_ms": res.get("latency_ms"),
+        "fail_count": row.get("fail_count"),
+        "tg_ok": res.get("tg_ok"), "socks_ok": res.get("socks_ok"),
+        "http_ok": res.get("http_ok"),
+        "kind": row.get("kind"), "ip_version": row.get("ip_version"),
+        "date_end": row.get("date_end"),
+        "exit_cc": res.get("exit_cc"), "country": row.get("country"),
+        "geo_agree": res.get("geo_agree", True),
+    }
+    return _score_core(vals, cfg, is_current)[0]
+
+
+def _rget(row, key):
+    """Значение колонки из dict ИЛИ sqlite3.Row (у Row нет .get)."""
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def score_from_row(row, cfg=None, is_current=False):
+    """П3: оценка «на лету» из сохранённой строки пула под ТЕКУЩУЮ стратегию.
+
+    Смена стратегии ничего не пересчитывает в БД — потребители (таблица пула,
+    порядок ротации, превью стратегий) зовут эту функцию и видят ОДНИ И ТЕ ЖЕ
+    числа немедленно. Колонка score в БД остаётся «последним замером» (CLI list,
+    отладка), потребители на неё больше не завязаны.
+
+    Все входы формулы лежат в строке (latency_ms, socks/http/tg_ok, kind,
+    ip_version, date_end, fail_count, exit_cc, geo_agree). Штраф «<2 дней до
+    конца» считается от текущего времени — честно «плывёт» без новой пробы.
+    -> (полная_оценка, базовая_часть); (None, None), если последняя проба не прошла.
+    """
+    geo = _rget(row, "geo_agree")
+    vals = {
+        "ok": bool(_rget(row, "probe_ok")), "latency_ms": _rget(row, "latency_ms"),
+        "fail_count": _rget(row, "fail_count"),
+        "tg_ok": _rget(row, "tg_ok"), "socks_ok": _rget(row, "socks_ok"),
+        "http_ok": _rget(row, "http_ok"),
+        "kind": _rget(row, "kind"), "ip_version": _rget(row, "ip_version"),
+        "date_end": _rget(row, "date_end"),
+        "exit_cc": _rget(row, "exit_cc"), "country": _rget(row, "country"),
+        "geo_agree": True if geo is None else bool(geo),
+    }
+    return _score_core(vals, cfg, is_current)
 
 
 def days_left(date_end):

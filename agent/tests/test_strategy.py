@@ -1,0 +1,231 @@
+# -*- coding: utf-8 -*-
+"""Стратегии выбора стран (§6.1, настройка админа 2026-08-17).
+
+Стратегия меняет три вещи — где автоматике можно покупать, в каком порядке перебирать
+пул и сколько весит страна в оценке пробы. Это прямо про деньги и про то, из какой
+страны увидят клиента, поэтому проверяем каждое из трёх для каждой стратегии, а
+отдельно — что **ни одна** не открывает чёрный список и что по умолчанию поведение
+осталось ровно тем, каким было до появления выбора.
+"""
+import unittest
+
+import _ctx      # noqa: F401  (добавляет panel/ в sys.path)
+import country
+import money
+import probe
+import states
+
+WL = ["fi", "ee", "lv", "de"]
+
+
+def cfg(strategy=None, whitelist=None, blacklist=None):
+    c = {"countries": {"whitelist": list(WL if whitelist is None else whitelist),
+                       "blacklist": list(blacklist or [])}}
+    if strategy:
+        c["countries"]["strategy"] = strategy
+    return c
+
+
+def row(host, cc, probe_ok=0, score=None, **meas):
+    """Строка пула. Оценка с 1.3.0 (П3) считается на лету из ЗАМЕРОВ строки
+    (latency_ms/tg_ok/http_ok/kind — kwargs); колонка score потребителями не
+    читается и оставлена в фикстуре только как «последний замер»."""
+    r = {"uid": "proxy6:%s" % host, "host": host, "country": cc, "exit_cc": cc,
+         "probe_ok": probe_ok, "score": score, "role": "auto",
+         "latency_ms": None, "tg_ok": 0, "socks_ok": probe_ok, "http_ok": 0,
+         "kind": None, "ip_version": 4, "fail_count": 0, "date_end": None,
+         "geo_agree": 1}
+    r.update(meas)
+    return r
+
+
+class TestSelection(unittest.TestCase):
+    def test_four_strategies_and_default(self):
+        self.assertEqual(list(country.STRATEGIES), ["whitelist", "reputation", "balanced", "speed"])
+        self.assertEqual(country.DEFAULT_STRATEGY, "reputation")
+
+    def test_unknown_or_missing_falls_back_to_default(self):
+        for c in (None, {}, cfg(), cfg("нет-такой"), {"countries": {"strategy": ""}}):
+            self.assertEqual(country.strategy(c), "reputation")
+
+    def test_strategy_is_case_and_space_tolerant(self):
+        self.assertEqual(country.strategy({"countries": {"strategy": " SPEED "}}), "speed")
+
+    def test_info_carries_id_and_human_text(self):
+        info = country.strategy_info(cfg("speed"))
+        self.assertEqual(info["id"], "speed")
+        for field in ("title", "short", "desc"):
+            self.assertTrue(len(info[field]) > 10, field)
+
+
+class TestBlacklistHoldsEverywhere(unittest.TestCase):
+    """Ни одна стратегия не должна открывать ru/ua/by — это запрет в коде."""
+
+    def test_rating_none_and_auto_denied(self):
+        for sid in country.STRATEGIES:
+            for cc in ("ru", "ua", "by"):
+                self.assertIsNone(country.rating(cc, True, cfg(sid)), (sid, cc))
+                self.assertFalse(country.auto_allowed(cc, True, cfg(sid)), (sid, cc))
+                self.assertEqual(country.tier(cc, True, cfg(sid)), "blocked")
+
+    def test_candidates_dropped_in_every_strategy(self):
+        rows = [row("r", "ru", 1, 200.0), row("d", "de")]
+        for sid in country.STRATEGIES:
+            out = [r["host"] for r in states.rank_candidates(rows, cfg(sid))]
+            self.assertEqual(out, ["d"], sid)
+
+    def test_extra_blacklist_from_config_holds_too(self):
+        c = cfg("speed", blacklist=["ng"])
+        self.assertFalse(country.auto_allowed("ng", True, c))
+        self.assertIsNone(country.rating("ng", True, c))
+
+
+class TestAutoBuyGate(unittest.TestCase):
+    """Где автоматике РАЗРЕШЕНО покупать (money.buy_candidates)."""
+
+    def test_whitelist_buys_only_from_list(self):
+        c = cfg("whitelist")
+        cands = money.buy_candidates(c, available=["ng", "jp", "de", "us"])
+        self.assertEqual(set(cands), set(WL))          # us/jp есть у провайдера, но не в списке
+        self.assertFalse(country.auto_allowed("us", True, c))
+        self.assertTrue(country.auto_allowed("fi", True, c))
+
+    def test_reputation_keeps_old_behaviour(self):
+        c = cfg("reputation")
+        cands = money.buy_candidates(c, available=["ng", "kz", "jp"])
+        self.assertNotIn("ng", cands)                  # рискованные — только вручную
+        self.assertNotIn("kz", cands)
+        self.assertIn("jp", cands)
+        self.assertEqual(cands[:2], ["fi", "ee"])      # trusted вперёд, порядок списка сохранён
+        self.assertEqual(cands, money.buy_candidates({"countries": {"whitelist": WL}},
+                                                     available=["ng", "kz", "jp"]))
+
+    def test_balanced_allows_risky_but_puts_it_last(self):
+        cands = money.buy_candidates(cfg("balanced"), available=["ng", "jp"])
+        self.assertIn("ng", cands)
+        self.assertEqual(cands[-1], "ng")
+        self.assertLess(cands.index("jp"), cands.index("ng"))
+
+    def test_speed_keeps_input_order_and_allows_everything(self):
+        cands = money.buy_candidates(cfg("speed"), available=["ng", "jp"])
+        self.assertEqual(cands, WL + ["ng", "jp"])     # ничего не переставлено и не выкинуто
+
+
+class TestCandidateOrder(unittest.TestCase):
+    """В каком порядке перебирать пул (states.rank_candidates)."""
+
+    def rows(self):
+        # медленный, но надёжный vs быстрый, но рискованный:
+        # ng_fast: 100−5(лат.)+20(tg)+15(оба порта) = базовая 130
+        # de_slow: 100−40(лат.) = базовая 60
+        return [row("ng_fast", "ng", probe_ok=1, latency_ms=50, tg_ok=1, http_ok=1),
+                row("de_slow", "de", probe_ok=1, latency_ms=400)]
+
+    def test_country_first_strategies_prefer_reputation(self):
+        for sid in ("whitelist", "reputation"):
+            out = [r["host"] for r in states.rank_candidates(self.rows(), cfg(sid))]
+            self.assertEqual(out[0], "de_slow", sid)
+
+    def test_speed_prefers_measurements(self):
+        out = [r["host"] for r in states.rank_candidates(self.rows(), cfg("speed"))]
+        self.assertEqual(out[0], "ng_fast")
+
+    def test_balanced_lets_a_big_gap_win(self):
+        # разрыв в замерах 70 против половины репутации (25+25)/2 -> побеждает быстрый
+        out = [r["host"] for r in states.rank_candidates(self.rows(), cfg("balanced"))]
+        self.assertEqual(out[0], "ng_fast")
+
+    def test_balanced_keeps_reputation_when_measurements_are_close(self):
+        # базовые 125 против 120: +5 по замерам не перебивают половину репутации
+        rows = [row("ng", "ng", probe_ok=1, latency_ms=100, tg_ok=1, http_ok=1),
+                row("de", "de", probe_ok=1, latency_ms=150, tg_ok=1, http_ok=1)]
+        out = [r["host"] for r in states.rank_candidates(rows, cfg("balanced"))]
+        self.assertEqual(out[0], "de")
+
+    def test_unprobed_candidate_gets_a_chance_in_speed(self):
+        """Непробованный не должен навсегда уступать любому измеренному (UNPROBED_SCORE)."""
+        # known_bad: базовая 100−40(лат.)−20(shared) = 40 < UNPROBED_SCORE=100
+        rows = [row("known_bad", "de", probe_ok=1, latency_ms=400, kind="shared"),
+                row("fresh", "de")]
+        out = [r["host"] for r in states.rank_candidates(rows, cfg("speed"))]
+        self.assertEqual(out, ["fresh", "known_bad"])
+
+    def test_whitelist_pushes_outsiders_last_but_keeps_them(self):
+        """Страна вне списка — в конец очереди, но не выброшена: живой выход лучше аварии."""
+        rows = [row("us", "us", probe_ok=1, latency_ms=50, tg_ok=1, http_ok=1),
+                row("fi", "fi")]
+        out = [r["host"] for r in states.rank_candidates(rows, cfg("whitelist"))]
+        self.assertEqual(out, ["fi", "us"])
+        self.assertIn("us", out)
+
+
+class TestScoreWeight(unittest.TestCase):
+    """Сколько весит страна в оценке пробы (probe.score)."""
+
+    def _row(self):
+        return {"kind": "dedicated", "ip_version": 4, "fail_count": 0, "date_end": None,
+                "country": "de"}
+
+    def _res(self, cc):
+        return {"ok": True, "latency_ms": 200, "tg_ok": True, "socks_ok": True,
+                "http_ok": True, "exit_cc": cc, "geo_agree": True}
+
+    def gap(self, strategy):
+        r = self._row()
+        return (probe.score(r, self._res("de"), cfg=cfg(strategy))
+                - probe.score(r, self._res("ng"), cfg=cfg(strategy)))
+
+    def test_weights_scale_the_country_term(self):
+        full = country.RATING_TRUSTED - country.RATING_LOW      # 50
+        self.assertEqual(self.gap("reputation"), full)
+        self.assertEqual(self.gap("balanced"), full / 2)
+        self.assertEqual(self.gap("speed"), 0)                  # страна не влияет вообще
+        # у whitelist к разрыву добавляется штраф «ng вне списка избранных»
+        self.assertEqual(self.gap("whitelist"), full - country.OFF_WHITELIST_PENALTY)
+
+    def test_default_config_scores_exactly_as_before(self):
+        r, res = self._row(), self._res("ng")
+        self.assertEqual(probe.score(r, res), probe.score(r, res, cfg=cfg("reputation")))
+        self.assertEqual(probe.score(r, res), probe.score(r, res, cfg=None))
+
+    def test_whitelist_penalises_country_outside_the_list(self):
+        # us — надёжная страна, но не в списке избранных: при whitelist она проседает
+        r = self._row()
+        inside = probe.score(r, self._res("fi"), cfg=cfg("whitelist"))
+        outside = probe.score(r, self._res("us"), cfg=cfg("whitelist"))
+        self.assertEqual(inside - outside, -country.OFF_WHITELIST_PENALTY)
+        # а при «репутации» обе страны одинаково надёжны
+        self.assertEqual(probe.score(r, self._res("fi"), cfg=cfg("reputation")),
+                         probe.score(r, self._res("us"), cfg=cfg("reputation")))
+
+
+class TestReputationIsStrategyIndependent(unittest.TestCase):
+    """Метка страны в интерфейсе описывает саму страну, а не выбранное правило."""
+
+    def test_tier_does_not_move_with_strategy(self):
+        for sid in country.STRATEGIES:
+            self.assertEqual(country.tier("de", True, cfg(sid)), "trusted", sid)
+            self.assertEqual(country.tier("ng", True, cfg(sid)), "risky", sid)
+            self.assertEqual(country.tier("de", False, cfg(sid)), "disputed", sid)
+
+    def test_explain_mentions_the_whitelist_rule(self):
+        self.assertIn("избранных", country.explain("us", True, cfg("whitelist")))
+        self.assertNotIn("избранных", country.explain("us", True, cfg("reputation")))
+
+
+class TestWhitelistSource(unittest.TestCase):
+    def test_money_and_country_agree(self):
+        self.assertEqual(money.whitelist(cfg()), country.whitelist(cfg()))
+
+    def test_blacklist_wins_over_whitelist(self):
+        c = cfg(whitelist=["fi", "ru", "de"])
+        self.assertEqual(country.whitelist(c), ["fi", "de"])
+
+    def test_empty_whitelist_falls_back_to_defaults(self):
+        wl = country.whitelist({"countries": {"whitelist": []}})
+        self.assertIn("fi", wl)
+        self.assertNotIn("ru", wl)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
