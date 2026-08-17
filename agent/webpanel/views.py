@@ -283,6 +283,8 @@ _DASH_HTML = """
       Под страной — <b>оценка</b>: ✅ надёжная (Европа, США — минимум лишних проверок), 🟢 нормальная,
       ⚪ нейтральная, ⚠️ рискованная (банки и платёжки часто просят подтверждения),
       ❓ спорная (базы геолокации не сошлись — для сайтов «страна скачет»).
+      Подпись живёт по выбранной стратегии: при «Скорость и отклик» страна на оценку не влияет —
+      панель так и пишет («не влияет»), при «Только избранных» помечает страны вне твоего списка.
       <b>Россия, Украина и Беларусь запрещены навсегда</b> — такие прокси не покупаются и не используются.
       Страны с плохой оценкой автоматика сама не покупает, но ты можешь выбрать любую вручную.</div>
     <div class="scroll"><table id="pool"><thead><tr>
@@ -487,6 +489,15 @@ const TIER={trusted:['✅','надёжная'],good:['🟢','нормальна�
 function tierBadge(t,hint){const d=TIER[t]||TIER.neutral;
   return '<span class="pill'+(t=='trusted'||t=='good'?' ok':(t=='risky'||t=='blocked'?' bad':(t=='disputed'?' warn':'')))+
     '" title="'+esc(hint||'')+'">'+d[0]+' '+d[1]+'</span>'}
+/* подпись страны глазами АКТИВНОЙ стратегии (приёмка №7): при «Скорость и отклик»
+   страна на оценку не влияет — тревожить «спорной» не за что; при «только избранных»
+   главное — в списке страна или нет. Оценка самой страны остаётся в подсказке. */
+function ccBadge(p){
+  if(p.cc_mode==='ignored')return '<span class="pill" style="opacity:.55" title="'+
+    esc('стратегия «Скорость и отклик»: страна в оценке не участвует, решают замеры. Для справки: '+(p.cc_hint||''))+
+    '">⏱ не влияет</span>';
+  if(p.cc_mode==='wl_out')return '<span class="pill warn" title="'+esc(p.cc_hint||'')+'">✂ вне избранных</span>';
+  return tierBadge(p.cc_tier,p.cc_hint)}
 function ccWarn(s){const t=s.cc_tier;
   if(t!=='risky'&&t!=='disputed')return '';
   return ' ⚠️ Оценка страны выхода — '+(TIER[t]||[])[1]+': '+(s.cc_hint||'')+
@@ -620,10 +631,12 @@ async function loadPool(){const rows=(await api('/api/pool')).proxies;const tb=d
     tr.innerHTML=
       '<td>'+id+(p.is_current?' <span class="pill ok">боевой</span>':'')+(p.gone?' <span class="pill bad">пропал</span>':'')+
         '<div class="sub" style="font-size:10px">'+esc(p.provider)+'</div></td>'+
-      '<td>'+esc(country(cc)||'??')+' '+tierBadge(p.cc_tier,p.cc_hint)+
+      '<td>'+esc(country(cc)||'??')+' '+ccBadge(p)+
         (note?'<div class="sub" style="font-size:10px">'+note+'</div>':'')+'</td>'+
       '<td>'+esc(p.host)+'<div class="sub" style="font-size:10px">порт '+ports+'</div></td>'+
-      '<td>'+(p.score==null?'—':p.score)+'<div class="flags" style="font-size:11px">'+
+      '<td>'+(p.score==null?'—':p.score)+
+        (p.latency!=null?'<div class="sub" style="font-size:10px">'+p.latency+' мс</div>':'')+
+        '<div class="flags" style="font-size:11px">'+
         fl(p.socks_ok)+fl(p.http_ok)+fl(p.tg_ok)+'</div></td>'+
       '<td>'+(p.days==null?'—':p.days+' дн')+
         '<div class="sub" style="font-size:10px">'+(p.last_probe?('тест '+esc(p.last_probe)):'не проверялся')+'</div></td>'+

@@ -265,5 +265,43 @@ class TestStrategyPreview(_AppHarness):
         self.assertGreaterEqual(s["buy_total"], len(s["buy"]))
 
 
+class TestPoolRowStrategyBadge(_AppHarness):
+    """Приёмка №7: подпись страны в пуле — глазами АКТИВНОЙ стратегии.
+
+    Под «Скорость и отклик» страна на оценку не влияет — тревожный бейдж
+    «спорная» у каждой строки вводил админа в заблуждение; под «Только
+    избранными» главный факт — в списке страна или нет."""
+
+    EXTRA_CONFIG = {"countries": {"whitelist": ["fi", "de"]}}
+
+    _n = 0
+
+    def row(self, strategy, cc="tw", agree=1):
+        self.app.cfg.setdefault("countries", {})["strategy"] = strategy
+        TestPoolRowStrategyBadge._n += 1
+        uid = self.put_proxy("b%d" % self._n, country=cc, exit_cc=cc,
+                             exit_cc_alt=cc, host="10.1.1.%d" % self._n)
+        self.app.pool.conn.execute(
+            "UPDATE proxy SET geo_agree=?, latency_ms=321 WHERE uid=?", (agree, uid))
+        self.app.pool.conn.commit()
+        return self.pool_row(uid)
+
+    def test_speed_ignores_country(self):
+        self.assertEqual(self.row("speed")["cc_mode"], "ignored")
+        # даже спорная строка под speed не тревожит: спор на оценку не влияет
+        self.assertEqual(self.row("speed", agree=0)["cc_mode"], "ignored")
+
+    def test_whitelist_marks_outsiders(self):
+        self.assertEqual(self.row("whitelist", cc="tw")["cc_mode"], "wl_out")
+        self.assertEqual(self.row("whitelist", cc="de")["cc_mode"], "rated")
+
+    def test_reputation_and_balanced_keep_tier(self):
+        self.assertEqual(self.row("reputation")["cc_mode"], "rated")
+        self.assertEqual(self.row("balanced")["cc_mode"], "rated")
+
+    def test_latency_passthrough(self):
+        self.assertEqual(self.row("speed")["latency"], 321)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -158,6 +158,15 @@ class TestCandidateOrder(unittest.TestCase):
         self.assertEqual(out, ["fi", "us"])
         self.assertIn("us", out)
 
+    def test_equal_scores_faster_first(self):
+        """Приёмка №7: лестница оценки квантует близкие задержки в один балл —
+        при равных очках вперёд идёт более быстрый (таблица и ротация едины)."""
+        rows = [row("slower", "de", probe_ok=1, latency_ms=925, tg_ok=1, http_ok=1),
+                row("faster", "de", probe_ok=1, latency_ms=826, tg_ok=1, http_ok=1)]
+        for sid in ("speed", "reputation", "balanced", "whitelist"):
+            out = [r["host"] for r in states.rank_candidates(rows, cfg(sid))]
+            self.assertEqual(out, ["faster", "slower"], sid)
+
 
 class TestScoreWeight(unittest.TestCase):
     """Сколько весит страна в оценке пробы (probe.score)."""

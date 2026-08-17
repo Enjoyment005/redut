@@ -254,10 +254,15 @@ def rank_candidates(rows, cfg=None):
         if cr is None:            # чёрный список — не выбираем и не тратим пробу
             continue
         full, base = probe_mod.score_from_row(r, cfg)
+        # при равных очках — кто быстрее по последнему замеру (приёмка №7: под
+        # «скорость и отклик» лестница оценки квантует близкие задержки в один балл,
+        # и 826 мс стояли в таблице ПОСЛЕ 925 мс просто по порядку вставки)
+        lat = probe_mod._rget(r, "latency_ms")
+        lat = float(lat) if lat is not None else float("inf")
         if country_first:
-            key = (-(cr), -(base if base is not None else 0.0))
+            key = (-(cr), -(base if base is not None else 0.0), lat)
         else:
-            key = (-(full if full is not None else cr + UNPROBED_SCORE), 0.0)
+            key = (-(full if full is not None else cr + UNPROBED_SCORE), lat)
         ranked.append((key, r))
     ranked.sort(key=lambda t: t[0])     # только по ключу: равные сохраняют входной порядок
     return [r for _, r in ranked]

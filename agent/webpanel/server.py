@@ -1436,10 +1436,21 @@ class Handler(BaseHTTPRequestHandler):
         # П3: оценка на лету под текущую стратегию (колонка score в БД — лишь
         # последний замер той стратегии, что была активна в момент пробы)
         live_score, _ = probe_mod.score_from_row(r, APP.cfg, is_current=is_cur)
+        # подпись страны — глазами АКТИВНОЙ стратегии (приёмка №7): под «скорость
+        # и отклик» страна на оценку не влияет, и тревожный бейдж «спорная» врал бы
+        st_info = country_mod.strategy_info(APP.cfg)
+        if st_info["only_whitelist"] and cc and country_mod.norm(cc) not in country_mod.whitelist(APP.cfg):
+            cc_mode = "wl_out"     # вне избранных: штраф −60, автоматика сама не купит
+        elif not st_info["country_first"] and not st_info["weight"]:
+            cc_mode = "ignored"    # «скорость и отклик»: решают только замеры
+        else:
+            cc_mode = "rated"      # репутация/баланс/внутри избранных — обычный бейдж
         return {"uid": r["uid"], "provider": r["provider"], "country": r["country"],
                 "provider_active": r["provider"] in APP.providers,
                 "host": r["host"], "port_socks5": r["port_socks5"], "port_http": r["port_http"],
                 "role": r["role"], "score": live_score, "gone": r["gone"], "blocked": blocked,
+                "cc_mode": cc_mode,
+                "latency": r["latency_ms"] if _has(r, "latency_ms") else None,
                 "socks_ok": r["socks_ok"], "http_ok": r["http_ok"], "tg_ok": r["tg_ok"],
                 "days": None if days is None else round(days),
                 "last_probe": (r["last_probe_at"] or "")[5:16],
