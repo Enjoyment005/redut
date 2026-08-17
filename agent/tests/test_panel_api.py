@@ -195,5 +195,75 @@ class TestKeyDelete(_AppHarness):
         self.assertIn("api_key", (self.app.secrets.get("proxy6") or {}))
 
 
+class _PreviewHandler:
+    """_strategy_state без HTTP (по образцу _FakeHandler)."""
+    _brief = staticmethod(server.Handler._brief)
+    _strategy_state = server.Handler._strategy_state
+
+
+class TestStrategyPreview(_AppHarness):
+    """П3: превью «Сейчас с ней» стратегийно-разное и видит текущий канал.
+
+    Регресс приёмки сноса №7 (17.08): rotation_candidates(exclude_host=текущий)
+    выкидывал боевой канал из превью, и все четыре стратегии «выбирали» один и
+    тот же запасной (Коста-Рику), а строка про докупку обрезалась до одинаковых
+    первых восьми стран белого списка."""
+
+    EXTRA_CONFIG = {"countries": {"whitelist": ["fi", "de"]}}
+
+    def setUp(self):
+        super().setUp()
+        # быстрый рискованный против медленного надёжного — стратегии обязаны разойтись
+        self.seed("f", "10.0.0.1", "ng", latency=50)
+        self.seed("s", "10.0.0.2", "de", latency=400)
+
+    def seed(self, ext_id, host, cc, latency):
+        uid = self.put_proxy(ext_id, country=cc, exit_cc=cc, exit_cc_alt=cc, host=host)
+        self.app.pool.conn.execute(
+            "UPDATE proxy SET probe_ok=1, socks_ok=1, http_ok=1, tg_ok=1, latency_ms=?,"
+            " last_probe_at=datetime('now'), score=50 WHERE uid=?", (latency, uid))
+        self.app.pool.conn.commit()
+        return uid
+
+    def state(self):
+        return _PreviewHandler()._strategy_state()
+
+    def by_id(self, st, sid):
+        return next(s for s in st["strategies"] if s["id"] == sid)
+
+    def test_picks_follow_strategy(self):
+        st = self.state()
+        self.assertEqual(self.by_id(st, "speed")["pick"]["host"], "10.0.0.1")
+        for sid in ("reputation", "whitelist"):
+            self.assertEqual(self.by_id(st, sid)["pick"]["host"], "10.0.0.2", sid)
+
+    def test_current_channel_participates(self):
+        # боевой канал — лучший по скорости: speed обязан сказать «останется текущий»,
+        # а не выбирать лучшего из запасных (сама суть бага)
+        self.app.current_host = lambda: "10.0.0.1"
+        st = self.state()
+        sp = self.by_id(st, "speed")["pick"]
+        self.assertEqual(sp["host"], "10.0.0.1")
+        self.assertTrue(sp["is_current"])
+        rep = self.by_id(st, "reputation")["pick"]
+        self.assertEqual(rep["host"], "10.0.0.2")
+        self.assertFalse(rep["is_current"])
+
+    def test_buy_modes_and_pool_gate_differ(self):
+        st = self.state()
+        modes = {s["id"]: s["buy_mode"] for s in st["strategies"]}
+        self.assertEqual(modes, {"whitelist": "whitelist", "reputation": "gated",
+                                 "balanced": "open", "speed": "open"})
+        self.assertIn("ng", self.by_id(st, "reputation")["pool_block"])
+        self.assertIn("ng", self.by_id(st, "balanced")["pool_pass"])
+        self.assertIn("ng", self.by_id(st, "whitelist")["pool_block"])
+
+    def test_buy_capped_but_total_reported(self):
+        st = self.state()
+        s = self.by_id(st, "balanced")
+        self.assertLessEqual(len(s["buy"]), 8)
+        self.assertGreaterEqual(s["buy_total"], len(s["buy"]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

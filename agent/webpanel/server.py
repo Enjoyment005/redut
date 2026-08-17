@@ -818,12 +818,14 @@ class Handler(BaseHTTPRequestHandler):
         """GET /api/strategy: четыре стратегии + что изменится ПРЯМО СЕЙЧАС.
 
         Абстрактное описание («репутация важнее скорости») человеку мало что говорит,
-        поэтому к каждой стратегии считаем два факта на живых данных: в каких странах
-        она разрешит автопокупку и какой прокси из нынешнего пула выбрала бы ротация.
-        Всё считается на месте, без обращений к провайдеру."""
+        поэтому к каждой стратегии считаем живые факты: кого из нынешнего пула она
+        считает лучшим — ВКЛЮЧАЯ текущий канал (П3: превью обязано совпадать с
+        порядком таблицы пула; раньше текущий исключался, и все стратегии «выбирали»
+        одного и того же запасного), какие страны пула проходят её авто-гейт покупки
+        и где докупка разрешена. Всё считается на месте, без обращений к провайдеру."""
         cur_host = APP.current_host()
         with _DB_LOCK:
-            rows = APP.pool.rotation_candidates(exclude_host=cur_host)
+            rows = APP.pool.rotation_candidates()
         rows = [r for r in rows if r["provider"] in APP.providers]   # только активные (П7)
         pool_cc = []
         for r in rows:
@@ -837,11 +839,21 @@ class Handler(BaseHTTPRequestHandler):
             st = country_mod.strategy_info(name=sid)
             top = states_mod.rank_candidates(rows, cfg)[:1]
             with _DB_LOCK:   # F8: buy_candidates читает выученную стабильность из БД
-                buy = money_mod.buy_candidates(cfg, available=pool_cc, pool=APP.pool)[:8]
+                buy = money_mod.buy_candidates(cfg, available=pool_cc, pool=APP.pool)
+            pick = self._brief(top[0]) if top else None
+            if pick is not None:
+                pick["is_current"] = bool(cur_host and pick["host"] == cur_host)
+            # авто-гейт покупки над странами ИМЕЮЩЕГОСЯ пула: наглядно, чем стратегии
+            # отличаются друг от друга на живых данных (а не только за кромкой топ-8)
+            pool_pass = [c for c in pool_cc if country_mod.auto_allowed(c, True, cfg)]
             out.append({"id": sid, "title": st["title"], "short": st["short"], "desc": st["desc"],
                         "current": sid == country_mod.strategy(APP.cfg),
-                        "buy": buy,
-                        "pick": (self._brief(top[0]) if top else None)})
+                        "buy": buy[:8], "buy_total": len(buy),
+                        "buy_mode": ("whitelist" if st.get("only_whitelist") else
+                                     "gated" if st.get("auto_gate") else "open"),
+                        "pool_pass": pool_pass,
+                        "pool_block": [c for c in pool_cc if c not in pool_pass],
+                        "pick": pick})
         return {"current": country_mod.strategy(APP.cfg), "strategies": out,
                 "whitelist": country_mod.whitelist(APP.cfg),
                 "blacklist": sorted(country_mod.blacklist(APP.cfg)),

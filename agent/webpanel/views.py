@@ -739,14 +739,25 @@ async function loadStrategy(){try{const r=await api('/api/strategy');
   document.getElementById('stmeta').textContent='пул для выбора: '+r.pool_size+' шт · запрещено навсегда: '+
     (r.blacklist||[]).map(country).join(', ');
   document.getElementById('strategies').innerHTML=(r.strategies||[]).map(s=>{
-    const cc=(s.buy||[]).map(country).join(', ')||'—';
-    const pick=s.pick?(esc(s.pick.host)+(s.pick.cc?(' · '+country(s.pick.cc)):'')):'пул пуст';
+    /* П3: строка «Сейчас с ней» обязана быть стратегийно-разной — и по правилу
+       докупки, и по судьбе стран нынешнего пула, и по выбору канала */
+    const names=a=>(a||[]).map(country).join(', ');
+    const more=(s.buy_total||0)>(s.buy||[]).length?' и ещё '+(s.buy_total-(s.buy||[]).length):'';
+    let buy;
+    if(s.buy_mode==='whitelist')buy='докупать — строго из избранных ('+(s.buy_total||0)+' стран): '+(names(s.buy)||'—')+more;
+    else if(s.buy_mode==='gated')buy='докупать — только в надёжных: '+(names(s.buy)||'—')+more+
+      (s.pool_block&&s.pool_block.length?'; страны пула '+names(s.pool_block)+' сама не купит':'');
+    else buy='докупать можно везде, кроме запрещённых'+
+      (s.pool_pass&&s.pool_pass.length?' — страны пула ('+names(s.pool_pass)+') разрешены':'')+
+      '; сначала пробует: '+(names((s.buy||[]).slice(0,4))||'—');
+    const pick=s.pick?(esc(s.pick.host)+(s.pick.cc?(' · '+country(s.pick.cc)):'')+
+      (s.pick.is_current?' — текущий канал, останется':' — сменило бы при ближайшей ротации')):'пул пуст';
     return '<div class="step" style="margin-top:10px'+(s.current?';border-color:rgba(5,255,161,.45);background:rgba(5,255,161,.05)':'')+'">'+
       '<b>'+esc(s.title)+'</b>'+
       (s.current?'<span class="pill ok">включена сейчас</span>':'<span class="pill">'+esc(s.short)+'</span>')+
       '<div class="sub" style="margin-top:7px;white-space:normal">'+esc(s.desc)+'</div>'+
-      '<div class="sub" style="margin-top:7px;white-space:normal">Сейчас с ней: докупать разрешено в '+
-        esc(cc)+'; из нынешнего пула выбрало бы <b>'+pick+'</b></div>'+
+      '<div class="sub" style="margin-top:7px;white-space:normal">Сейчас с ней: '+buy+
+      '; из нынешнего пула выбрало бы <b>'+pick+'</b></div>'+
       (s.current?'':'<div style="margin-top:9px"><button class="btn g" onclick="setStrategy(\\''+esc(s.id)+
         '\\',\\''+esc(s.title)+'\\')">Включить</button></div>')+
       '</div>'}).join('')}
