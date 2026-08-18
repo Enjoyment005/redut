@@ -1477,6 +1477,18 @@ class Handler(BaseHTTPRequestHandler):
             # только провайдеры с ключом: осиротевший пул — не «живой» (П7)
             out["pool_alive"] = len([r for r in rows
                                      if not r["gone"] and r["provider"] in APP.providers])
+            # карта выхода: страны живых прокси — точки «куда можно переключиться».
+            # Запрещённые страны не показываем: панель ими всё равно не пользуется.
+            bl = country_mod.blacklist(APP.cfg)
+            ccs = set()
+            for r in rows:
+                if r["gone"] or r["provider"] not in APP.providers:
+                    continue
+                c = (r["exit_cc"] if _has(r, "exit_cc") and r["exit_cc"] else r["country"]) or ""
+                c = c.strip().lower()
+                if c and c not in bl:
+                    ccs.add(c)
+            out["pool_cc"] = sorted(ccs)
             for k, v in APP.pool.conn.execute("SELECT key,value FROM setting WHERE key LIKE 'balance:%'"):
                 out["balances"][k.split(":", 1)[1]] = v
             # автомат состояний (§8) + пульс (§6.3)

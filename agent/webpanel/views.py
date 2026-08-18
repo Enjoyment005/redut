@@ -98,6 +98,24 @@ padding:13px 15px;background:rgba(255,255,255,.02);margin:14px 0}
 .beacon.b-bad{border-color:rgba(255,42,109,.45);background:rgba(255,42,109,.07)}
 .beacon.b-bad .dot,.beacon.b-bad .ttl{color:var(--pink)}
 
+/* ── карта выхода: HUD на canvas ────────────────────────────────────
+   Тайлов и чужих библиотек тут быть не может (CSP `default-src 'none'`),
+   поэтому карта рисуется целиком в браузере: точечная маска суши лежит
+   в самой панели. Ширина — по блоку, высота считается из пропорций карты. */
+.geo .map{position:relative;margin-top:10px;border:1px solid var(--line2);border-radius:9px;overflow:hidden;
+background:radial-gradient(ellipse 60% 80% at 50% 45%,rgba(0,240,255,.07),transparent 70%),
+linear-gradient(180deg,#060b16,#04060e)}
+.geo canvas{display:block;width:100%;height:auto}
+.geo .lock{position:absolute;left:9px;top:9px;max-width:calc(100% - 18px);padding:5px 8px;
+border:1px solid var(--line2);border-radius:5px;background:rgba(4,7,15,.72);color:var(--cyan);
+font:600 10px/1 var(--mono);letter-spacing:.13em;text-transform:uppercase;pointer-events:none;
+white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.geo .hud{position:absolute;left:0;right:0;bottom:0;display:flex;gap:12px;flex-wrap:wrap;
+justify-content:space-between;padding:7px 10px;color:var(--mut);font:400 10.5px/1.4 var(--mono);
+pointer-events:none;background:linear-gradient(180deg,transparent,rgba(4,6,12,.82) 65%)}
+@media(max-width:640px){.geo .hud{font-size:9.5px}.geo .lock{font-size:9px;letter-spacing:.06em}}
+@media(prefers-reduced-motion:reduce){.beacon .dot{animation:none}}
+
 /* ── плитки метрик ─────────────────────────────────────────────────── */
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:11px}
 .tile{position:relative;background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;overflow:hidden}
@@ -208,6 +226,99 @@ def login_page(error="", note=""):
     return _doc("Вход — vpn-panel", _fill(_LOGIN_HTML, ERR=err, NOTE=nt))
 
 
+# ─────────────────────────── данные карты выхода ────────────────────────
+# Суша — битовая маска 240×84 ячейки (шаг 1.5°, широты −51…75°, вся долгота),
+# страны — их label-точки. Источник: Natural Earth 110m admin_0 (public domain),
+# пересчитано скриптом при разработке. Держим прямо в панели, потому что CSP
+# узла запрещает внешние ресурсы (`default-src 'none'`), да и незачем узлу
+# ходить в интернет за картинкой. Точность тут не нужна: панель показывает
+# СТРАНУ выхода — geoip и сам не знает большего.
+_MAP_COLS, _MAP_ROWS = 240, 84
+_MAP_BOX = (-180.0, 180.0, -51.0, 75.0)     # lon0, lon1, lat0, lat1
+
+_MAP_LAND = (
+    "AAAAAAcAAAAAAD///8AAAAAAAAYAAD//gAAAAAAAAAAAAAe6zs/AAB///4AAAAAAABgDA/////wGAAAAwAEAAAI/wM//AAf/"
+    "/4AAAAAAABwHf/////z/+AABAB//wPI/+sEP4A///wAAAAf8AACHf////////8B8wH/////ww3mB4Af/8AAAAD//xjf7v///"
+    "////////7A////////+B/g//gAAAAH//4///f///////////GH////////0P5Af4AH4AAPx+H///////////////AAf/////"
+    "//Ng+AP4ADAAA/n////////////////+AD///////8COMAHwAAAAD/P///////////////v8AD/7/////4APwABgAAAAH/P/"
+    "/////////////wfAAA+AH////4APzAAAAAAAD/D/////////////JhgAAAFAAf///8AH/gAAAAAIAOD////////////4AHAA"
+    "AAQAAP////wH/gAAAAAMBuP////////////wAPgAACAAAH////+f/8AAAAAWAhf////////////AAPAAAAAAAT////+f/+AA"
+    "AAA3H//////////////+AOAAAAAAAB/////f/8AAAAAHn//////////////+AIAAAAAAAB//////8wAAAAAMf///////////"
+    "///9AAAAAAAAAA//////2HAAAAAF///////////////4AAAAAAAAAAf/////+AgAAAAD///////////////4AAAAAAAAAAf/"
+    "/////wAAAAAB///yfx/////////wAAAAAAAAAAf/////yAAAAAAB/z/gPj/////////jAAAAAAAAAAf/////gAAAAAA/wY/g"
+    "Dx////////8HAAAAAAAAAAf/////AAAAAAA/gGfnn4////////wAAAAAAAAAAAf////+AAAAAAA/ACY//4///////1gGAAAA"
+    "AAAAAAP////8AAAAAAA/ACM//4///////hwEAAAAAAAAAAH////4AAAAAAAOLgA//////////4wcAAAAAAAAAAH////4AAAA"
+    "AAAN/gDC/////////wz8AAAAAAAAAAB////wAAAAAAAf/gAA/////////wDgAAAAAAAAAAA////AAAAAAAA//8YB////////"
+    "/4EAAAAAAAAAAAAH///AAAAAAAA///f//////////4AAAAAAAAAAAAAX/5BAAAAAAAB//////z///////4AAAAAAAAAAAAAb"
+    "/gBAAAAAAAH////8/5///////4AAAAAAAAAAAAAF/gBoAAAAAAP////+/4f//////wAAAAAAAAAAAAAE/gAAAAAAAAP////+"
+    "f8wH/////gAAAAAAAAAAAAAAfgAAAAAAAAf/////P/4D/////IAAAAAAAAAAAAAAPgAQAAAAAAf/////v/8D/+f/4AAAAAAA"
+    "AAAAAAAAPgwOAAAAAAf/////n/4Af8P+AAAAAAAAAAAAAAAAHxwAwAAAAAf/////n/wAfwH+wAAAAAAAAAAAAAAAB/gAAAAA"
+    "AAf/////z/gAfgH+AMAAAAAAAAAAAAAAAT8AAAAAAAf/////z+AAfAF/AIAAAAAAAAAAAAAAAB+AAAAAAAf/////94AAOAB/"
+    "gIAAAAAAAAAAAAAAAAMAAAAAAAf//////AAAOAA/gCAAAAAAAAAAAAAAAAEBQAAAAAP/////+MAAGAAHAFAAAAAAAAAAAAAA"
+    "AACDfgAAAAH//////8AAGAACAAAAAAAAAAAAAAAAAABP/wAAAAH//////4AABABgADAAAAAAAAAAAAAAAAAP/4AAAAD/////"
+    "/4AABAAQABAAAAAAAAAAAAAAAAAP//gAAAA/H////wAAAACYBgAAAAAAAAAAAAAAAAAH//wAAAAAA////wAAAADYDAAAAAAA"
+    "AAAAAAAAAAAP//wAAAAAA////gAAAABoPgAAAAAAAAAAAAAAAAAf//4AAAAAA///+AAAAAA4fuQAAAAAAAAAAAAAAAA///+A"
+    "AAAAA///8AAAAAAYfASAAAAAAAAAAAAAAAA////AAAAAA///4AAAAAAcfYBYAAAAAAAAAAAAAAA////8AAAAAf//4AAAAAAO"
+    "CEh/AAAAAAAAAAAAAAA/////AAAAAP//wAAAAAAGAAAPgAAAAAAAAAAAAAA/////gAAAAP//wAAAAAADIABPwIAAAAAAAAAA"
+    "AAAf////gAAAAH//wAAAAAAAOAAPYCAAAAAAAAAAAAAP////AAAAAH//4AAAAAAAACAAMAAAAAAAAAAAAAAP///+AAAAAH//"
+    "4AAAAAAAAAAAAAAAAAAAAAAAAAAH///+AAAAAH//4AAAAAAAAAHhAAAAAAAAAAAAAAAH///8AAAAAP//4IAAAAAAAAvjAAAA"
+    "AAAAAAAAAAAD///8AAAAAP//4cAAAAAAAB/jgAAAAAAAAAAAAAAA///8AAAAAP//h4AAAAAAAD/7gAAAAAAAAAAAAAAAf//8"
+    "AAAAAP//B4AAAAAAAH//wAAAAAAAAAAAAAAAf//4AAAAAH/+AwAAAAAAAf//4AQAAAAAAAAAAAAAf//4AAAAAH//BwAAAAAA"
+    "B///8AIAAAAAAAAAAAAAf//gAAAAAD//BwAAAAAAD///+AAAAAAAAAAAAAAAf/8AAAAAAD/+BgAAAAAAD////AAAAAAAAAAA"
+    "AAAAf/8AAAAAAD/8AAAAAAAAD////AAAAAAAAAAAAAAAf/8AAAAAAD/8AAAAAAAAD////AAAAAAAAAAAAAAA//4AAAAAAB/4"
+    "AAAAAAAAB////AAAAAAAAAAAAAAA//wAAAAAAA/wAAAAAAAAB////AAAAAAAAAAAAAAA//gAAAAAAA/gAAAAAAAAB/h//AAA"
+    "AAAAAAAAAAAA//AAAAAAAA+AAAAAAAAAB+Av+AAAAAAAAAAAAAAA/8AAAAAAAAAAAAAAAAAAAAAP8AAQAAAAAAAAAAAB/8AA"
+    "AAAAAAAAAAAAAAAAAAAH8AAIAAAAAAAAAAAB/4AAAAAAAAAAAAAAAAAAAAADQAAOAAAAAAAAAAAB/gAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAMAAAAAAAAAAAB+AAAAAAAAAAAAAAAAAAAAAAAYAAIAAAAAAAAAAAB+AAAAAAAAAAAAAAAAAAAAAAAYAAwAAAAAAAA"
+    "AAAD8AAAAAAAAAAAAAAAAAAAAAAAAADAAAAAAAAAAAAD4AAAAAAAAAAAAAAAAAAAAAAAAAHAAAAAAAAAAAAD8AAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAD4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADwAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+
+_MAP_CC = {
+    "ae": [54.5, 23.5], "af": [66.5, 34.2], "al": [20.1, 40.7], "am": [44.8, 40.5], "ao": [18.0,
+    -12.2], "ar": [-64.2, -33.5], "at": [14.1, 47.5], "au": [134.0, -24.1], "az": [47.2, 40.4],
+    "ba": [18.1, 44.1], "bd": [89.7, 24.2], "be": [4.8, 50.8], "bf": [-1.4, 12.7], "bg": [25.2,
+    42.5], "bh": [50.55, 26.1], "bi": [29.9, -3.3], "bj": [2.4, 10.3], "bn": [114.6, 4.4], "bo":
+    [-64.6, -16.7], "br": [-49.6, -12.1], "bs": [-77.1, 26.4], "bt": [90.0, 27.5], "bw": [24.2,
+    -22.1], "by": [28.4, 53.8], "bz": [-88.7, 17.2], "ca": [-101.9, 60.3], "cd": [23.5, -1.9],
+    "cf": [20.9, 7.0], "cg": [15.9, 0.1], "ch": [7.5, 46.7], "ci": [-5.6, 7.5], "cl": [-72.3,
+    -38.2], "cm": [12.5, 4.6], "cn": [106.3, 32.5], "co": [-73.2, 3.4], "cr": [-84.1, 10.1],
+    "cu": [-78.0, 21.3], "cy": [33.1, 34.9], "cz": [15.4, 49.9], "de": [9.7, 51.0], "dj": [42.5,
+    12.0], "dk": [9.0, 56.0], "do": [-70.7, 19.1], "dz": [2.8, 27.4], "ec": [-78.2, -1.3], "ee":
+    [25.9, 58.7], "eg": [29.4, 26.2], "eh": [-12.6, 24.0], "er": [38.3, 15.8], "es": [-3.5,
+    40.1], "et": [39.1, 8.0], "fi": [27.3, 63.3], "fj": [178.0, -17.8], "fk": [-58.7, -51.6],
+    "fr": [2.6, 46.7], "ga": [11.8, -0.4], "gb": [-2.1, 54.4], "ge": [43.7, 41.9], "gh": [-1.0,
+    7.7], "gi": [-5.35, 36.14], "gl": [-39.3, 74.3], "gm": [-15.0, 13.6], "gn": [-10.0, 10.6],
+    "gq": [9.0, 2.3], "gr": [21.7, 39.5], "gt": [-90.5, 15.0], "gw": [-14.5, 12.2], "gy":
+    [-58.9, 5.1], "hk": [114.2, 22.3], "hn": [-86.9, 14.8], "hr": [16.4, 45.8], "ht": [-72.2,
+    19.3], "hu": [19.4, 47.1], "id": [101.9, -1.0], "ie": [-7.8, 53.1], "il": [34.8, 30.9],
+    "in": [79.4, 22.7], "iq": [43.3, 33.1], "ir": [54.9, 32.2], "is": [-18.7, 64.8], "it":
+    [11.1, 44.7], "jm": [-77.3, 18.1], "jo": [36.4, 30.8], "jp": [138.4, 36.1], "ke": [37.9,
+    0.5], "kg": [74.5, 41.7], "kh": [104.5, 12.6], "kp": [126.4, 39.9], "kr": [128.1, 36.4],
+    "kw": [47.3, 29.4], "kz": [68.7, 49.1], "la": [102.5, 19.4], "lb": [36.0, 34.1], "li":
+    [9.55, 47.15], "lk": [80.7, 7.6], "lr": [-9.5, 6.4], "ls": [28.2, -29.5], "lt": [24.1,
+    55.1], "lu": [6.1, 49.7], "lv": [25.5, 57.1], "ly": [18.0, 26.6], "ma": [-7.2, 31.7], "mc":
+    [7.4, 43.7], "md": [28.5, 47.4], "me": [19.1, 42.8], "mg": [46.7, -18.6], "mk": [21.6,
+    41.6], "ml": [-2.0, 18.7], "mm": [95.8, 21.6], "mn": [104.2, 46.0], "mo": [113.5, 22.2],
+    "mr": [-9.7, 19.6], "mt": [14.4, 35.9], "mu": [57.55, -20.3], "mv": [73.5, 4.2], "mw":
+    [33.6, -13.4], "mx": [-102.3, 23.9], "my": [113.8, 2.5], "mz": [37.8, -13.9], "na": [17.1,
+    -20.6], "nc": [165.1, -21.1], "ne": [9.5, 17.4], "ng": [7.5, 9.4], "ni": [-85.1, 12.7],
+    "nl": [5.6, 52.4], "no": [9.7, 61.4], "np": [83.6, 28.3], "nz": [172.8, -39.8], "om": [57.3,
+    22.1], "pa": [-80.4, 8.7], "pe": [-72.9, -13.0], "pg": [143.9, -5.7], "ph": [122.5, 11.2],
+    "pk": [68.5, 29.3], "pl": [19.5, 52.0], "pr": [-66.5, 18.2], "ps": [35.3, 32.0], "pt":
+    [-8.3, 39.6], "py": [-60.1, -21.7], "qa": [51.1, 25.2], "ro": [25.0, 45.7], "rs": [20.8,
+    44.2], "ru": [44.7, 58.2], "rw": [30.1, -1.9], "sa": [44.7, 23.8], "sb": [159.2, -8.0],
+    "sc": [55.5, -4.6], "sd": [29.3, 16.3], "se": [19.0, 65.9], "sg": [103.8, 1.35], "si":
+    [14.9, 46.1], "sk": [19.0, 48.7], "sl": [-11.8, 8.6], "sm": [12.45, 43.94], "sn": [-14.8,
+    15.1], "so": [45.2, 3.6], "sr": [-55.9, 4.1], "ss": [30.4, 7.2], "sv": [-88.9, 13.7], "sy":
+    [38.3, 35.0], "sz": [31.5, -26.5], "td": [18.6, 15.1], "tf": [69.1, -49.3], "tg": [1.1,
+    8.8], "th": [101.1, 15.5], "tj": [72.6, 38.2], "tl": [125.9, -8.8], "tm": [58.7, 39.9],
+    "tn": [9.0, 33.7], "tr": [34.5, 39.3], "tt": [-60.9, 11.0], "tw": [120.9, 23.7], "tz":
+    [35.0, -6.1], "ua": [32.1, 49.7], "ug": [32.9, 2.0], "us": [-97.5, 39.5], "uy": [-56.0,
+    -33.0], "uz": [64.0, 41.7], "ve": [-64.6, 7.2], "vn": [105.4, 21.7], "vu": [166.9, -15.4],
+    "xk": [20.9, 42.6], "ye": [45.9, 15.3], "za": [23.7, -29.7], "zm": [26.4, -14.7], "zw":
+    [29.9, -18.9]}
+
+
 # ─────────────────────────── дашборд ────────────────────────────────────
 _DASH_HTML = """
 <div class="wrap">
@@ -216,6 +327,7 @@ _DASH_HTML = """
       <small><span id="subline">соединяюсь с сервером…</span><span class="cursor"></span></small></div>
     <div class="tools">
       <button class="btn s tiny" id="exbtn" onclick="toggleEx()" title="Показать/скрыть подсказки простым языком">💡 Объяснения: вкл</button>
+      <button class="btn s tiny" id="foldbtn" onclick="foldToggleAll()" title="Развернуть или свернуть сразу все разделы">▾ Развернуть всё</button>
       <span class="btnq"><button class="btn s" onclick="egress()">Проверить выход</button><i class="q" tabindex="0"
         data-h="Безопасно, ничего не меняет. Сервер спрашивает у внешнего сайта: «какой у меня IP?» — и показывает ответ. Так видно, доходит ли трафик до зарубежного прокси.">?</i></span>
       <span class="btnq"><button class="btn s" onclick="refresh()">Обновить пул</button><i class="q" tabindex="0"
@@ -241,15 +353,34 @@ _DASH_HTML = """
   <div id="beacon" class="beacon"><div class="dot"></div>
     <div><div class="ttl">Проверяю состояние…</div><div class="txt">Читаю данные с сервера.</div></div></div>
 
-  <div class="card">
-    <h2>Состояние узла<span class="r"><span class="sub" id="ts"></span></span></h2>
+  <div class="card fold geo" id="card_geo">
+    <h2 onclick="foldClick(event,'geo')">Карта выхода<span class="sub" id="sum_geo"></span><span class="r"><span class="arr" id="fa_geo">▾</span></span></h2>
+    <div class="fold-body">
+    <div class="ex">Где в мире сайты видят твой трафик. <b>Прицел</b> — страна прокси, через который
+      сервер выходит наружу; <b>пустые квадратики</b> — запасные прокси из пула, куда панель может
+      переключиться, а пунктир между ними — эти самые запасные пути. Карта нарисована прямо в панели
+      по встроенным данным: наружу она ничего не запрашивает и точку ставит <b>по стране</b>, а не по
+      адресу — точнее geoip всё равно не знает.</div>
+    <div class="map">
+      <canvas id="geocv" width="1200" height="420"></canvas>
+      <div class="lock" id="geolock">СВЯЗЬ ЕЩЁ НЕ ПРОВЕРЕНА</div>
+      <div class="hud"><span id="geoxy">LAT — · LON —</span><span id="geowho"></span></div>
+    </div>
+    </div>
+  </div>
+
+  <div class="card fold folded" id="card_status">
+    <h2 onclick="foldClick(event,'status')">Состояние узла<span class="sub" id="sum_status"></span><span class="r"><span class="sub" id="ts"></span><span class="arr" id="fa_status">▸</span></span></h2>
+    <div class="fold-body">
     <div class="ex">Цепочка такая: <b>телефон/ноутбук → твой сервер → зарубежный прокси → интернет</b>.
       Сайты видят IP последнего звена. Если «IP на выходе» совпадает с «прокси на выходе» — цепочка цела.</div>
     <div class="grid" id="status"></div>
+    </div>
   </div>
 
-  <div class="card">
-    <h2>Деньги<span class="r"><button class="btn s tiny" onclick="market()">Что есть в продаже</button></span></h2>
+  <div class="card fold folded" id="card_money">
+    <h2 onclick="foldClick(event,'money')">Деньги<span class="sub" id="sum_money"></span><span class="r"><button class="btn s tiny" onclick="market()">Что есть в продаже</button><span class="arr" id="fa_money">▸</span></span></h2>
+    <div class="fold-body">
     <div class="ex">Панель умеет сама покупать прокси, когда старый умирает. Чтобы она не потратила лишнего,
       стоят лимиты (сколько покупок в день, потолок цены, неснижаемый остаток). Лимиты меняются только
       на сервере в файле <span class="mono">/etc/vpn-panel/config.json</span> — из браузера их не поправить,
@@ -273,10 +404,12 @@ _DASH_HTML = """
       <button class="btn g" onclick="buy()">Купить прокси</button>
       <span class="pill warn">спишутся реальные деньги</span>
     </div>
+    </div>
   </div>
 
-  <div class="card">
-    <h2>Пул прокси</h2>
+  <div class="card fold folded" id="card_pool">
+    <h2 onclick="foldClick(event,'pool')">Пул прокси<span class="sub" id="sum_pool"></span><span class="r"><span class="arr" id="fa_pool">▸</span></span></h2>
+    <div class="fold-body">
     <div class="ex">Список прокси, купленных у провайдера. <b>«Применить»</b> ставит выбранный прокси боевым:
       панель сначала проверит его, потом переключит сервер, проверит выход ещё раз и <b>сама откатится</b>,
       если стало хуже. Зелёная строка — тот, что работает прямо сейчас.<br>
@@ -299,12 +432,14 @@ _DASH_HTML = """
     <div class="ex" style="margin-top:10px"><b>Тест</b> — проверить, безопасно. <b>В бой</b> — сделать боевым
       (проверка → переключение → проверка → автооткат). <b>Продлить</b> и <b>Удалить</b> — деньги;
       удаление проходит проверки на сервере, боевой прокси удалить нельзя.</div>
+    </div>
   </div>
 
-  <div class="card">
-    <h2>Кто подключён<span class="r">
+  <div class="card fold folded" id="card_clients">
+    <h2 onclick="foldClick(event,'clients')">Кто подключён<span class="sub" id="sum_clients"></span><span class="r">
       <input id="cname" style="width:180px" placeholder="имя, например phone-mine" autocomplete="off">
-      <button class="btn g" onclick="addClient()">Выдать доступ</button></span></h2>
+      <button class="btn g" onclick="addClient()">Выдать доступ</button><span class="arr" id="fa_clients">▸</span></span></h2>
+    <div class="fold-body">
     <div class="ex">Каждому устройству — свой профиль. Нажми «Выдать доступ» → появится строка → <b>«Скачать»</b>
       даёт файл для компьютера, <b>«QR»</b> — картинку для телефона. На устройстве нужно приложение
       <b>WireGuard</b> (бесплатное, есть в App Store и Google Play): в нём «+» → «Сканировать QR-код»
@@ -321,10 +456,11 @@ _DASH_HTML = """
       <div class="sub" id="qrname" style="margin-top:6px"></div>
       <button class="btn s tiny" style="margin-top:8px" onclick="document.getElementById('qrpanel').style.display='none'">Скрыть QR</button>
     </div>
+    </div>
   </div>
 
   <div class="card fold folded" id="card_strategy">
-    <h2 onclick="toggleFold('strategy')">Стратегия выбора стран<span class="r"><span class="sub" id="stnow"></span><span class="arr" id="fa_strategy">▸</span></span></h2>
+    <h2 onclick="foldClick(event,'strategy')">Стратегия выбора стран<span class="r"><span class="sub" id="stnow"></span><span class="arr" id="fa_strategy">▸</span></span></h2>
     <div class="fold-body">
     <div class="ex">Прокси бывают в разных странах, и они не равноценны: из Финляндии банк пустит
       без вопросов, а из Нигерии тот же банк покажет капчу и откажет в оплате — зато нигерийский
@@ -340,9 +476,10 @@ _DASH_HTML = """
     </div>
   </div>
 
-  <div class="card">
-    <h2>Ключи провайдеров прокси<span class="r">
-      <button class="btn s tiny" onclick="loadKeys()">Обновить</button></span></h2>
+  <div class="card fold folded" id="card_keys">
+    <h2 onclick="foldClick(event,'keys')">Ключи провайдеров прокси<span class="sub" id="sum_keys"></span><span class="r">
+      <button class="btn s tiny" onclick="reloadFold('keys')">Обновить</button><span class="arr" id="fa_keys">▸</span></span></h2>
+    <div class="fold-body">
     <div class="ex">Зарубежные прокси панель покупает и продлевает <b>в твоём кабинете у провайдера</b>,
       и для этого ей нужен оттуда <b>API-ключ</b>. Здесь его можно вписать или заменить — например,
       если завёл другой кабинет, сменил провайдера или ключ куда-то утёк. <b>Заходить на сервер по SSH
@@ -357,11 +494,13 @@ _DASH_HTML = """
       тоже</b>: следующая покупка или продление пойдут уже через новый кабинет. Прокси старого кабинета
       панель перестанет видеть, поэтому после смены ключа она сама заново спросит список прокси
       (это занимает до минуты).</div>
+    </div>
   </div>
 
-  <div class="card">
-    <h2>Обновления<span class="r">
-      <button class="btn s tiny" onclick="checkUpd(this)">Проверить сейчас</button></span></h2>
+  <div class="card fold folded" id="card_upd">
+    <h2 onclick="foldClick(event,'upd')">Обновления<span class="sub" id="sum_upd"></span><span class="r">
+      <button class="btn s tiny" onclick="checkUpd(this)">Проверить сейчас</button><span class="arr" id="fa_upd">▸</span></span></h2>
+    <div class="fold-body">
     <div class="ex">«Редут» умеет обновлять сам себя: раз в сутки узел сверяет свою версию с последним
       выпуском в официальном репозитории на GitHub и, если вышла новая, ночью скачивает её и
       переустанавливается своим же установщиком. <b>Обновление ничего не теряет</b>: доступы устройств,
@@ -371,10 +510,11 @@ _DASH_HTML = """
     <div class="grid" id="upd"></div>
     <div id="updbox" class="sub" style="margin-top:9px"></div>
     <div id="updact" style="margin-top:11px"></div>
+    </div>
   </div>
 
   <div class="card fold folded" id="card_events">
-    <h2 onclick="toggleFold('events')">Журнал событий<span class="r"><span class="arr" id="fa_events">▸</span></span></h2>
+    <h2 onclick="foldClick(event,'events')">Журнал событий<span class="r"><span class="arr" id="fa_events">▸</span></span></h2>
     <div class="fold-body">
     <div class="ex">Кто и что делал: смена прокси, покупки, выдача доступов, срабатывания автоматики.
       Строка <span class="mono">actor=agent</span> — действовала автоматика, <span class="mono">actor=web</span> — человек из панели.</div>
@@ -450,24 +590,196 @@ function toggleEx(){const off=document.body.classList.toggle('noex');
   document.getElementById('exbtn').textContent=off?'💡 Объяснения: выкл':'💡 Объяснения: вкл'}
 (function(){try{if(localStorage.getItem('vpnpanel-ex')==='0'){document.body.classList.add('noex');
   document.getElementById('exbtn').textContent='💡 Объяснения: выкл'}}catch(e){}})();
-/* ── сворачивание карточек (П2/П4): дефолт — свернуто, состояние в localStorage.
-   Свернутая карточка НЕ дёргает свой API (reloadAll идёт через loadFold) —
-   запрос уходит при разворачивании. ── */
-const FOLDS={events:{def:1,load:()=>loadEvents()},strategy:{def:1,load:()=>loadStrategy()}};
-const FOLD_MEM={}; /* фолбэк на сессию, когда localStorage запрещён — иначе карточки не развернуть вовсе */
+/* ── сворачивание разделов ──────────────────────────────────────────────
+   Дефолт — свёрнуто ВСЁ, кроме карты выхода: панель открывается коротким
+   экраном «маяк + карта», остальное человек разворачивает сам. Что развернул,
+   то и останется развёрнутым — состояние по каждому разделу отдельно лежит
+   в localStorage браузера (у каждого свой набор открытых разделов).
+   Свёрнутый раздел НЕ дёргает свой API (reloadAll идёт через loadFold) —
+   запрос уходит при разворачивании. Помеченные always — исключение: их данные
+   нужны маяку и карте наверху страницы, поэтому грузятся всегда. ── */
+const FOLDS={
+  geo:{def:0,load:()=>geoSync()},
+  status:{def:1,always:1,load:()=>loadStatus()},
+  money:{def:1,load:()=>loadMoney()},
+  pool:{def:1,load:()=>loadPool()},
+  clients:{def:1,always:1,load:()=>loadClients()},
+  strategy:{def:1,load:()=>loadStrategy()},
+  keys:{def:1,load:()=>loadKeys()},
+  upd:{def:1,load:()=>loadUpd()},
+  events:{def:1,load:()=>loadEvents()}};
+const FOLD_ORDER=['status','money','pool','clients','strategy','keys','upd','events'];
+const FOLD_MEM={}; /* фолбэк на сессию, когда localStorage запрещён — иначе разделы не развернуть вовсе */
 function isFolded(id){try{const v=localStorage.getItem('vpnpanel-fold-'+id);
   if(v==='0')return false;if(v==='1')return true}catch(e){}
   if(id in FOLD_MEM)return FOLD_MEM[id];
   return !!FOLDS[id].def}
+function foldSet(id,to){FOLD_MEM[id]=to;
+  try{localStorage.setItem('vpnpanel-fold-'+id,to?'1':'0')}catch(e){}
+  applyFold(id)}
 function applyFold(id){const c=document.getElementById('card_'+id);
   if(c)c.classList.toggle('folded',isFolded(id));
   const a=document.getElementById('fa_'+id);if(a)a.textContent=isFolded(id)?'▸':'▾'}
-async function toggleFold(id){const to=!isFolded(id);FOLD_MEM[id]=to;
-  try{localStorage.setItem('vpnpanel-fold-'+id,to?'1':'0')}catch(e){}
-  applyFold(id);
+/* заголовок кликабелен целиком, но кнопка и поле ввода в нём — это они сами,
+   а не «свернуть»: иначе «Выдать доступ» захлопывал бы раздел вместе с ответом */
+function foldClick(ev,id){const t=ev&&ev.target;
+  if(t&&t.closest&&t.closest('button,input,select,a,label,.q'))return;
+  toggleFold(id)}
+async function toggleFold(id){foldSet(id,!isFolded(id));foldBtn();
+  if(id==='geo'&&isFolded('geo'))geoStop();
   if(!isFolded(id))try{await FOLDS[id].load()}catch(e){toast(e.message,'bad')}}
-async function loadFold(id){if(!isFolded(id))await FOLDS[id].load()}
-(function(){for(const id in FOLDS)applyFold(id)})();
+async function loadFold(id){if(FOLDS[id].always||!isFolded(id))await FOLDS[id].load()}
+/* кнопка в шапке раздела: свёрнутый — развернуть (это и есть загрузка), открытый — перечитать */
+async function reloadFold(id){if(isFolded(id))return toggleFold(id);
+  try{await FOLDS[id].load()}catch(e){toast(e.message,'bad')}}
+async function openFold(id){if(isFolded(id))await toggleFold(id)}
+function foldBtn(){const b=document.getElementById('foldbtn');if(!b)return;
+  b.textContent=FOLD_ORDER.some(id=>!isFolded(id))?'▴ Свернуть всё':'▾ Развернуть всё'}
+async function foldToggleAll(){const to=FOLD_ORDER.some(id=>!isFolded(id));
+  for(const id in FOLDS)foldSet(id,to);
+  foldBtn();
+  if(to){geoStop();return}
+  geoSync();
+  for(const id of FOLD_ORDER){try{await FOLDS[id].load()}catch(e){}}}
+function sum(id,txt){const e=document.getElementById('sum_'+id);if(e)e.textContent=txt||''}
+(function(){for(const id in FOLDS)applyFold(id);foldBtn()})();
+
+/* ── карта выхода ───────────────────────────────────────────────────────
+   Показывает страну, из которой сайты видят твой трафик, и запасные прокси
+   пула. Рисуем сами на canvas: CSP не пускает ни чужие библиотеки, ни тайлы,
+   да и узлу незачем ходить в интернет ради картинки. Суша — битовая маска
+   240×84 (Natural Earth 110m, шаг 1.5°), страны — её же label-точки; всё это
+   лежит в самой панели (_MAP_LAND/_MAP_CC в views.py).
+   Точка ставится ПО СТРАНЕ — точнее geoip и не знает, а рисовать «дом на
+   карте» панель не должна. ── */
+const GEO={cols:__MAPCOLS__,rows:__MAPROWS__,l0:__MAPL0__,l1:__MAPL1__,b0:__MAPB0__,b1:__MAPB1__,
+  cc:__MAPCC__,land:null,W:0,H:0,dpr:0,base:null,raf:0,last:0,run:0,st:null};
+const GEOFONT='ui-monospace,SFMono-Regular,Consolas,monospace';
+(function(){try{const b=atob(__MAPLAND__),a=new Uint8Array(b.length);
+  for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i);GEO.land=a}catch(e){}})();
+function geoPt(cc){return GEO.cc[(cc||'').toLowerCase()]||null}
+function geoXY(lon,lat){return [(lon-GEO.l0)/(GEO.l1-GEO.l0)*GEO.W,(GEO.b1-lat)/(GEO.b1-GEO.b0)*GEO.H]}
+/* размер холста — от ширины блока; свёрнутая карта имеет ширину 0 и не рисуется */
+function geoFit(){const cv=document.getElementById('geocv');
+  if(!cv||!GEO.land)return null;
+  const w=Math.round(cv.clientWidth||0);if(w<80)return null;
+  const dpr=Math.min(2,window.devicePixelRatio||1);
+  if(w!==GEO.W||dpr!==GEO.dpr){GEO.W=w;GEO.H=Math.round(w*GEO.rows/GEO.cols);GEO.dpr=dpr;
+    cv.width=Math.round(GEO.W*dpr);cv.height=Math.round(GEO.H*dpr);GEO.base=geoBase()}
+  return cv}
+/* суша и сетка меридианов — один раз на размер, дальше просто копируем картинку */
+function geoBase(){const c=document.createElement('canvas');
+  c.width=Math.round(GEO.W*GEO.dpr);c.height=Math.round(GEO.H*GEO.dpr);
+  const g=c.getContext('2d');g.setTransform(GEO.dpr,0,0,GEO.dpr,0,0);
+  g.strokeStyle='rgba(0,240,255,.05)';g.lineWidth=1;
+  for(let lon=-150;lon<=150;lon+=30){const p=geoXY(lon,0);
+    g.beginPath();g.moveTo(Math.round(p[0])+.5,0);g.lineTo(Math.round(p[0])+.5,GEO.H);g.stroke()}
+  for(let lat=-40;lat<=60;lat+=20){const p=geoXY(0,lat);
+    g.beginPath();g.moveTo(0,Math.round(p[1])+.5);g.lineTo(GEO.W,Math.round(p[1])+.5);g.stroke()}
+  const eq=geoXY(0,0);g.strokeStyle='rgba(0,240,255,.11)';
+  g.beginPath();g.moveTo(0,Math.round(eq[1])+.5);g.lineTo(GEO.W,Math.round(eq[1])+.5);g.stroke();
+  const cw=GEO.W/GEO.cols,ch=GEO.H/GEO.rows,d=Math.max(1,Math.min(cw,ch)*.62);
+  for(let pass=0;pass<2;pass++){
+    g.fillStyle=pass?'rgba(0,240,255,.5)':'rgba(96,168,214,.38)';
+    for(let r=0;r<GEO.rows;r++)for(let q=0;q<GEO.cols;q++){
+      if(((q+r)%5===0)!==!!pass)continue;                 /* каждая пятая точка ярче — «шум» сканера */
+      const i=r*GEO.cols+q;if(!(GEO.land[i>>3]>>(7-(i&7))&1))continue;
+      g.fillRect(q*cw+(cw-d)/2,r*ch+(ch-d)/2,d,d)}}
+  return c}
+/* дуга «куда панель может переключиться»; рисуем трижды со сдвигом, чтобы путь
+   через край карты (Япония — США) не тянулся поперёк всего мира */
+function geoArc(g,a,b){const W=GEO.W;let bx=b[0];
+  if(bx-a[0]>W/2)bx-=W;else if(a[0]-bx>W/2)bx+=W;
+  const d=Math.hypot(bx-a[0],b[1]-a[1]),mx=(a[0]+bx)/2,my=(a[1]+b[1])/2-Math.min(80,d*.3);
+  for(const o of [-W,0,W]){g.beginPath();g.moveTo(a[0]+o,a[1]);
+    g.quadraticCurveTo(mx+o,my,bx+o,b[1]);g.stroke()}}
+/* табличка у прицела: адрес и страна выхода */
+function geoTag(g,p,st,c){const t1=st.ip||'адрес неизвестен',t2=st.name||'';
+  g.font='600 11px '+GEOFONT;const w1=g.measureText(t1).width;
+  g.font='400 10px '+GEOFONT;const w2=t2?g.measureText(t2).width:0;
+  const w=Math.max(w1,w2)+14,h=t2?31:20;
+  let x=p[0]+28;if(x+w>GEO.W-6)x=p[0]-28-w;x=Math.max(4,Math.min(x,GEO.W-w-4));
+  let y=p[1]-h-22;if(y<4)y=Math.min(p[1]+22,GEO.H-h-24);
+  g.fillStyle='rgba(4,8,18,.86)';g.fillRect(x,y,w,h);
+  g.strokeStyle='rgba('+c+',.5)';g.lineWidth=1;g.strokeRect(x+.5,y+.5,w-1,h-1);
+  const lx=Math.max(x,Math.min(p[0],x+w)),ly=(y>p[1]?y:y+h);   /* поводок к ближнему краю таблички */
+  g.beginPath();g.moveTo(p[0],p[1]+(y>p[1]?10:-10));g.lineTo(lx,ly);g.stroke();
+  g.fillStyle='rgba('+c+',.95)';g.font='600 11px '+GEOFONT;g.fillText(t1,x+7,y+14);
+  if(t2){g.fillStyle='rgba(200,220,245,.72)';g.font='400 10px '+GEOFONT;g.fillText(t2,x+7,y+26)}}
+function geoDraw(t){const cv=geoFit();if(!cv)return;
+  const g=cv.getContext('2d');g.setTransform(GEO.dpr,0,0,GEO.dpr,0,0);
+  const W=GEO.W,H=GEO.H,st=GEO.st||{},c=st.rgb||'0,240,255',T=(t||0)/1000;
+  g.clearRect(0,0,W,H);
+  if(GEO.base)g.drawImage(GEO.base,0,0,W,H);
+  const tgt=st.pt?geoXY(st.pt[0],st.pt[1]):null;
+  const res=[];
+  for(const cc of (st.pool||[])){if(cc===st.cc)continue;const p=geoPt(cc);
+    if(p){const q=geoXY(p[0],p[1]);q.push(cc);res.push(q)}}
+  if(tgt&&res.length){g.strokeStyle='rgba('+c+',.3)';g.lineWidth=1;
+    g.setLineDash([3,6]);g.lineDashOffset=-T*(st.rot?52:14);
+    for(const r of res)geoArc(g,tgt,r);g.setLineDash([])}
+  g.strokeStyle='rgba(0,240,255,.6)';g.fillStyle='rgba(0,240,255,.18)';g.lineWidth=1;
+  for(const r of res){const x=Math.round(r[0])-2.5,y=Math.round(r[1])-2.5;
+    g.fillRect(x,y,5,5);g.strokeRect(x,y,5,5)}
+  if(res.length<=12){g.font='600 10px '+GEOFONT;g.fillStyle='rgba(0,240,255,.72)';
+    for(const r of res){const w=g.measureText(r[2]).width;
+      g.fillText(r[2],Math.min(r[0]+7,GEO.W-w-3),r[1]+3.5)}}
+  if(tgt){
+    const R=Math.max(54,W*.075),a=.12+.05*Math.sin(T*1.7);
+    const gr=g.createRadialGradient(tgt[0],tgt[1],0,tgt[0],tgt[1],R);
+    gr.addColorStop(0,'rgba('+c+','+a.toFixed(3)+')');gr.addColorStop(1,'rgba('+c+',0)');
+    g.fillStyle=gr;g.fillRect(tgt[0]-R,tgt[1]-R,R*2,R*2);
+    for(let i=0;i<2;i++){const ph=((T*.45)+i*.5)%1;
+      g.strokeStyle='rgba('+c+','+(.45*(1-ph)).toFixed(3)+')';g.lineWidth=1.1;
+      g.beginPath();g.arc(tgt[0],tgt[1],8+ph*44,0,6.283);g.stroke()}
+    g.save();g.translate(tgt[0],tgt[1]);g.rotate(T*1.05%6.283);
+    const lg=g.createLinearGradient(0,0,46,0);
+    lg.addColorStop(0,'rgba('+c+',.6)');lg.addColorStop(1,'rgba('+c+',0)');
+    g.strokeStyle=lg;g.lineWidth=1.4;g.beginPath();g.moveTo(0,0);g.lineTo(46,0);g.stroke();g.restore();
+    g.strokeStyle='rgba('+c+',.9)';g.lineWidth=1.3;
+    g.beginPath();g.arc(tgt[0],tgt[1],7,0,6.283);g.stroke();
+    for(const d of [[1,0],[-1,0],[0,1],[0,-1]]){g.beginPath();
+      g.moveTo(tgt[0]+d[0]*11,tgt[1]+d[1]*11);g.lineTo(tgt[0]+d[0]*17,tgt[1]+d[1]*17);g.stroke()}
+    g.fillStyle='rgba('+c+',1)';g.beginPath();g.arc(tgt[0],tgt[1],2.1,0,6.283);g.fill();
+    geoTag(g,tgt,st,c)}
+  const sy=((T*.09)%1)*H;                                  /* строка сканера сверху вниз */
+  g.fillStyle='rgba('+c+',.045)';g.fillRect(0,sy-16,W,16);
+  g.fillStyle='rgba('+c+',.16)';g.fillRect(0,Math.round(sy),W,1)}
+function geoStill(){try{return window.matchMedia('(prefers-reduced-motion: reduce)').matches}catch(e){return false}}
+function geoLoop(t){if(!GEO.run){GEO.raf=0;return}
+  GEO.raf=requestAnimationFrame(geoLoop);
+  if(t-GEO.last<32)return;GEO.last=t;geoDraw(t)}
+function geoStart(){if(isFolded('geo')||document.hidden)return geoStop();
+  if(geoStill()){geoStop();geoDraw(0);return}                /* «поменьше движения» — рисуем один кадр */
+  if(GEO.run)return;GEO.run=1;GEO.last=0;GEO.raf=requestAnimationFrame(geoLoop)}
+function geoStop(){GEO.run=0;if(GEO.raf)cancelAnimationFrame(GEO.raf);GEO.raf=0}
+/* состояние карты — из того же /api/status, что и маяк: своих запросов карта не делает */
+function geoSync(s){s=s||window.__S;if(!s||!document.getElementById('geocv'))return;
+  /* без проверки выхода цели нет: рисовать прошлогоднюю страну — врать человеку */
+  const cc=(s.egress_cc||'').toLowerCase(),pt=s.egress_at?geoPt(cc):null;
+  let rgb='0,240,255',lock='цель не захвачена';
+  if(s.emergency){rgb='255,42,109';lock='авария · прямой выход без прокси'}
+  else if(s.automat==='ROTATING'){rgb='255,184,0';lock='перебор пула…'}
+  else if(!s.egress_at){lock='выход ещё не проверялся'}
+  else if(s.egress_ok){rgb=ccWarn(s)?'255,184,0':'5,255,161';lock='цель захвачена'}
+  else{rgb='255,42,109';lock='цепь разорвана'}
+  if(s.egress_at&&cc&&!pt)lock+=' · страна '+cc+' не на карте';
+  const pool=(s.pool_cc||[]);
+  GEO.st={pt:pt,rgb:rgb,cc:cc,ip:s.egress||'',name:country(cc)||'',pool:pool,rot:s.automat==='ROTATING'};
+  const L=document.getElementById('geolock');
+  if(L){L.textContent=lock+((s.egress&&s.egress_at)?(' · '+s.egress):'');
+    L.style.color='rgb('+rgb+')';L.style.borderColor='rgba('+rgb+',.45)'}
+  const xy=document.getElementById('geoxy');
+  if(xy)xy.textContent=pt?('LAT '+pt[1].toFixed(1)+' · LON '+pt[0].toFixed(1)+' · '+(country(cc)||cc.toUpperCase()))
+    :'LAT — · LON —';
+  const who=document.getElementById('geowho');
+  const spare=pool.filter(x=>x!==cc).length;
+  if(who)who.textContent=(s.egress_at?('проверено '+agoTxt(s.egress_age)):'проверки ещё не было')+
+    (spare?(' · запасных на карте: '+spare):'');
+  sum('geo',pt?((country(cc)||cc.toUpperCase())+(s.egress?(' · '+s.egress):'')):'');
+  geoStart()}
+document.addEventListener('visibilitychange',()=>{document.hidden?geoStop():geoStart()});
+window.addEventListener('resize',()=>{GEO.W=0;if(!GEO.run)geoDraw(0)});
 async function api(path,opts){opts=opts||{};opts.headers=Object.assign({'X-CSRF-Token':CSRF},opts.headers||{});
   const r=await fetch(path,opts);const t=await r.text();let j;try{j=JSON.parse(t)}catch(e){j={error:t}}
   if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
@@ -587,6 +899,11 @@ async function loadStatus(){const s=await api('/api/status');window.__S=s;
   if(fb){fb.textContent=s.frozen?'▶ Возобновить автоматику':'⏸ Пауза автоматики';
     fb.className='btn '+(s.frozen?'a':'s')}
   beacon(s,window.__CN);
+  /* сводки в шапках: свёрнутый раздел всё равно говорит главное */
+  sum('pool','живых прокси: '+(s.pool_alive==null?'?':s.pool_alive));
+  sum('money',Object.entries(s.balances||{}).map(([k,v])=>k+': '+v).join(' · '));
+  sum('upd','Редут '+(s.version||'?'));
+  geoSync(s);
   maybeRecheck(s)}
 
 /* F7: пауза автоматики (FROZEN) — сторож ничего не делает сам, пока не снимешь */
@@ -696,7 +1013,7 @@ function apTile(){const a=(window.__S||{}).auto_prolong;
     'сколько продление, но новый IP «холодный»: сайты начинают требовать перелогины, капчи и подтверждения оплаты. '+
     'Если продлить не выйдет (лимит, баланс, сбой у провайдера) — придёт письмо, молча истечь не даст.')}
 
-async function market(){toast('Спрашиваю провайдера, что есть в продаже…');try{const m=await api('/api/market');window.__MARKET=m;const box=document.getElementById('marketbox');
+async function market(){await openFold('money');toast('Спрашиваю провайдера, что есть в продаже…');try{const m=await api('/api/market');window.__MARKET=m;const box=document.getElementById('marketbox');
   const pr=m.price?('цена '+m.price.price+' '+m.price.currency+' за 1 шт × '+m.period+' дн · баланс '+m.price.balance):(m.price_error||'цена недоступна');
   box.textContent=(m.country_error?('рынок недоступен ('+m.country_error+') · '):
     ('Доступные страны ('+(m.available||[]).length+'): '+((m.available||[]).map(a=>country(a.cc)).join(', ')||'—')+' · '))+pr;
@@ -899,7 +1216,7 @@ async function loadUpd(){let r;try{r=await api('/api/update/status')}
     else if(live.phase==='failed'){toast('Обновление не прошло: '+esc(live.why||'')+(live.rolled_back?' — откат выполнен, узел на прежней версии':' — откат не подтвердился!'),live.rolled_back?'warn':'bad')}}
   if(busy&&!window.__UPDPOLL){window.__UPDPOLL=1;
     setTimeout(async()=>{window.__UPDPOLL=0;try{await loadUpd()}catch(_){}},3000)}}
-async function checkUpd(btn){if(btn)btn.disabled=true;toast('Спрашиваю GitHub, какая версия последняя…');
+async function checkUpd(btn){await openFold('upd');if(btn)btn.disabled=true;toast('Спрашиваю GitHub, какая версия последняя…');
   try{const r=await api('/api/update/check',{method:'POST'});
     if(!r.ok){toast('Проверка не отработала: '+((r.output||'').split('\\n').pop()||'см. журнал узла'),'bad')}
     else toast(r.last_error?('Проверка не удалась: '+r.last_error)
@@ -923,7 +1240,8 @@ async function toggleAuto(){const r0=window.__UPD||{};const to=!r0.auto;
     await loadUpd()}
   catch(e){toast('настройка: '+e.message,'bad')}}
 
-async function reloadAll(){try{await loadStatus();await loadMoney();await loadPool();await loadClients();await loadFold('strategy');await loadKeys();await loadUpd();await loadFold('events')}catch(e){toast(e.message,'bad')}}
+async function reloadAll(){try{for(const id of FOLD_ORDER)await loadFold(id)}
+  catch(e){toast(e.message,'bad')}}
 
 function ago(ts){if(!ts)return '<span class="mut">ещё ни разу</span>';const d=Math.floor(Date.now()/1000)-ts;
   if(d<0)return '<span class="ok">только что</span>';
@@ -943,11 +1261,13 @@ async function loadClients(){const r=await api('/api/clients');const tb=document
       '<button class="btn r tiny" onclick="delClient(\\''+nm+'\\')">Отозвать</button></td>';
     tb.appendChild(tr)}
   window.__CN=r.clients.length;
+  sum('clients','устройств: '+r.clients.length);
   document.getElementById('qstart').style.display=r.clients.length?'none':'grid';
   if(!r.clients.length)tb.innerHTML='<tr><td colspan="5" class="mut">доступ пока никому не выдан — начни с шагов выше</td></tr>';
   if(window.__S)beacon(window.__S,window.__CN)}
 
 async function addClient(){const n=document.getElementById('cname').value.trim();if(!n)return toast('впиши имя устройства','bad');
+  await openFold('clients');
   toast('Создаю профиль '+n+'…');try{const r=await api('/api/clients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})});
     document.getElementById('cname').value='';
     toast('Готово: '+r.name+' ('+r.ip+'). Дальше — «QR» для телефона или «Скачать» для компьютера.','ok');await loadClients()}catch(e){toast(e.message,'bad')}}
@@ -1029,7 +1349,11 @@ reloadAll();setInterval(loadStatus,30000);
 
 
 def dashboard_page(server_name, csrf):
-    body = _fill(_DASH_HTML, SRV=_esc(server_name), CSRF=_esc(csrf), CSRFJS=_js(csrf))
+    body = _fill(_DASH_HTML, SRV=_esc(server_name), CSRF=_esc(csrf), CSRFJS=_js(csrf),
+                 MAPCOLS=str(_MAP_COLS), MAPROWS=str(_MAP_ROWS),
+                 MAPL0=repr(_MAP_BOX[0]), MAPL1=repr(_MAP_BOX[1]),
+                 MAPB0=repr(_MAP_BOX[2]), MAPB1=repr(_MAP_BOX[3]),
+                 MAPCC=_js(_MAP_CC), MAPLAND=_js(_MAP_LAND))
     return _doc("vpn-panel — %s" % _esc(server_name), body)
 
 
