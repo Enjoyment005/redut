@@ -1113,6 +1113,10 @@ _SETUP_HTML = """
       <div style="flex:2;min-width:160px"><label>логин</label><input id="sm_user" autocomplete="off"></div>
     </div>
     <label>пароль от ящика</label><input id="sm_password" type="password" autocomplete="new-password">
+    <div id="sm_from_row" style="display:none">
+      <label>адрес отправителя</label><input id="sm_from" autocomplete="off" placeholder="vpn@example.com">
+      <div class="sub">Логин не похож на почтовый адрес — впишите, с какого адреса слать письма.</div>
+    </div>
     <label>кому слать</label><input id="sm_to" autocomplete="off" placeholder="you@example.com">
     <div style="margin-top:11px"><button class="btn g" onclick="saveSmtp()">Сохранить</button>
       <button class="btn s" onclick="skipSmtp()">Пропустить</button></div>
@@ -1142,7 +1146,8 @@ function toast(t,cls){const d=document.createElement('div');d.className='msg '+(
 async function sapi(path,obj){const r=await fetch(path,{method:'POST',
   headers:{'X-Setup-Token':SETUP,'Content-Type':'application/json'},body:JSON.stringify(obj||{})});
   const t=await r.text();let j;try{j=JSON.parse(t)}catch(e){j={error:t}}
-  if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
+  if(!r.ok){const err=new Error(j.error||('HTTP '+r.status));Object.assign(err,j);throw err}
+  return j}
 let CUR=1;const DONE={};
 const NAMES=['','пароль','второй фактор','провайдер','почта','готово'];
 function stepper(){document.getElementById('stepper').innerHTML=
@@ -1174,8 +1179,9 @@ async function saveProv(){const b={proxy6:document.getElementById('proxy6').valu
     ('<span class="bad">'+esc(v.error)+'</span>'))).join('<br>');
   done(3)}catch(e){document.getElementById('provbox').innerHTML='<span class="bad">'+esc(e.message)+'</span>';toast(e.message,'bad')}}
 async function saveSmtp(){const b={host:v('sm_host'),port:v('sm_port'),user:v('sm_user'),
-  password:v('sm_password'),to:v('sm_to')};
-  try{await sapi('/api/setup/smtp',b);document.getElementById('smtpbox').innerHTML='<span class="ok">почта сохранена</span>';done(4)}catch(e){toast(e.message,'bad')}}
+  password:v('sm_password'),from:v('sm_from'),to:v('sm_to')};
+  try{await sapi('/api/setup/smtp',b);document.getElementById('smtpbox').innerHTML='<span class="ok">почта сохранена</span>';done(4)}
+  catch(e){if(e.need_from)document.getElementById('sm_from_row').style.display='block';toast(e.message,'bad')}}
 async function skipSmtp(){try{await sapi('/api/setup/smtp',{skip:true});
   document.getElementById('smtpbox').innerHTML='<span class="mut">почта пропущена — настроишь позже</span>';done(4)}catch(e){toast(e.message,'bad')}}
 function v(id){return document.getElementById(id).value.trim()}

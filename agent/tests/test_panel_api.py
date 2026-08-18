@@ -13,6 +13,8 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webpanel"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import alerts  # noqa: E402
 import server  # noqa: E402
 
 
@@ -141,6 +143,54 @@ class _FakeHandler:
         self.resp = (code, obj)
 
     _do_key_delete = server.Handler._do_key_delete
+    _setup_smtp = server.Handler._setup_smtp
+
+
+
+class TestSetupSmtp(_AppHarness):
+    """Шаг 4 мастера: молча принять почту, с которой письма не уйдут, — нельзя.
+
+    Ровно так и случилось на node2 18.08: «от кого» осталось пустым, `configured`
+    требовал его — и все алерты выключились, ничего об этом не сказав.
+    """
+
+    def save(self, **body):
+        h = _FakeHandler()
+        h._setup_smtp(body)
+        return h.resp
+
+    def test_login_is_email_no_from_needed(self):
+        code, r = self.save(host="mail.example.com", port="587", user="box@example.com",
+                            password="x", to="me@example.com")
+        self.assertEqual(code, 200, r)
+        saved = server.APP.setup["smtp"]
+        self.assertNotIn("from", saved, "пустой «from» в secrets.json не нужен")
+        self.assertTrue(alerts.Alerter(smtp=saved).configured, "письма обязаны уходить")
+
+    def test_login_not_email_asks_for_sender(self):
+        # логины вида u123456 / apikey / postmaster — обычное дело у хостеров
+        code, r = self.save(host="smtp.example.com", port="587", user="u123456",
+                            password="x", to="me@example.com")
+        self.assertEqual(code, 400)
+        self.assertTrue(r.get("need_from"), "форма должна показать поле отправителя")
+        self.assertNotIn("smtp", server.APP.setup, "негодную почту не сохраняем")
+
+    def test_login_not_email_but_sender_given(self):
+        code, r = self.save(host="smtp.example.com", port="587", user="u123456", password="x",
+                            **{"from": "vpn@example.com", "to": "me@example.com"})
+        self.assertEqual(code, 200, r)
+        self.assertTrue(alerts.Alerter(smtp=server.APP.setup["smtp"]).configured)
+
+    def test_display_name_as_sender_rejected(self):
+        code, r = self.save(host="mail.example.com", port="587", user="box@example.com",
+                            password="x", **{"from": "Vpn000", "to": "me@example.com"})
+        self.assertEqual(code, 400)
+
+    def test_skip_keeps_wizard_moving(self):
+        code, r = self.save(skip=True)
+        self.assertEqual(code, 200)
+        self.assertTrue(server.APP.setup["smtp_done"])
+        self.assertNotIn("smtp", server.APP.setup)
 
 
 class TestKeyDelete(_AppHarness):

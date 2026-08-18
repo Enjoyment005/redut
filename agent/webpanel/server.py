@@ -1344,6 +1344,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "«from», если задан, должен быть e-mail адресом"})
         if not smtp.get("from"):
             smtp.pop("from", None)          # не сорить null-ом в secrets.json
+        # Отказываем, если с этими данными письмо УЙТИ НЕ МОЖЕТ. Проверяем ровно тем же
+        # условием, каким живёт отправка (Alerter.configured): раньше «настроено» и «умеет
+        # отправить» расходились, и почта молча выключалась (node2 18.08). Обычно отправитель
+        # берётся из логина, но логин не всегда адрес (u123456, apikey, postmaster) — тогда
+        # мастер просит адрес отправителя, а не делает вид, что письма настроены.
+        if not alerts_mod.Alerter(smtp=smtp).configured:
+            return self._json(400, {
+                "error": "письма отправлять не с чего: логин SMTP не почтовый адрес — "
+                         "укажите адрес отправителя",
+                "need_from": True})
         APP.setup["smtp"] = smtp
         APP.setup["smtp_done"] = True
         return self._json(200, {"ok": True})
