@@ -37,7 +37,7 @@ class _Capture(alerts.Alerter):
 
 
 def _mk(mask=None):
-    return _Capture(smtp={"host": "h", "from": "f@x", "to": "t@x"}, server="node1", mask=mask)
+    return _Capture(smtp={"host": "h", "from": "f@x.co", "to": "t@x.co"}, server="node1", mask=mask)
 
 
 class TestFormatting(unittest.TestCase):
@@ -169,14 +169,32 @@ class TestEnvelopeFrom(unittest.TestCase):
             self.assertTrue(a._send("тест", "тело"))
         self.assertEqual(_FakeSMTP.last.sent[0]["From"], "real@example.com")
 
+    def test_empty_from_with_valid_user_is_configured(self):
+        # Мастер сохраняет почту без «from» (поля больше нет) — алерты обязаны работать:
+        # отправитель берётся из логина. До 1.3.2 такой узел молча сидел без писем (node2 18.08).
+        smtp = {"host": "h", "port": 587, "user": "box@example.com", "password": "x",
+                "from": "", "to": "to@example.com"}
+        a = alerts.Alerter(smtp=smtp, server="test", log=lambda m: None)
+        self.assertTrue(a.configured)
+        with mock.patch.object(alerts.smtplib, "SMTP", _FakeSMTP):
+            self.assertTrue(a._send("тест", "тело"))
+        msg = _FakeSMTP.last.sent[0]
+        self.assertEqual(self._envelope_from(msg), "box@example.com")
+        self.assertEqual(msg["From"], "box@example.com")          # без ярлыка — голый адрес
+
+    def test_no_from_key_at_all_is_configured(self):
+        smtp = {"host": "h", "user": "box@example.com", "to": "to@example.com"}
+        self.assertTrue(alerts.Alerter(smtp=smtp, server="test", log=lambda m: None).configured)
+
     def test_invalid_from_and_no_user_logs_and_returns_false(self):
         logs = []
         smtp = {"host": "h", "from": "От ВПНА", "to": "to@example.com"}  # user отсутствует
         a = alerts.Alerter(smtp=smtp, server="test", log=logs.append)
-        self.assertTrue(a.configured)
+        # слать нечем: ни валидного «from», ни логина -> честно «не настроено»
+        self.assertFalse(a.configured)
         with mock.patch.object(alerts.smtplib, "SMTP", _FakeSMTP):
             self.assertFalse(a._send("тест", "тело"))            # не шлём и НЕ бросаем
-        self.assertTrue(any("from" in m.lower() for m in logs))
+        self.assertTrue(any("не настроен" in m.lower() for m in logs))
 
 
 if __name__ == "__main__":

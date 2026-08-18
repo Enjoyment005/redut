@@ -49,8 +49,14 @@ class Alerter:
 
     @property
     def configured(self):
+        """Есть ли чем и куда слать. «from» НЕ обязателен: _send подставит логин SMTP
+        (реальный ящик) — тем же фолбэком, что и при ярлыке вместо адреса. Раньше
+        пустой «from» молча выключал ВСЕ алерты, хотя ящик настроен и письма ушли бы:
+        поймано на node2 18.08 (мастер сохранил from="" -> «SMTP не настроен»).
+        Условие теперь совпадает с тем, что _send реально умеет отправить."""
         s = self.smtp
-        return bool(s and s.get("host") and s.get("to") and s.get("from"))
+        return bool(s and s.get("host") and s.get("to")
+                    and (_valid_email(s.get("from")) or _valid_email(s.get("user"))))
 
     # ------------------------------------------------------------- транспорт
     def _send(self, subject, body):
