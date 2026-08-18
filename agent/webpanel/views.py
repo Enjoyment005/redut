@@ -1105,18 +1105,15 @@ _SETUP_HTML = """
     <h2>Шаг 4 · Почта для тревожных писем</h2>
     <div class="ex">Куда писать, если VPN сломался, прокси умер или деньги на исходе. Нужны данные
       почтового ящика, от имени которого слать письма (те же, что вбиваются в почтовый клиент:
-      сервер, порт, логин, пароль). <b>Не знаешь — жми «Пропустить»</b>, панель будет работать без писем,
-      настроишь потом.</div>
+      сервер, порт, логин, пароль). Письма приходят с адреса логина — отдельно его указывать не нужно.
+      <b>Не знаешь — жми «Пропустить»</b>, панель будет работать без писем, настроишь потом.</div>
     <label>Почтовый сервер (SMTP)</label><input id="sm_host" autocomplete="off" placeholder="mail.example.com">
     <div class="field">
       <div style="flex:1;min-width:90px"><label>порт</label><input id="sm_port" placeholder="587"></div>
       <div style="flex:2;min-width:160px"><label>логин</label><input id="sm_user" autocomplete="off"></div>
     </div>
     <label>пароль от ящика</label><input id="sm_password" type="password" autocomplete="new-password">
-    <div class="field">
-      <div style="flex:1;min-width:160px"><label>от кого</label><input id="sm_from" autocomplete="off"></div>
-      <div style="flex:1;min-width:160px"><label>кому слать</label><input id="sm_to" autocomplete="off"></div>
-    </div>
+    <label>кому слать</label><input id="sm_to" autocomplete="off" placeholder="you@example.com">
     <div style="margin-top:11px"><button class="btn g" onclick="saveSmtp()">Сохранить</button>
       <button class="btn s" onclick="skipSmtp()">Пропустить</button></div>
     <div id="smtpbox" class="sub" style="margin-top:9px"></div>
@@ -1177,7 +1174,7 @@ async function saveProv(){const b={proxy6:document.getElementById('proxy6').valu
     ('<span class="bad">'+esc(v.error)+'</span>'))).join('<br>');
   done(3)}catch(e){document.getElementById('provbox').innerHTML='<span class="bad">'+esc(e.message)+'</span>';toast(e.message,'bad')}}
 async function saveSmtp(){const b={host:v('sm_host'),port:v('sm_port'),user:v('sm_user'),
-  password:v('sm_password'),from:v('sm_from'),to:v('sm_to')};
+  password:v('sm_password'),to:v('sm_to')};
   try{await sapi('/api/setup/smtp',b);document.getElementById('smtpbox').innerHTML='<span class="ok">почта сохранена</span>';done(4)}catch(e){toast(e.message,'bad')}}
 async function skipSmtp(){try{await sapi('/api/setup/smtp',{skip:true});
   document.getElementById('smtpbox').innerHTML='<span class="mut">почта пропущена — настроишь позже</span>';done(4)}catch(e){toast(e.message,'bad')}}

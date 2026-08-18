@@ -1332,13 +1332,18 @@ class Handler(BaseHTTPRequestHandler):
             smtp["port"] = int(smtp["port"] or 587)
         except (TypeError, ValueError):
             return self._json(400, {"error": "порт — число"})
-        # Адреса проверяем на входе, а не когда первый алерт молча не уйдёт (501 Invalid
-        # MAIL FROM): «from», если задан, и «to» должны быть настоящими e-mail, а не
-        # отображаемым именем вроде «От ВПНА».
+        # Адрес получателя проверяем на входе, а не когда первый алерт молча не уйдёт
+        # (501 Invalid MAIL FROM): «to» должен быть настоящим e-mail.
         if not alerts_mod._valid_email(smtp["to"]):
             return self._json(400, {"error": "«to» — не похоже на e-mail адрес (например you@example.com)"})
+        # «from» мастер больше НЕ спрашивает (18.08): у обычного узла адрес отправителя равен
+        # логину SMTP, а поле дважды поняли как «подпись письма» и упирались в отказ. Ключ
+        # остаётся в API для редкого случая ящика-алиаса (правка secrets.json руками) — тогда
+        # он обязан быть адресом, иначе alerts.py всё равно откатится на логин.
         if smtp.get("from") and not alerts_mod._valid_email(smtp["from"]):
-            return self._json(400, {"error": "«from» — не похоже на e-mail; впишите почтовый адрес или оставьте поле пустым"})
+            return self._json(400, {"error": "«from», если задан, должен быть e-mail адресом"})
+        if not smtp.get("from"):
+            smtp.pop("from", None)          # не сорить null-ом в secrets.json
         APP.setup["smtp"] = smtp
         APP.setup["smtp_done"] = True
         return self._json(200, {"ok": True})
