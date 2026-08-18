@@ -25,6 +25,8 @@
   --- ключи провайдеров (§12; сам ключ обратно не отдаётся никогда) ---
   GET  /api/key/status              по провайдеру: задан ли ключ, хвост, баланс, живых в пуле
   POST /api/key                     {provider, key, force?} — сменить/добавить/убрать ключ
+                                    (удаление = П7-2: прокси провайдера удаляются из пула,
+                                    боевой канал переключается по стратегии фоновым юнитом)
   POST /api/key/check               {provider} — живая проверка уже сохранённого ключа
   --- деньги (фаза 2, гейты money.py §6.2/§6.4) ---
   GET  /api/market                  getcountry+getprice: что и почём (PROXY6)
@@ -39,8 +41,9 @@
   --- обновления с GitHub (vpn/UPDATE-PLAN.md) ---
   GET  /api/update/status           версии узла/маяка, когда проверялось, авто вкл/выкл, ход установки
   POST /api/update/check            сверить с маяком сейчас (отдельным процессом vpn-agent)
-  POST /api/update/apply            обновиться сейчас: транзиентный юнит systemd-run redut-update
-                                    (переживает рестарт самой панели в середине обновления)
+  POST /api/update/apply            {force?} обновиться сейчас: транзиентный юнит systemd-run
+                                    redut-update (переживает рестарт самой панели в середине
+                                    обновления); force — переустановить ТУ ЖЕ версию (лечение)
   POST /api/update/config           {auto: bool} — тумблер автообновления (config.json, точечно)
 """
 import json
@@ -191,6 +194,26 @@ def _pool_refresh_kick():
         print("[key] pool-refresh rc=%s: %s" % (rc, (out or "")[-300:].replace("\n", " | ")), flush=True)
     except Exception as e:      # noqa: BLE001 — фон, панель жить должна
         print("[key] pool-refresh не удался: %s" % e, flush=True)
+
+
+def _switch_provider_kick(name):
+    """П7-2: фоном увести боевой канал с провайдера, у которого удалили ключ.
+
+    На узле — транзиентный юнит (как ротация, F6): переключение длинное (пробы +
+    apply + verify), в потоке панели ему не место; коллизия имени юнита = «уже
+    идёт» (дедуп повторных удалений ключей). В argv — только имя провайдера,
+    прошедшее проверку по PROVIDER_CLASSES. -> (started, err)."""
+    if os.name != "posix":
+        threading.Thread(target=lambda: _run_agent(
+            ["switch-provider", "--from", name, "--reason", "key-removed"], timeout=900),
+            name="key-switch", daemon=True).start()
+        return True, ""
+    rc, out = apply_mod.run_cmd(["systemd-run", "--collect", "-p", "RuntimeMaxSec=900",
+                                 "--unit", "redut-switch", "/usr/local/bin/vpn-agent",
+                                 "switch-provider", "--from", name, "--reason", "key-removed"])
+    if rc == 0 or "already" in (out or "").lower():
+        return True, ""
+    return False, (out or "systemd-run rc=%s" % rc)[:200]
 
 
 # ── ключи провайдеров: правка из панели (§12 POST /api/key) ──────────────────────────
@@ -639,10 +662,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_post(self, path):
         if path == "/api/pool/refresh":
+            cur = APP.current_host()
             with _DB_LOCK:
-                # active по ключам на диске (🔴 C2): осиротевшие провайдеры — gone
+                # active по ключам на диске (🔴 C2): осиротевшие провайдеры удаляются
+                # из пула (П7-2), кроме строки боевого канала — её держим до переключения
                 summary = APP.pool.refresh(APP.providers, actor="user",
-                                           active=provider_keys(APP.secrets))
+                                           active=provider_keys(APP.secrets),
+                                           keep_hosts={cur} if cur else None)
                 for name, prov in APP.providers.items():
                     if name in summary["errors"]:
                         continue
@@ -791,7 +817,10 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "нет такого метода"})
 
     def _do_update_apply(self):
-        """POST /api/update/apply: обновиться сейчас.
+        """POST /api/update/apply {force?}: обновиться сейчас.
+
+        force=true (1.6.0) — принудительная переустановка ТОЙ ЖЕ версии (лечение
+        узла: скачать выпуск заново и прогнать установщик; анти-даунгрейд остаётся).
 
         Запускаем ТРАНЗИЕНТНЫМ юнитом (systemd-run): установка перезапустит саму
         панель, и работа, начатая в потоке этого сервера, погибла бы на середине.
@@ -799,24 +828,39 @@ class Handler(BaseHTTPRequestHandler):
         дочитает исход после своего рестарта."""
         if os.name != "posix":
             return self._json(400, {"error": "обновление применяется только на сервере"})
+        try:
+            body = json.loads(self._body() or b"{}") or {}
+        except ValueError:
+            body = {}
+        force = bool(body.get("force"))
         st = self._update_status()
         if st.get("applying"):
             return self._json(409, {"error": "обновление уже идёт"})
         if not st.get("latest"):
             return self._json(400, {"error": "сначала «Проверить сейчас» — панель ещё не знает свежую версию"})
         if not st.get("newer"):
-            return self._json(400, {"error": "обновляться не на что: узел уже на %s"
-                                             % (st.get("local") or "?")})
+            if not force:
+                return self._json(400, {"error": "обновляться не на что: узел уже на %s"
+                                                 % (st.get("local") or "?")})
+            if str(st.get("latest")) != str(st.get("local") or ""):
+                # анти-даунгрейд (Р3): принудительно можно только ту версию, что стоит
+                return self._json(400, {"error": "принудительно можно переустановить только "
+                                                 "текущую версию узла (%s), а в репозитории %s — "
+                                                 "версии вниз не ставятся"
+                                                 % (st.get("local") or "?", st.get("latest"))})
         target = str(st["latest"])
-        rc, out = apply_mod.run_cmd(["systemd-run", "--unit", "redut-update", "--collect",
-                                     "/usr/local/bin/vpn-agent", "self-update",
-                                     "--apply", "--version", target])
+        cmd = ["systemd-run", "--unit", "redut-update", "--collect",
+               "/usr/local/bin/vpn-agent", "self-update", "--apply", "--version", target]
+        if force:
+            cmd.append("--force")
+        rc, out = apply_mod.run_cmd(cmd)
         with _DB_LOCK:
             APP.pool.log_event("update-apply-start", actor="user", result=target,
+                               detail="принудительная переустановка" if force else "",
                                src_ip=self._client_ip())
         if rc != 0:
             return self._json(500, {"error": "systemd-run не запустился: %s" % (out or "rc=%s" % rc)})
-        return self._json(200, {"ok": True, "started": target})
+        return self._json(200, {"ok": True, "started": target, "force": force})
 
     # ------------------------------------------------ стратегия стран (§6.1)
     def _strategy_state(self):
@@ -982,9 +1026,13 @@ class Handler(BaseHTTPRequestHandler):
                                 "error": "" if ok else info["error"]})
 
     def _do_key_delete(self, name):
-        """Убрать ключ провайдера (П7): его прокси помечаются gone (их больше некому
-        опросить и нечем продлить), кэш баланса убирается — как и обещает confirm в UI.
-        Боевой канал НЕ рвём (правило «держать IP»), только предупреждаем."""
+        """Убрать ключ провайдера (П7-2, 1.6.0): его прокси сразу УДАЛЯЮТСЯ из пула
+        (управлять ими больше нечем; раньше висели «пропал» навсегда — жалоба
+        владельца 18.08), кэш баланса убирается. Если боевой канал на этом
+        провайдере — он продолжает работать (правило «держать IP» на время
+        манёвра), а фоном запускается плановое переключение по текущей стратегии
+        (проба -> apply -> verify -> автооткат, states.switch_from_provider);
+        до переключения строка боевого видна в пуле с пометкой «пропал»."""
         # проверка «последнего ключа» и запись — под ОДНИМ локом по данным с диска
         # (ревью 1.3.0): два одновременных удаления разных провайдеров иначе оба
         # проходили проверку и оставляли панель слепой
@@ -1001,26 +1049,34 @@ class Handler(BaseHTTPRequestHandler):
             APP.write_secrets(merge_key(data, name, None))
         cur_host = APP.current_host()
         with _DB_LOCK:
-            c = APP.pool.conn.execute(
-                "UPDATE proxy SET gone=1 WHERE provider=? AND gone=0", (name,))
-            marked = c.rowcount if c.rowcount and c.rowcount > 0 else 0
-            APP.pool.conn.execute("DELETE FROM setting WHERE key=?", ("balance:%s" % name,))
-            APP.pool.conn.commit()
             battle = None
             if cur_host:
                 battle = APP.pool.conn.execute(
                     "SELECT uid FROM proxy WHERE provider=? AND host=?",
                     (name, cur_host)).fetchone()
+            pr = APP.pool.purge_provider(name, keep_hosts=({cur_host} if battle else None))
+            APP.pool.conn.execute("DELETE FROM setting WHERE key=?", ("balance:%s" % name,))
+            APP.pool.conn.commit()
             APP.pool.log_event("key-del", actor="user", result="ok",
-                               detail="%s: помечено gone %d, баланс убран%s"
-                               % (name, marked, "; боевой остаётся" if battle else ""),
+                               detail="%s: удалено из пула %d, баланс убран%s"
+                               % (name, pr["deleted"],
+                                  "; боевой на нём — переключаю по стратегии" if battle else ""),
                                src_ip=self._client_ip())
         warning = ""
+        switching = False
         if battle:
-            warning = ("Боевой канал принадлежит %s: он продолжает работать, но продление "
-                       "теперь невозможно — канал будет заменён по истечении срока" % name)
+            switching, err = _switch_provider_kick(name)
+            warning = ("Боевой канал принадлежит %s: он продолжает работать, а панель уже "
+                       "переключает его на другого провайдера по текущей стратегии "
+                       "(проверка → переключение → проверка → автооткат). Если живых "
+                       "кандидатов не найдётся, канал останется как есть, письмо расскажет, "
+                       "и попытка повторится при следующем обновлении пула" % name)
+            if err:
+                warning += ". Не удалось запустить переключение сейчас (%s) — " \
+                           "его сделает ближайший цикл обновления пула" % err
         return self._json(200, {"ok": True, "deleted": True, "provider": name,
-                                "gone_marked": marked, "warning": warning})
+                                "purged": pr["deleted"], "battle": bool(battle),
+                                "switch_started": switching, "warning": warning})
 
     def _do_key_check(self, body):
         """POST /api/key/check {provider} — живая проверка уже сохранённого ключа."""
@@ -1472,6 +1528,9 @@ class Handler(BaseHTTPRequestHandler):
             # F6: ротация из панели идёт транзиентным юнитом — фронт поллит её ход
             rc, ract = apply_mod.run_cmd(["systemctl", "is-active", "redut-rotate"])
             out["rotate_busy"] = (ract or "").strip() in ("active", "activating")
+            # П7-2: плановое переключение с провайдера без ключа — тоже юнит
+            rc, sact = apply_mod.run_cmd(["systemctl", "is-active", "redut-switch"])
+            out["switch_busy"] = (sact or "").strip() in ("active", "activating")
         with _DB_LOCK:
             rows = APP.pool.list(include_gone=True)
             # только провайдеры с ключом: осиротевший пул — не «живой» (П7)

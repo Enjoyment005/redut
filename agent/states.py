@@ -712,6 +712,108 @@ def try_rotating(cfg, providers, pool, alerter, log, actor):
     return {"ok": False, "exhausted": True, "tried": tried}
 
 
+# --------------------------------------------- переключение с провайдера (П7-2)
+def switch_from_provider(cfg, providers, pool, alerter, from_provider,
+                         log=print, actor="user", reason="key-removed"):
+    """П7-2 (1.6.0): плановое переключение боевого канала с провайдера без ключа.
+
+    Это НЕ лестница §8: канал ЖИВОЙ (egress работает), rotate его чинить не станет
+    («делать нечего»). Но ключ провайдера удалён — продлить боевой нечем и управлять
+    им панель не может, поэтому уходим по-хорошему, пока канал ещё дышит: кандидаты
+    ОСТАВШИХСЯ провайдеров в порядке текущей стратегии (ровно как «В бой»), первый
+    прошедший живую пробу применяется через apply_candidate (проверка -> переключение
+    -> verify -> автооткат). Провал любого шага НЕ рвёт работающий канал.
+
+    После успеха строки выбывшего провайдера добиваются purge_provider (боевой
+    больше не на нём). Если живых кандидатов нет — канал остаётся, письмо владельцу
+    (дедуп 6 ч), повтор при каждом pool-refresh (крон */30 мин).
+
+    Возвращает dict(ok, switched, detail[, uid]): ok=True и switched=False —
+    переключать нечего (боевой не у этого провайдера).
+    """
+    res = {"ok": False, "switched": False, "detail": ""}
+    try:
+        sb = apply_mod.load_json(cfg["singbox_config"])
+    except (OSError, ValueError):
+        sb = {}
+    host = apply_mod.current_upstream(sb)
+    cur = _pool_row_by_host(pool, host) if host else None
+    if cur is None or cur.get("provider") != from_provider:
+        res.update(ok=True, detail="боевой канал не у %s — переключать нечего" % from_provider)
+        return res
+    if pool.get_setting("automat_frozen") == "1":
+        # паузу уважаем как rotate: владелец сказал «руки прочь» — боевой держим,
+        # повтор придёт со следующим pool-refresh уже после снятия паузы
+        pool.log_event("provider-switch", actor=actor, result="frozen",
+                       detail="боевой у %s (ключ удалён) — автоматика на паузе, жду" % from_provider)
+        res.update(detail="автоматика на паузе (FROZEN) — боевой остаётся, "
+                          "переключусь после снятия паузы")
+        return res
+    if os.name != "posix":
+        res.update(detail="переключение канала доступно только на сервере (Linux)")
+        return res
+    try:
+        with apply_mod.Flock(cfg.get("lock") or "/run/vpn-agent.lock"):
+            return _switch_locked(cfg, providers, pool, alerter, from_provider,
+                                  host, cur, log, actor, reason, res)
+    except apply_mod.ApplyError:
+        res.update(detail="агент занят (ротация/обновление?) — переключение "
+                          "повторится при следующем обновлении пула")
+        return res
+
+
+def _switch_locked(cfg, providers, pool, alerter, from_provider,
+                   host, cur, log, actor, reason, res):
+    # кандидаты уже без gone/off/cooldown/чёрного списка и упорядочены стратегией;
+    # фильтр по from_provider — страховка (его строки и так удалены либо gone)
+    cands = [r for r in selectable_candidates(pool, cfg, host, providers)
+             if r["provider"] != from_provider]
+    log("переключение с %s (%s): боевой %s, кандидатов %d"
+        % (from_provider, reason, host, len(cands)))
+    tried = 0
+    for row in cands:
+        if tried >= MAX_CANDIDATES_PER_CYCLE:
+            log("  лимит ≤%d кандидатов/цикл — остальных попробует следующий pool-refresh"
+                % MAX_CANDIDATES_PER_CYCLE)
+            break
+        tried += 1
+        pres = _probe(pool, providers, row, host, cfg)
+        if pres.get("disqualified") or not pres.get("ok"):
+            _cooldown_after_fail(pool, row["uid"], log)
+            continue
+        try:
+            r = apply_mod.apply_candidate(cfg, row, pres, log=log, _locked=True)
+        except apply_mod.ApplyError as e:
+            pool.bump_fail(row["uid"])
+            _cooldown_after_fail(pool, row["uid"], log)
+            pool.log_event("provider-switch", actor=actor, to_uid=row["uid"],
+                           result="fail", detail=str(e))
+            continue
+        pool.mark_used(row["uid"])
+        pool.clear_cooldown(row["uid"])
+        pool.set_egress(r.get("verify"))
+        purged = pool.purge_provider(from_provider)      # боевой ушёл — добить остатки
+        pool.log_event("provider-switch", actor=actor, from_uid=cur["uid"], to_uid=row["uid"],
+                       result="ok",
+                       detail="ключ %s удалён: %s -> %s egress=%s cc=%s; строк удалено %d"
+                              % (from_provider, host, r["new_ip"], r["verify"]["egress_ip"],
+                                 r["verify"]["exit_cc"], purged["deleted"]))
+        alerter.provider_switched(provider=from_provider, old_ip=host, new_ip=r["new_ip"],
+                                  uid=row["uid"], egress=r["verify"]["egress_ip"],
+                                  cc=r["verify"]["exit_cc"])
+        res.update(ok=True, switched=True, uid=row["uid"],
+                   detail="боевой переключён: %s -> %s (%s)" % (host, r["new_ip"], row["uid"]))
+        return res
+    pool.log_event("provider-switch", actor=actor, result="stuck",
+                   detail="боевой остаётся у %s: живых кандидатов нет (перебрано %d)"
+                          % (from_provider, tried))
+    _alert_once(pool, alerter, "provider_switch_stuck",
+                provider=from_provider, host=host, tried=tried)
+    res.update(detail="живых кандидатов нет (перебрано %d) — боевой остаётся на %s, "
+                      "повтор при следующем обновлении пула" % (tried, host))
+    return res
+
+
 # ------------------------------------------------------------------- REPLENISH
 def _alert_once(pool, alerter, kind, period=ALERT_DEDUP_SEC, **kw):
     """F7: дедуп писем. no_funds/pool_empty/no_market шлются на каждом ретрае

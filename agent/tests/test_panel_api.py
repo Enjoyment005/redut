@@ -271,7 +271,8 @@ class TestSetupSmtp(_AppHarness):
         self.assertNotIn("smtp", server.APP.setup)
 
 class TestKeyDelete(_AppHarness):
-    """П7: удаление ключа выключает провайдера целиком (gone + баланс + кандидаты)."""
+    """П7-2 (1.6.0): удаление ключа выселяет провайдера из пула сразу; боевой
+    держится (gone) и уводится фоновым переключением по стратегии."""
 
     def setUp(self):
         super().setUp()
@@ -285,26 +286,35 @@ class TestKeyDelete(_AppHarness):
             "port_http": 8080, "port_socks5": 1080, "user": "u", "password": "p",
             "country": "de", "ip_version": 4, "kind": "dedicated",
             "date_end": None, "descr": ""})
+        # переключение — отдельный процесс агента: в тестах его не запускаем,
+        # только фиксируем факт запуска
+        self.kicked = []
+        self._kick_saved = server._switch_provider_kick
+        server._switch_provider_kick = lambda name: (self.kicked.append(name) or True, "")
+
+    def tearDown(self):
+        server._switch_provider_kick = self._kick_saved
+        super().tearDown()
 
     def do_delete(self, name):
         h = _FakeHandler()
         h._do_key_delete(name)
         return h.resp
 
-    def test_delete_marks_gone_and_clears_balance(self):
+    def test_delete_purges_rows_and_clears_balance(self):
         code, r = self.do_delete("proxyline")
         self.assertEqual(code, 200)
-        self.assertEqual(r["gone_marked"], 1)
-        self.assertEqual(self.app.pool.get(self.pl)["gone"], 1, "строки провайдера gone")
+        self.assertEqual(r["purged"], 1)
+        self.assertIsNone(self.app.pool.get(self.pl), "строки провайдера УДАЛЕНЫ (П7-2)")
         self.assertEqual(self.app.pool.get(self.p6)["gone"], 0, "чужие строки не тронуты")
         self.assertIsNone(self.app.pool.get_setting("balance:proxyline"), "баланс убран")
         self.assertEqual(self.app.pool.get_setting("balance:proxy6"), "500 RUB")
-        uids = {x["uid"] for x in self.app.pool.candidates()}
-        self.assertNotIn(self.pl, uids, "осиротевшие строки — не кандидаты")
-        self.assertIn(self.p6, uids)
+        self.assertEqual(self.kicked, [], "боевой не его — переключение не зовём")
+        self.assertEqual(r["warning"], "")
 
-    def test_battle_channel_not_cut_but_warned(self):
-        # боевой принадлежит удаляемому провайдеру: канал не рвём, но предупреждаем
+    def test_battle_channel_kept_and_switch_kicked(self):
+        # боевой принадлежит удаляемому провайдеру: канал не рвём, строку держим
+        # с пометкой gone, фоном стартует переключение по стратегии
         sb = os.path.join(self.tmp.name, "singbox.json")
         with open(sb, "w", encoding="utf-8") as f:
             json.dump({"outbounds": [{"tag": "socks-out", "type": "socks",
@@ -312,8 +322,13 @@ class TestKeyDelete(_AppHarness):
         self.app.cfg["singbox_config"] = sb
         code, r = self.do_delete("proxyline")
         self.assertEqual(code, 200)
-        self.assertIn("продление", r["warning"])
-        self.assertEqual(self.app.pool.get(self.pl)["gone"], 1)
+        self.assertTrue(r["battle"])
+        self.assertTrue(r["switch_started"])
+        self.assertIn("переключает", r["warning"])
+        self.assertEqual(self.kicked, ["proxyline"])
+        row = self.app.pool.get(self.pl)
+        self.assertIsNotNone(row, "боевой не удаляется до переключения")
+        self.assertEqual(row["gone"], 1)
 
     def test_last_key_protected(self):
         self.do_delete("proxyline")

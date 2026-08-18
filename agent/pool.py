@@ -4,6 +4,12 @@
 Ключ записи — uid = provider:ext_id (не IP: при продлении/замене IP меняется).
 Пропавшие из выдачи провайдера записи помечаются gone=1, но НЕ удаляются:
 при недоступности API работаем на кэше (§10), креды всех известных прокси локально.
+Исключение (П7-2, 1.6.0): провайдер, у которого УДАЛИЛИ КЛЮЧ, выбывает целиком —
+его строки удаляются из пула (см. purge_provider), потому что управлять ими больше
+нечем, а «пропал» на весь кабинет захламлял панель навсегда (жалоба владельца 18.08).
+Держится только строка боевого канала — до планового переключения (states.switch_
+from_provider). gone=1 остаётся мягкой меткой для ЖИВОГО провайдера: его выдача
+может мигнуть (пагинация, сбой на стороне API), и запись вернётся с ролью и историей.
 Роль записи pool никогда не меняет сам — только владелец (исключение: успешный
 apply переводит off->auto, иначе боевой канал невидим подсчёту резерва).
 
@@ -236,7 +242,7 @@ class Pool:
         self.conn.commit()
 
     # ---------- пул ----------
-    def refresh(self, providers, actor="user", active=None):
+    def refresh(self, providers, actor="user", active=None, keep_hosts=None):
         """Слить пул со всех провайдеров. Ошибка одного не роняет остальных.
 
         merge: новые — insert (роль по DEFAULT_ROLE), существующие — update
@@ -245,13 +251,18 @@ class Pool:
         не трогается вообще (работаем на кэше, §10).
 
         active (П7, 🔴 C2): множество провайдеров, у которых ЕСТЬ ключ на диске.
-        Строки провайдеров вне этого множества помечаются gone=1 (без ключа их
-        никто не опросит — иначе они навсегда «живые»). Ориентир — именно ключи,
+        Строки провайдеров вне этого множества УДАЛЯЮТСЯ из пула (П7-2, 1.6.0:
+        без ключа их никто не опросит, не продлит и не проверит — раньше они
+        помечались gone и висели в панели навсегда). Ориентир — именно ключи,
         а НЕ переданный словарь providers: refresh зовётся с подмножеством
         {"proxy6": …} после каждой покупки, и уборка «кого нет в словаре»
         похоронила бы весь пул второго провайдера. None — уборку не делать
         (subset-вызовы постпокупки). Ошибка list() уборку не включает: признак —
         состав ключей, не доступность API.
+
+        keep_hosts (П7-2): хосты, которые удалять нельзя, — боевой канал. Его
+        строка остаётся с gone=1 (панель видит, на чём сидит канал), пока
+        плановое переключение не уведёт трафик к живому провайдеру.
         """
         summary = {"providers": {}, "errors": {}, "stale": {}}
         for name, prov in providers.items():
@@ -293,16 +304,47 @@ class Pool:
         if active is not None:
             known = {r[0] for r in self.conn.execute("SELECT DISTINCT provider FROM proxy")}
             for name in sorted(known - set(active)):
-                cur = self.conn.execute(
-                    "UPDATE proxy SET gone=1 WHERE provider=? AND gone=0", (name,))
-                n = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
-                if n:
-                    summary["stale"][name] = n
+                r = self.purge_provider(name, keep_hosts=keep_hosts)
+                if r["deleted"]:
+                    summary["stale"][name] = r["deleted"]
         self.conn.commit()
         self.log_event("pool-refresh", actor=actor,
                        result="ok" if not summary["errors"] else "partial",
                        detail=json.dumps(summary, ensure_ascii=False))
         return summary
+
+    def purge_provider(self, name, keep_hosts=None):
+        """П7-2 (1.6.0): провайдер без ключа выбывает целиком — его строки удаляются.
+
+        Мягкая метка gone тут не годится: без ключа записи некому воскресить, и
+        «пропал» висел в панели вечно (жалоба владельца 18.08). История замеров
+        (probe_log), деньги (money) и обучение (stability) остаются — это журнал,
+        а не пул; вернётся ключ — refresh вставит прокси заново.
+
+        keep_hosts — хосты, которые удалять нельзя (боевой канал: правило «держать
+        IP» на время манёвра). Такие строки помечаются gone=1 и живут до планового
+        переключения (states.switch_from_provider), после которого их добьёт
+        либо само переключение, либо следующий refresh.
+        -> {"deleted": n, "kept": m}
+        """
+        keep = [h for h in (keep_hosts or ()) if h]
+        if keep:
+            qm = ",".join("?" * len(keep))
+            cur = self.conn.execute(
+                "DELETE FROM proxy WHERE provider=? AND host NOT IN (%s)" % qm,
+                (name, *keep))
+        else:
+            cur = self.conn.execute("DELETE FROM proxy WHERE provider=?", (name,))
+        deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        kept = 0
+        if keep:
+            qm = ",".join("?" * len(keep))
+            cur = self.conn.execute(
+                "UPDATE proxy SET gone=1 WHERE provider=? AND host IN (%s)" % qm,
+                (name, *keep))
+            kept = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        self.conn.commit()
+        return {"deleted": deleted, "kept": kept}
 
     def list(self, include_gone=False, include_off=True):
         q = "SELECT * FROM proxy"

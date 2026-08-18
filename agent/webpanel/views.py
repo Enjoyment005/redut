@@ -166,6 +166,32 @@ label{display:block;margin:11px 0 5px;color:var(--mut);font:500 10px/1.4 var(--m
 .pill.warn{border-color:rgba(255,184,0,.45);color:var(--amber);background:rgba(255,184,0,.08)}
 .ok{color:var(--green)}.bad{color:var(--pink)}.warn{color:var(--amber)}.mut{color:var(--mut)}
 .mono{font-family:var(--mono)}
+
+/* ── прогресс обновления (карточка «Обновления», 1.6.0) ─────────────── */
+.pwrap{margin:10px 0 4px}
+.pbar{position:relative;height:16px;border:1px solid var(--line2);border-radius:9px;overflow:hidden;
+background:rgba(4,8,16,.85);box-shadow:inset 0 1px 4px rgba(0,0,0,.5)}
+.pfill{height:100%;width:0;border-radius:8px 0 0 8px;transition:width .9s ease;
+background:repeating-linear-gradient(-55deg,rgba(255,255,255,.14) 0 9px,rgba(255,255,255,0) 9px 18px),
+linear-gradient(90deg,rgba(0,240,255,.55),rgba(5,255,161,.75));
+background-size:26px 100%,100% 100%;animation:pmove 1.1s linear infinite;
+box-shadow:0 0 12px rgba(5,255,161,.35)}
+.pfill.ok{animation:none;background:linear-gradient(90deg,rgba(5,255,161,.6),rgba(5,255,161,.85))}
+.pfill.bad{background:repeating-linear-gradient(-55deg,rgba(255,255,255,.12) 0 9px,rgba(255,255,255,0) 9px 18px),
+linear-gradient(90deg,rgba(255,42,109,.55),rgba(255,42,109,.8));box-shadow:0 0 12px rgba(255,42,109,.35)}
+@keyframes pmove{to{background-position:26px 0,0 0}}
+.pbar .plabel{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+font:600 10px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:#eaf6ff;
+text-shadow:0 1px 3px rgba(0,0,0,.8)}
+.psteps{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}
+.pstep{flex:1 1 0;min-width:96px;text-align:center;padding:4px 6px;border:1px solid var(--line);
+border-radius:7px;color:var(--dim);font:500 10px/1.5 var(--mono);letter-spacing:.06em;text-transform:uppercase;
+background:rgba(255,255,255,.015)}
+.pstep.done{color:var(--green);border-color:rgba(5,255,161,.4);background:rgba(5,255,161,.06)}
+.pstep.act{color:var(--cyan);border-color:rgba(0,240,255,.5);background:rgba(0,240,255,.07);
+animation:pulse 2.4s infinite}
+.pstep.bad{color:var(--pink);border-color:rgba(255,42,109,.5);background:rgba(255,42,109,.07)}
+@media(prefers-reduced-motion:reduce){.pfill{animation:none}.pstep.act{animation:none}}
 details{border:1px solid var(--line);border-radius:10px;padding:10px 13px;background:rgba(255,255,255,.02);margin-top:12px}
 details summary{cursor:pointer;color:var(--cyan);font:600 12px/1.4 var(--ui);letter-spacing:.08em;text-transform:uppercase}
 details[open] summary{margin-bottom:8px}
@@ -506,7 +532,9 @@ _DASH_HTML = """
       переустанавливается своим же установщиком. <b>Обновление ничего не теряет</b>: доступы устройств,
       пароль панели, ключи провайдеров и рабочий прокси остаются как были — это то же самое повторное
       выполнение команды установки, только автоматом. Если после обновления узел сам себе не понравится
-      (панель не встала, связь пропала) — он <b>откатится на прежнюю версию</b> и напишет письмо.</div>
+      (панель не встала, связь пропала) — он <b>откатится на прежнюю версию</b> и напишет письмо.
+      Когда стоит последняя версия, доступна <b>принудительная переустановка</b> — тот же выпуск ставится
+      заново: лечит узел, если файлы или службы разъехались. Ход установки виден здесь по шагам.</div>
     <div class="grid" id="upd"></div>
     <div id="updbox" class="sub" style="margin-top:9px"></div>
     <div id="updact" style="margin-top:11px"></div>
@@ -900,7 +928,8 @@ async function loadStatus(){const s=await api('/api/status');window.__S=s;
     fb.className='btn '+(s.frozen?'a':'s')}
   beacon(s,window.__CN);
   /* сводки в шапках: свёрнутый раздел всё равно говорит главное */
-  sum('pool','живых прокси: '+(s.pool_alive==null?'?':s.pool_alive));
+  sum('pool','живых прокси: '+(s.pool_alive==null?'?':s.pool_alive)+
+    (s.switch_busy?' · переключаю боевой канал…':''));
   sum('money',Object.entries(s.balances||{}).map(([k,v])=>k+': '+v).join(' · '));
   sum('upd','Редут '+(s.version||'?'));
   geoSync(s);
@@ -947,6 +976,7 @@ async function loadPool(){const rows=(await api('/api/pool')).proxies;const tb=d
     const ports=(p.port_socks5||'—')+(p.port_http&&p.port_http!=p.port_socks5?('/'+p.port_http):'');
     tr.innerHTML=
       '<td>'+id+(p.is_current?' <span class="pill ok">боевой</span>':'')+(p.gone?' <span class="pill bad">пропал</span>':'')+
+        (inact?' <span class="pill warn" title="Ключ провайдера удалён: панель этим прокси не управляет. Боевой канал будет переключён по стратегии автоматически.">без ключа</span>':'')+
         '<div class="sub" style="font-size:10px">'+esc(p.provider)+'</div></td>'+
       '<td>'+esc(country(cc)||'??')+' '+ccBadge(p)+
         (note?'<div class="sub" style="font-size:10px">'+note+'</div>':'')+'</td>'+
@@ -1159,12 +1189,14 @@ async function checkKey(p){toast('Спрашиваю у '+p+' баланс эт�
                 (r.network?' Похоже на недоступность сервиса с сервера, а не на плохой ключ.':'')),r.ok?'ok':'bad');
     await loadKeys();if(r.ok)await loadStatus()}catch(e){toast(e.message,'bad')}}
 
-async function delKey(p){if(!confirm('Убрать ключ '+p+' из панели?\\n\\nПанель перестанет видеть прокси этого '+
-    'провайдера, покупать и продлевать у него. Сам кабинет и уже оплаченные прокси никуда не денутся. '+
+async function delKey(p){if(!confirm('Убрать ключ '+p+' из панели?\\n\\nЕго прокси будут сразу УДАЛЕНЫ из пула — '+
+    'покупать, продлевать и проверять их панели больше нечем. Сам кабинет у провайдера и уже оплаченные '+
+    'прокси никуда не денутся.\\n\\nЕсли боевой канал сейчас на этом провайдере — панель сама переключит его '+
+    'на другого провайдера по текущей стратегии (проверка → переключение → проверка → автооткат).\\n\\n'+
     'Последний оставшийся ключ убрать нельзя — без него панель слепа.'))return;
   try{const r=await api('/api/key',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({provider:p,key:''})});
-    toast('Ключ '+p+' убран'+(r.gone_marked?(': '+r.gone_marked+' его прокси скрыты из пула'):'')+
+    toast('Ключ '+p+' убран'+(r.purged?(': '+r.purged+' его прокси удалены из пула'):'')+
       (r.warning?('. ⚠️ '+r.warning):''),r.warning?'warn':'ok');
     await loadKeys();await loadPool();await loadStatus()}catch(e){toast(e.message,'bad')}}
 
@@ -1172,6 +1204,28 @@ async function delKey(p){if(!confirm('Убрать ключ '+p+' из пане�
 function updWhen(ts){return ts?esc(String(ts).replace('T',' ')):'ещё не проверялось'}
 const UPD_PH={check:'проверяю версию',download:'скачиваю выпуск',backup:'откладываю прежнюю сборку',
   install:'устанавливаю (пара минут)',verify:'проверяю узел после установки',rollback:'ОТКАТЫВАЮСЬ на прежнюю версию'};
+/* прогресс-бар хода обновления (1.6.0): проценты по фазам update.py; внутри фазы
+   точных процентов нет (setup.sh — чёрный ящик), поэтому бар «дышит» анимацией */
+const UPD_PCT={check:6,download:22,backup:40,install:68,verify:88,rollback:88,done:100,failed:100};
+const UPD_STEPS=[['download','скачивание'],['backup','резерв'],['install','установка'],['verify','проверка']];
+function updBar(live){const ph=live.phase||'check';
+  const bad=(ph==='rollback'||ph==='failed');
+  const pct=UPD_PCT[ph]!=null?UPD_PCT[ph]:10;
+  let idx=UPD_STEPS.findIndex(s=>s[0]===ph);
+  if(idx<0)idx=(ph==='done')?UPD_STEPS.length:(bad?UPD_STEPS.length-1:0);
+  const steps=UPD_STEPS.map((s,i)=>{
+    let cls=i<idx?'done':(i===idx?'act':'');
+    if(bad&&i>=idx)cls='bad';
+    return '<span class="pstep '+cls+'">'+s[1]+'</span>'}).join('');
+  const what=(live.frm||live.to)?((live.frm?esc(live.frm):'?')+' → '+esc(live.to||'?')):'';
+  return '<div class="pwrap">'+
+    '<div class="pbar"><div class="pfill'+(bad?' bad':(ph==='done'?' ok':''))+'" style="width:'+pct+'%"></div>'+
+      '<div class="plabel">'+esc(UPD_PH[ph]||ph)+(what?(' · '+what):'')+'</div></div>'+
+    '<div class="psteps">'+steps+'</div>'+
+    '<div class="sub" style="margin-top:6px">'+
+    (bad?('<span class="bad">'+esc(live.why||'проверка не прошла')+'</span> — узел возвращается на прежнюю версию, карточка покажет итог')
+        :'панель может ненадолго перезапуститься — карточка сама дочитает итог')+
+    '</div></div>'}
 async function loadUpd(){let r;try{r=await api('/api/update/status')}
   catch(e){ /* панель могла перезапускаться посреди обновления — тихо пробуем ещё */
     if(window.__UPDBUSY&&!window.__UPDPOLL){window.__UPDPOLL=1;
@@ -1197,7 +1251,7 @@ async function loadUpd(){let r;try{r=await api('/api/update/status')}
   document.getElementById('upd').innerHTML=tiles.join('');
   const box=document.getElementById('updbox');
   const la=r.last_apply||null;
-  if(busy){box.innerHTML='<span class="warn">Идёт обновление: '+esc(UPD_PH[live.phase]||live.phase||'работаю')+'…</span> <span class="mut">панель может ненадолго перезапуститься — карточка сама дочитает итог</span>'}
+  if(busy){box.innerHTML='<span class="warn">Идёт обновление</span>'+updBar(live)}
   else if(r.last_error){box.innerHTML='<span class="warn">Последняя проверка не удалась: '+esc(r.last_error)+'</span>'}
   else if(r.newer&&r.bad){box.innerHTML='<span class="bad">Версия '+esc(r.latest)+' в чёрном списке: обновление на неё уже проваливалось и было откатано. Автоматика её не тронет.</span>'}
   else if(r.newer){box.innerHTML='<span class="warn">Доступна версия '+esc(r.latest)+'.</span> '+(r.auto?'Узел сам обновится в окно '+esc(r.window)+'.':'Автообновление выключено — обнови вручную.')}
@@ -1208,6 +1262,7 @@ async function loadUpd(){let r;try{r=await api('/api/update/status')}
   else{let b='';
     if(r.newer&&!r.bad)b='<button class="btn g" onclick="applyUpd(this)">Обновить сейчас до '+esc(r.latest)+'</button> ';
     else if(r.newer&&r.bad)b='<button class="btn r" onclick="applyUpd(this)" title="Прошлая попытка провалилась и была откатана. Ставить повторно имеет смысл, только если понимаешь, что тогда пошло не так.">Поставить '+esc(r.latest)+' несмотря на прошлый провал</button> ';
+    else if(r.latest&&r.local&&r.latest===r.local)b='<button class="btn s" onclick="applyUpd(this,true)" title="Скачает этот же выпуск с GitHub заново и прогонит установщик — как обычное обновление, только на ту же версию. Лечение узла: если файлы, юниты или кроны разъехались, переустановка вернёт всё по местам. Доступы, ключи и рабочий канал сохранятся.">Переустановить '+esc(r.latest)+' принудительно</button> ';
     b+='<button class="btn s" onclick="toggleAuto()">'+(r.auto?'Выключить':'Включить')+' автообновление</button>';
     act.innerHTML=b}
   const wasBusy=window.__UPDBUSY;window.__UPDBUSY=busy;
@@ -1225,11 +1280,14 @@ async function checkUpd(btn){await openFold('upd');if(btn)btn.disabled=true;toas
     await loadUpd()}
   catch(e){toast('проверка обновлений: '+e.message,'bad')}
   finally{if(btn)btn.disabled=false}}
-async function applyUpd(btn){const r0=window.__UPD||{};
-  if(!confirm('Обновить узел до версии '+(r0.latest||'?')+' прямо сейчас?\\n\\nУзел скачает выпуск с GitHub и переустановит сам себя тем же установщиком: доступы устройств, ключи, пароль панели и рабочий канал сохранятся. Панель на несколько секунд перезапустится. Если что-то главное не поднимется — узел сам откатится на текущую версию.'))return;
-  if(btn)btn.disabled=true;toast('Запускаю обновление…');
-  try{const r=await api('/api/update/apply',{method:'POST'});
-    toast('Обновление до '+(r.started||'')+' запущено. Карточка покажет ход; панель может на минуту перестать отвечать — это нормально.','warn');
+async function applyUpd(btn,force){const r0=window.__UPD||{};
+  const q=force?('Принудительно переустановить версию '+(r0.latest||'?')+'?\\n\\nУзел скачает этот же выпуск с GitHub заново и прогонит установщик — как обычное обновление, только на ту же версию. Это лечение: разъехавшиеся файлы, юниты и кроны вернутся по местам. Доступы устройств, ключи, пароль панели и рабочий канал сохранятся; панель на несколько секунд перезапустится. Если что-то главное не поднимется — узел сам откатится.')
+             :('Обновить узел до версии '+(r0.latest||'?')+' прямо сейчас?\\n\\nУзел скачает выпуск с GitHub и переустановит сам себя тем же установщиком: доступы устройств, ключи, пароль панели и рабочий канал сохранятся. Панель на несколько секунд перезапустится. Если что-то главное не поднимется — узел сам откатится на текущую версию.');
+  if(!confirm(q))return;
+  if(btn)btn.disabled=true;toast(force?'Запускаю принудительную переустановку…':'Запускаю обновление…');
+  try{const r=await api('/api/update/apply',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({force:!!force})});
+    toast((force?'Переустановка ':'Обновление до ')+(r.started||'')+' запущена. Карточка покажет ход по шагам; панель может на минуту перестать отвечать — это нормально.','warn');
     window.__UPDBUSY=1;await loadUpd()}
   catch(e){toast('обновление: '+e.message,'bad');if(btn)btn.disabled=false}}
 async function toggleAuto(){const r0=window.__UPD||{};const to=!r0.auto;

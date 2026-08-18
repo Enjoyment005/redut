@@ -490,34 +490,38 @@ def _event(pool, action, result, detail=""):
         pool.log_event(action, actor="agent", result=result, detail=detail)
 
 
-def apply(cfg, pool=None, alerter=None, log=None, target=None, manual=False):
+def apply(cfg, pool=None, alerter=None, log=None, target=None, manual=False, force=False):
     """Скачать и накатить версию (по умолчанию — свежую с маяка) с бэкапом и откатом.
 
     manual=True — человек (кнопка/CLI): можно ставить версию из чёрного списка
     (сознательный повтор) и не требуется «здоровый» baseline. Автоматика — False.
-    Одна попытка; возвращает dict {ok, from, to, rolled_back, why}."""
+    force=True (только вместе с manual, 1.6.0) — принудительная переустановка ТОЙ ЖЕ
+    версии: скачать выпуск заново и прогнать установщик — лечение узла, у которого
+    что-то разъехалось. Анти-даунгрейд (Р3) force НЕ отменяет: версии ниже узла
+    не ставятся никогда. Одна попытка; возвращает dict {ok, from, to, rolled_back, why}."""
     log = log or (lambda m: None)
     res = {"ok": False, "from": node_version(), "to": target, "rolled_back": False, "why": ""}
     import apply as apply_mod          # лениво: fcntl только на POSIX
     try:
         with apply_mod.Flock(LOCK_PATH):
-            return _apply_locked(cfg, pool, alerter, log, target, manual, res)
+            return _apply_locked(cfg, pool, alerter, log, target, manual, res, force)
     except apply_mod.ApplyError:
         res["why"] = "обновление уже идёт (занят %s)" % LOCK_PATH
         log(res["why"])
         return res
 
 
-def _apply_locked(cfg, pool, alerter, log, target, manual, res):
+def _apply_locked(cfg, pool, alerter, log, target, manual, res, force=False):
     u = update_cfg(cfg)
     local = res["from"]
+    force = bool(force and manual)     # у автоматики принудительного режима нет
     if not target:
         r = check(cfg, pool=pool, alerter=None, log=log)
         if r["error"]:
             res["why"] = r["error"]
             status_write("error", why=res["why"])
             return res
-        if not r["newer"]:
+        if not r["newer"] and not (force and r["remote"] == local):
             res["why"] = "обновляться не на что (узел %s, маяк %s)" % (local or "?", r["remote"])
             status_write("idle", why=res["why"])
             log(res["why"])
@@ -525,10 +529,18 @@ def _apply_locked(cfg, pool, alerter, log, target, manual, res):
         target = r["remote"]
     res["to"] = target
     if not is_newer(target, local):
-        res["why"] = "версия %s не новее узла (%s) — обновляемся только вверх" % (target, local or "?")
-        status_write("error", why=res["why"])
-        log(res["why"])
-        return res
+        # force разрешает ровно один «не вверх» случай: переустановку ТЕКУЩЕЙ версии
+        # (target == local). Даунгрейд запрещён и с force (анти-даунгрейд Р3).
+        if force and target == local:
+            log("принудительная переустановка %s: та же версия заново (лечение узла)" % target)
+        else:
+            res["why"] = ("версия %s не новее узла (%s) — обновляемся только вверх%s"
+                          % (target, local or "?",
+                             "; принудительно можно переустановить только ТУ ЖЕ версию"
+                             if force else ""))
+            status_write("error", why=res["why"])
+            log(res["why"])
+            return res
     st = load_state(cfg)
     if target in (st.get("bad_versions") or []) and not manual:
         res["why"] = ("версия %s в чёрном списке (обновление на неё уже проваливалось) — "
@@ -567,7 +579,7 @@ def _apply_locked(cfg, pool, alerter, log, target, manual, res):
     import apply as apply_mod
     try:
         with apply_mod.Flock((cfg or {}).get("lock") or "/run/vpn-agent.lock"):
-            return _apply_install(cfg, pool, alerter, log, target, manual, res, baseline)
+            return _apply_install(cfg, pool, alerter, log, target, manual, res, baseline, force)
     except apply_mod.ApplyError:
         res["why"] = "агент занят (ротация?) — обновление отложено, попробуй через пару минут"
         status_write("failed", why=res["why"], to=target)
@@ -576,7 +588,7 @@ def _apply_locked(cfg, pool, alerter, log, target, manual, res):
         return res
 
 
-def _apply_install(cfg, pool, alerter, log, target, manual, res, baseline):
+def _apply_install(cfg, pool, alerter, log, target, manual, res, baseline, force=False):
     """Установка скачанного дерева + проверка + откат. Вызывается под ДВУМЯ локами
     (redut-update и vpn-agent)."""
     local = res["from"]
@@ -584,7 +596,10 @@ def _apply_install(cfg, pool, alerter, log, target, manual, res, baseline):
     status_write("backup", to=target, frm=local)
     src_ver = node_version(paths=[os.path.join(REDUT_SRC, "VERSION")]) \
         if os.path.isdir(REDUT_SRC) else None
-    if src_ver == target and os.path.isdir(REDUT_PREV):
+    # При force ветка «след недоустановки» не годится: src_ver == target там ПО
+    # ОПРЕДЕЛЕНИЮ (переустанавливаем версию узла), а живое дерево — не «битое»,
+    # это лучшая цель отката для сознательной переустановки.
+    if src_ver == target and os.path.isdir(REDUT_PREV) and not force:
         # След прошлой недоустановки ТОЙ ЖЕ версии (kill посреди setup.sh): настоящий
         # «до» уже лежит в prev — не затирать его полуустановленным деревом, иначе
         # откат поехал бы на ту же битую версию (ревью 17.08).
@@ -623,10 +638,13 @@ def _apply_install(cfg, pool, alerter, log, target, manual, res, baseline):
         res["ok"] = True
         st = load_state(cfg)
         st["last_apply"] = {"ts": now_iso(), "from": local, "to": target,
-                            "ok": True, "manual": manual}
+                            "ok": True, "manual": manual, "force": bool(force)}
         save_state(cfg, st)
         status_write("done", ok=True, to=target, frm=local)
-        _event(pool, "update-apply", target, "с %s%s" % (local or "?", ", вручную" if manual else ""))
+        _event(pool, "update-apply", target,
+               "с %s%s" % (local or "?",
+                           ", принудительная переустановка" if force and target == local
+                           else (", вручную" if manual else "")))
         if alerter is not None:
             alerter.send("Редут обновлён до %s" % target,
                          "Узел «%s» обновился: %s -> %s.\nКлиенты, ключи и канал не тронуты; "
@@ -661,11 +679,16 @@ def _apply_install(cfg, pool, alerter, log, target, manual, res, baseline):
         log("Прежнего дерева нет (%s) — откатывать нечем, нужен человек" % REDUT_PREV)
 
     st = load_state(cfg)
-    bad = set(st.get("bad_versions") or [])
-    bad.add(target)
-    st["bad_versions"] = sorted(bad)
+    # Чёрный список — про «на эту версию не ОБНОВЛЯТЬСЯ»: провал переустановки ТОЙ ЖЕ
+    # версии (force) туда не пишем — автоматика на неё и так не пойдёт (не новее),
+    # а помечать работающую версию узла «проблемной» — только путать карточку.
+    if target != local:
+        bad = set(st.get("bad_versions") or [])
+        bad.add(target)
+        st["bad_versions"] = sorted(bad)
     st["last_apply"] = {"ts": now_iso(), "from": local, "to": target, "ok": False,
-                        "rolled_back": rolled, "why": why_v, "manual": manual}
+                        "rolled_back": rolled, "why": why_v, "manual": manual,
+                        "force": bool(force)}
     save_state(cfg, st)
     res.update(rolled_back=rolled, why=why_v)
     status_write("failed", why=why_v, rolled_back=rolled, to=target, frm=local)

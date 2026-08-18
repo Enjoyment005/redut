@@ -179,14 +179,16 @@ def cmd_pool_refresh(cfg, args):
         print("Нет ключей провайдеров (secrets: %s)" % (src or "не найден"))
         return 1
     p = open_pool(cfg)
+    current_host = apply_mod.current_upstream(read_singbox(cfg) or {})
     # active = провайдеры с ключом на диске (make_providers создаёт адаптер только при
-    # ключе) — строки осиротевших провайдеров уходят в gone (П7, 🔴 C2)
-    summary = p.refresh(providers, actor="user", active=set(providers))
+    # ключе) — строки осиротевших провайдеров удаляются из пула (П7-2), кроме боевого
+    summary = p.refresh(providers, actor="user", active=set(providers),
+                        keep_hosts={current_host} if current_host else None)
     for name, s in summary["providers"].items():
         print("%-10s: всего %d, новых %d, обновлено %d, gone %d"
               % (name, s["total"], s["added"], s["updated"], s["gone"]))
     for name, n in (summary.get("stale") or {}).items():
-        print("%-10s: ключа больше нет — %d строк помечено gone" % (name, n))
+        print("%-10s: ключа больше нет — %d строк удалено из пула" % (name, n))
     for name, err in summary["errors"].items():
         print("%-10s: ОШИБКА — %s" % (name, err))
     for name, prov in providers.items():
@@ -212,9 +214,19 @@ def cmd_pool_refresh(cfg, args):
     except Exception as e:
         print("egress-метка не обновлена (не критично): %s" % e)
 
+    # П7-2: боевой канал сидит на провайдере без ключа (ключ удалили, а переключение
+    # тогда не удалось или было на паузе) — пробуем увести его по стратегии каждым
+    # тиком, пока не получится. При живом канале rotate этого не сделает никогда.
+    row = next((r for r in p.list(include_gone=True) if r["host"] == current_host),
+               None) if current_host else None
+    if row is not None and row["provider"] not in providers:
+        r = states_mod.switch_from_provider(cfg, providers, p, _make_alerter(cfg, secrets),
+                                            row["provider"], log=print, actor="auto",
+                                            reason="pool-refresh")
+        print("боевой у провайдера без ключа (%s): %s" % (row["provider"], r["detail"]))
+
     if getattr(args, "probe", False):
         # cron раз в 2 ч (E2): держим кандидатов проверенными заранее (§6.0) + N+1 (§6.5)
-        current_host = apply_mod.current_upstream(read_singbox(cfg) or {})
         rows = p.candidates()
         ok = 0
         for row in rows:
@@ -724,6 +736,28 @@ def cmd_emergency(cfg, args):
     return 0
 
 
+def cmd_switch_provider(cfg, args):
+    """П7-2: увести боевой канал с провайдера, у которого удалили ключ.
+
+    Зовёт панель транзиентным юнитом сразу после удаления ключа (redut-switch);
+    ретраи — pool-refresh. Канал живой, поэтому rotate не годится («делать нечего») —
+    здесь путь «В бой»: кандидаты по стратегии, проба, apply с verify и автооткатом."""
+    secrets, _ = load_secrets()
+    providers = make_providers(secrets)
+    p = open_pool(cfg)
+    name = args.from_provider
+    if name in providers:
+        print("У %s есть ключ — переключение не требуется" % name)
+        p.close()
+        return 0
+    r = states_mod.switch_from_provider(cfg, providers, p, _make_alerter(cfg, secrets),
+                                        name, log=print, actor="user",
+                                        reason=args.reason or "key-removed")
+    print("=> %s" % r["detail"])
+    p.close()
+    return 0 if r["ok"] else 1
+
+
 def cmd_self_update(cfg, args):
     """Система обновлений (vpn/UPDATE-PLAN.md).
 
@@ -755,7 +789,8 @@ def cmd_self_update(cfg, args):
             return 0
         if args.apply_now:
             r = update_mod.apply(cfg, pool=p, alerter=alerter, log=log,
-                                 target=args.to_version, manual=True)
+                                 target=args.to_version, manual=True,
+                                 force=getattr(args, "force_apply", False))
             if r["ok"]:
                 print("Узел обновлён: Редут %s -> %s." % (r["from"] or "?", r["to"]))
                 return 0
@@ -833,6 +868,11 @@ def main(argv=None):
     sp.add_argument("--force", action="store_true", help="игнорировать паузу FROZEN и тайминг аварии")
     sp = sub.add_parser("emergency", help="аварийный режим вкл/выкл (прямой выход через WAN §8)")
     sp.add_argument("state", choices=["on", "off"])
+    sp = sub.add_parser("switch-provider",
+                        help="П7-2: увести боевой канал с провайдера без ключа (после удаления ключа)")
+    sp.add_argument("--from", dest="from_provider", required=True,
+                    help="провайдер, с которого уходим (proxy6|proxyline)")
+    sp.add_argument("--reason", help="источник вызова (панель пишет key-removed)")
     sub.add_parser("heartbeat-check", help="проверить пульс агента (§6.3); письмо, если нет цикла >24ч")
     sub.add_parser("auto-prolong", help="⚠️ продлить боевой прокси до истечения (§6.3, деньги; крон раз в сутки)")
     sp = sub.add_parser("self-update", help="обновления с GitHub (UPDATE-PLAN): проверить маяк / применить")
@@ -841,6 +881,9 @@ def main(argv=None):
                     help="скачать и установить (бэкап -> UPDATE=1 setup.sh -> verify -> откат при провале)")
     sp.add_argument("--version", dest="to_version",
                     help="какую версию ставить (по умолчанию — свежая с маяка; строго новее узла)")
+    sp.add_argument("--force", dest="force_apply", action="store_true",
+                    help="вместе с --apply: переустановить ТУ ЖЕ версию заново (лечение узла); "
+                         "даунгрейд запрещён и с этим флагом")
     sp.add_argument("--cron", action="store_true",
                     help="режим планировщика: jitter -> check -> apply при авто+окне (крон 04:41)")
     args = ap.parse_args(argv)
@@ -850,6 +893,7 @@ def main(argv=None):
                 "probe": cmd_probe, "apply": cmd_apply, "rollback": cmd_rollback,
                 "buy": cmd_buy, "prolong": cmd_prolong, "drop": cmd_drop,
                 "rotate": cmd_rotate, "emergency": cmd_emergency,
+                "switch-provider": cmd_switch_provider,
                 "heartbeat-check": cmd_heartbeat_check, "auto-prolong": cmd_auto_prolong,
                 "self-update": cmd_self_update, "egress-mark": cmd_egress_mark}
     try:

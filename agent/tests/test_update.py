@@ -527,6 +527,75 @@ class TestApplyOrchestration(unittest.TestCase):
         self.assertTrue(r["rolled_back"])
         self.assertIn("Откат прошёл", self.alerter.sent[0][1])
 
+    # ── принудительная переустановка (1.6.0): та же версия заново, лечение узла ──
+    def test_force_reinstall_same_version(self):
+        self.verify_q[:] = [(True, "")]
+        r = update.apply(self.cfg, pool=self.pool, alerter=self.alerter,
+                         target="1.2.0", manual=True, force=True)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(self.setup_runs, ["1.2.0"])
+        self.assertEqual(self._tree_ver(update.REDUT_SRC), "1.2.0")
+        # цель отката — ЖИВОЕ дерево, что работало до переустановки
+        self.assertEqual(self._tree_ver(update.REDUT_PREV), "1.2.0")
+        st = update.load_state(self.cfg)
+        self.assertTrue(st["last_apply"]["ok"])
+        self.assertTrue(st["last_apply"]["force"])
+
+    def test_force_downgrade_still_refused(self):
+        # анти-даунгрейд (Р3) force не отменяет: вниз — никогда
+        r = update.apply(self.cfg, pool=self.pool, alerter=self.alerter,
+                         target="1.1.0", manual=True, force=True)
+        self.assertFalse(r["ok"])
+        self.assertIn("не новее", r["why"])
+        self.assertEqual(self.setup_runs, [])
+
+    def test_force_needs_manual(self):
+        # у автоматики принудительного режима нет: force без manual — обычный отказ
+        r = update.apply(self.cfg, pool=self.pool, alerter=self.alerter,
+                         target="1.2.0", manual=False, force=True)
+        self.assertFalse(r["ok"])
+        self.assertIn("не новее", r["why"])
+        self.assertEqual(self.setup_runs, [])
+
+    def test_force_reinstall_ignores_leftover_prev(self):
+        # В prev лежит прошлая версия (1.1.0). Ветка «след недоустановки» здесь
+        # сработать не должна: src_ver == target при force — норма, а не признак
+        # битого дерева; откат обязан целиться в живое 1.2.0, не в 1.1.0 (даунгрейд).
+        self._mktree(update.REDUT_PREV, "1.1.0")
+        self.verify_q[:] = [(True, "")]
+        r = update.apply(self.cfg, pool=self.pool, alerter=self.alerter,
+                         target="1.2.0", manual=True, force=True)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(self._tree_ver(update.REDUT_PREV), "1.2.0")
+
+    def test_force_failed_reinstall_rolls_back_without_blacklist(self):
+        # Провал переустановки ТОЙ ЖЕ версии: откат на прежнее живое дерево, а в
+        # чёрный список версию узла не пишем (список — про «не обновляться НА»).
+        self.verify_q[:] = [(False, "панель не отвечает"), (True, "")]
+        r = update.apply(self.cfg, pool=self.pool, alerter=self.alerter,
+                         target="1.2.0", manual=True, force=True)
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["rolled_back"], r)
+        self.assertEqual(self.setup_runs, ["1.2.0", "1.2.0"])
+        self.assertNotIn("1.2.0", update.load_state(self.cfg).get("bad_versions") or [])
+
+    def test_force_apply_from_beacon_same_version(self):
+        # target не задан: без force маяк «не новее» = отказ, с force — переустановка
+        orig = update.check
+        update.check = lambda cfg, **kw: {"local": "1.2.0", "remote": "1.2.0",
+                                          "newer": False, "bad": False, "error": None}
+        try:
+            r0 = update.apply(self.cfg, pool=self.pool, alerter=self.alerter, manual=True)
+            self.assertFalse(r0["ok"])
+            self.assertIn("не на что", r0["why"])
+            self.verify_q[:] = [(True, "")]
+            r = update.apply(self.cfg, pool=self.pool, alerter=self.alerter,
+                             manual=True, force=True)
+            self.assertTrue(r["ok"], r)
+            self.assertEqual(r["to"], "1.2.0")
+        finally:
+            update.check = orig
+
 
 class TestWindowAndCron(unittest.TestCase):
     def test_in_window_plain(self):

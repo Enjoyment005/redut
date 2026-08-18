@@ -199,7 +199,8 @@ class TestRolesV2Migration(unittest.TestCase):
 
 
 class TestRefreshActiveCleanup(unittest.TestCase):
-    """П7 (🔴 C2): уборка осиротевших провайдеров — по ключам на диске, не по словарю."""
+    """П7 (🔴 C2) + П7-2 (1.6.0): уборка осиротевших провайдеров — по ключам на
+    диске, не по словарю; строки провайдера без ключа УДАЛЯЮТСЯ (кроме боевого)."""
 
     def setUp(self):
         fd, self.db = tempfile.mkstemp(suffix=".db")
@@ -215,6 +216,9 @@ class TestRefreshActiveCleanup(unittest.TestCase):
     def alive_providers(self):
         return {r["provider"] for r in self.pool.list(include_gone=False)}
 
+    def all_providers(self):
+        return {r["provider"] for r in self.pool.list(include_gone=True)}
+
     def test_subset_refresh_does_not_bury_other_provider(self):
         # кейс 🔴 C2: покупка у proxy6 зовёт refresh({"proxy6": …}) БЕЗ active —
         # строки ProxyLine обязаны остаться живыми
@@ -227,13 +231,29 @@ class TestRefreshActiveCleanup(unittest.TestCase):
                           active={"proxy6", "proxyline"})
         self.assertIn("proxyline", self.alive_providers())
 
-    def test_orphan_provider_marked_gone(self):
-        # ключ ProxyLine удалён: полный refresh с active={proxy6} хоронит его строки
+    def test_orphan_provider_rows_deleted(self):
+        # ключ ProxyLine удалён: полный refresh с active={proxy6} УДАЛЯЕТ его строки
+        # (П7-2: раньше — gone, и «пропал» висел в панели навсегда)
         s = self.pool.refresh({"proxy6": FakeProvider("proxy6", p6_items())},
                               active={"proxy6"})
-        self.assertNotIn("proxyline", self.alive_providers())
+        self.assertNotIn("proxyline", self.all_providers(), "строки удалены, не спрятаны")
         self.assertIn("proxy6", self.alive_providers())
         self.assertGreater(s["stale"].get("proxyline", 0), 0)
+
+    def test_orphan_battle_host_survives_as_gone(self):
+        # боевой канал на осиротевшем провайдере: его строку держим (gone=1),
+        # пока плановое переключение не уведёт трафик — иначе панель слепнет
+        battle = self.pool.list(include_gone=True)
+        battle = next(r for r in battle if r["provider"] == "proxyline")
+        s = self.pool.refresh({"proxy6": FakeProvider("proxy6", p6_items())},
+                              active={"proxy6"}, keep_hosts={battle["host"]})
+        rest = [r for r in self.pool.list(include_gone=True) if r["provider"] == "proxyline"]
+        self.assertEqual([r["uid"] for r in rest], [battle["uid"]], "выжил только боевой")
+        self.assertEqual(rest[0]["gone"], 1, "и он помечен «пропал»")
+        # повторный refresh не жужжит: удалять больше нечего
+        s2 = self.pool.refresh({"proxy6": FakeProvider("proxy6", p6_items())},
+                               active={"proxy6"}, keep_hosts={battle["host"]})
+        self.assertEqual(s2["stale"], {})
 
     def test_provider_error_with_key_not_buried(self):
         # ошибка API при ЖИВОМ ключе — не повод хоронить кэш (§10)
@@ -243,6 +263,52 @@ class TestRefreshActiveCleanup(unittest.TestCase):
         self.assertIn("proxy6", self.alive_providers())
         self.assertIn("proxy6", s["errors"])
         self.assertEqual(s["stale"], {})
+
+
+class TestPurgeProvider(unittest.TestCase):
+    """П7-2: purge_provider — точечное выселение провайдера без ключа."""
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.pool = pool_mod.Pool(self.db, server="test")
+        self.pool.refresh({"proxy6": FakeProvider("proxy6", p6_items()),
+                           "proxyline": FakeProvider("proxyline", pl_items())})
+
+    def tearDown(self):
+        self.pool.close()
+        os.unlink(self.db)
+
+    def test_purge_all_rows_of_provider(self):
+        n_pl = len([r for r in self.pool.list(include_gone=True) if r["provider"] == "proxyline"])
+        r = self.pool.purge_provider("proxyline")
+        self.assertEqual(r, {"deleted": n_pl, "kept": 0})
+        left = {x["provider"] for x in self.pool.list(include_gone=True)}
+        self.assertNotIn("proxyline", left)
+        self.assertIn("proxy6", left, "чужие строки не тронуты")
+
+    def test_purge_keeps_battle_host(self):
+        battle = next(r for r in self.pool.list(include_gone=True)
+                      if r["provider"] == "proxyline")
+        r = self.pool.purge_provider("proxyline", keep_hosts={battle["host"]})
+        self.assertEqual(r["kept"], 1)
+        rest = [x for x in self.pool.list(include_gone=True) if x["provider"] == "proxyline"]
+        self.assertEqual([x["uid"] for x in rest], [battle["uid"]])
+        self.assertEqual(rest[0]["gone"], 1)
+
+    def test_history_survives_purge(self):
+        # журналы — не пул: probe_log/money/stability переживают выселение
+        row = next(r for r in self.pool.list(include_gone=True) if r["provider"] == "proxyline")
+        self.pool.record_probe(row["uid"], {"ok": True, "latency_ms": 100, "score": 50})
+        self.pool.record_money("proxyline", "buy", row["uid"], 1.0, "USD")
+        self.pool.purge_provider("proxyline")
+        n_log = self.pool.conn.execute(
+            "SELECT COUNT(*) FROM probe_log WHERE provider='proxyline'").fetchone()[0]
+        n_money = self.pool.conn.execute(
+            "SELECT COUNT(*) FROM money WHERE provider='proxyline'").fetchone()[0]
+        self.assertGreater(n_log, 0)
+        self.assertGreater(n_money, 0)
+        self.assertIsNotNone(self.pool.stability_get("proxyline", row["country"]))
 
 
 if __name__ == "__main__":
