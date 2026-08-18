@@ -14,7 +14,10 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webpanel"))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import re  # noqa: E402
+from unittest import mock  # noqa: E402
 import alerts  # noqa: E402
+from test_alerts import _FakeSMTP  # noqa: E402
 import server  # noqa: E402
 
 
@@ -144,54 +147,128 @@ class _FakeHandler:
 
     _do_key_delete = server.Handler._do_key_delete
     _setup_smtp = server.Handler._setup_smtp
+    _setup_smtp_test = server.Handler._setup_smtp_test
+    _smtp_fields = server.Handler._smtp_fields
+    CODE_TTL_S = server.Handler.CODE_TTL_S
+    CODE_TRIES = server.Handler.CODE_TRIES
 
 
 
 class TestSetupSmtp(_AppHarness):
-    """Шаг 4 мастера: молча принять почту, с которой письма не уйдут, — нельзя.
+    """Шаг 4 мастера: почта включается только после РЕАЛЬНОЙ проверки связи кодом.
 
-    Ровно так и случилось на node2 18.08: «от кого» осталось пустым, `configured`
-    требовал его — и все алерты выключились, ничего об этом не сказав.
+    Дважды узел оставался без алертов молча (пустой «from» 18.08; логин-не-адрес), поэтому
+    «сохранено» теперь означает «письмо дошло»: мастер шлёт код на ящик и ждёт его обратно.
     """
 
-    def save(self, **body):
+    GOOD = {"host": "mail.example.com", "port": "587", "user": "box@example.com",
+            "password": "x", "to": "me@example.com"}
+
+    def call(self, method, body):
         h = _FakeHandler()
-        h._setup_smtp(body)
+        getattr(h, method)(body)
         return h.resp
 
-    def test_login_is_email_no_from_needed(self):
-        code, r = self.save(host="mail.example.com", port="587", user="box@example.com",
-                            password="x", to="me@example.com")
+    def send_test(self, **over):
+        """Нажать «Проверить связь» с подменённым SMTP-транспортом."""
+        body = dict(self.GOOD, **over)
+        with mock.patch.object(alerts.smtplib, "SMTP", _FakeSMTP):
+            return self.call("_setup_smtp_test", body)
+
+    @staticmethod
+    def code_from_letter():
+        """Код, который человек увидит в письме."""
+        msg = _FakeSMTP.last.sent[-1]
+        return re.search(r"Код проверки: (\d{6})", msg.get_content()).group(1)
+
+    def test_test_sends_letter_and_saves_nothing(self):
+        code, r = self.send_test()
+        self.assertEqual(code, 200, r)
+        self.assertEqual(r["to"], "me@example.com")
+        self.assertIn("smtp_pending", server.APP.setup)
+        self.assertNotIn("smtp", server.APP.setup, "до подтверждения почта НЕ включена")
+        self.assertNotIn("smtp_done", server.APP.setup)
+
+    def test_save_without_test_refused(self):
+        code, r = self.call("_setup_smtp", dict(self.GOOD))
+        self.assertEqual(code, 400)
+        self.assertTrue(r.get("need_test"), "форма обязана позвать на проверку связи")
+        self.assertNotIn("smtp", server.APP.setup)
+
+    def test_code_from_letter_enables_mail(self):
+        self.send_test()
+        body = dict(self.GOOD, code=self.code_from_letter())
+        code, r = self.call("_setup_smtp", body)
         self.assertEqual(code, 200, r)
         saved = server.APP.setup["smtp"]
-        self.assertNotIn("from", saved, "пустой «from» в secrets.json не нужен")
-        self.assertTrue(alerts.Alerter(smtp=saved).configured, "письма обязаны уходить")
+        self.assertTrue(server.APP.setup["smtp_done"])
+        self.assertNotIn("smtp_pending", server.APP.setup)
+        self.assertTrue(alerts.Alerter(smtp=saved).configured)
+        self.assertNotIn("from", saved, "логин и есть адрес — лишнего в secrets.json не пишем")
+
+    def test_wrong_code_refused_and_limited(self):
+        self.send_test()
+        for _ in range(server.Handler.CODE_TRIES):
+            code, r = self.call("_setup_smtp", dict(self.GOOD, code="000000"))
+            self.assertEqual(code, 400)
+        self.assertNotIn("smtp", server.APP.setup)
+        # попытки исчерпаны -> ожидание сброшено, нужна новая проверка связи
+        code, r = self.call("_setup_smtp", dict(self.GOOD, code="000000"))
+        self.assertTrue(r.get("need_test"))
+
+    def test_expired_code_asks_for_new_test(self):
+        self.send_test()
+        server.APP.setup["smtp_pending"]["at"] -= server.Handler.CODE_TTL_S + 1
+        code, r = self.call("_setup_smtp", dict(self.GOOD, code=self.code_from_letter()))
+        self.assertEqual(code, 400)
+        self.assertTrue(r.get("need_test"))
+
+    def test_edited_fields_require_new_test(self):
+        self.send_test()
+        body = dict(self.GOOD, to="other@example.com", code=self.code_from_letter())
+        code, r = self.call("_setup_smtp", body)
+        self.assertEqual(code, 400)
+        self.assertTrue(r.get("need_test"), "проверяли один ящик — сохранить другой нельзя")
+        self.assertNotIn("smtp", server.APP.setup)
+
+    def test_unreachable_server_reports_reason(self):
+        def boom(*a, **kw):
+            raise OSError("Connection refused")
+        with mock.patch.object(alerts.smtplib, "SMTP", boom):
+            code, r = self.call("_setup_smtp_test", dict(self.GOOD))
+        self.assertEqual(code, 400)
+        self.assertIn("не ушло", r["error"])
+        self.assertIn("Connection refused", r["error"], "человеку нужна причина, а не «ошибка»")
+        self.assertNotIn("smtp_pending", server.APP.setup)
 
     def test_login_not_email_asks_for_sender(self):
         # логины вида u123456 / apikey / postmaster — обычное дело у хостеров
-        code, r = self.save(host="smtp.example.com", port="587", user="u123456",
-                            password="x", to="me@example.com")
+        code, r = self.send_test(user="u123456")
         self.assertEqual(code, 400)
         self.assertTrue(r.get("need_from"), "форма должна показать поле отправителя")
-        self.assertNotIn("smtp", server.APP.setup, "негодную почту не сохраняем")
 
     def test_login_not_email_but_sender_given(self):
-        code, r = self.save(host="smtp.example.com", port="587", user="u123456", password="x",
-                            **{"from": "vpn@example.com", "to": "me@example.com"})
+        code, r = self.send_test(user="u123456", **{"from": "vpn@example.com"})
         self.assertEqual(code, 200, r)
-        self.assertTrue(alerts.Alerter(smtp=server.APP.setup["smtp"]).configured)
+        code, r = self.call("_setup_smtp", dict(self.GOOD, user="u123456",
+                                                **{"from": "vpn@example.com",
+                                                   "code": self.code_from_letter()}))
+        self.assertEqual(code, 200, r)
+        self.assertEqual(server.APP.setup["smtp"]["from"], "vpn@example.com")
 
     def test_display_name_as_sender_rejected(self):
-        code, r = self.save(host="mail.example.com", port="587", user="box@example.com",
-                            password="x", **{"from": "Vpn000", "to": "me@example.com"})
+        code, r = self.send_test(**{"from": "Vpn000"})
+        self.assertEqual(code, 400)
+
+    def test_bad_recipient_rejected(self):
+        code, r = self.send_test(to="не-адрес")
         self.assertEqual(code, 400)
 
     def test_skip_keeps_wizard_moving(self):
-        code, r = self.save(skip=True)
+        code, r = self.call("_setup_smtp", {"skip": True})
         self.assertEqual(code, 200)
         self.assertTrue(server.APP.setup["smtp_done"])
         self.assertNotIn("smtp", server.APP.setup)
-
 
 class TestKeyDelete(_AppHarness):
     """П7: удаление ключа выключает провайдера целиком (gone + баланс + кандидаты)."""

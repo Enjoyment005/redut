@@ -46,6 +46,7 @@ class Alerter:
         self.log = log or _stderr
         self.mask = mask or (lambda s: s)
         self.timeout = timeout
+        self.last_error = ""              # почему не ушло последнее письмо (для мастера)
 
     @property
     def configured(self):
@@ -61,7 +62,9 @@ class Alerter:
     # ------------------------------------------------------------- транспорт
     def _send(self, subject, body):
         """Собрать и отправить письмо. Любой сбой -> False (не бросаем)."""
+        self.last_error = ""
         if not self.configured:
+            self.last_error = "почта не настроена"
             self.log("SMTP не настроен — письмо «%s» не отправлено (это не ошибка)" % subject)
             return False
         s = self.smtp
@@ -80,6 +83,7 @@ class Alerter:
             elif _valid_email(login):
                 from_hdr = formataddr((raw_from, login)) if raw_from else login
             else:
+                self.last_error = "нет адреса, с которого слать"
                 self.log("SMTP from-адрес «%s» невалиден, а валидного user для подмены нет "
                          "— письмо «%s» не отправлено (это не ошибка)" % (raw_from, subject))
                 return False
@@ -112,7 +116,8 @@ class Alerter:
             return True
         except Exception as e:
             # Маскируем и текст ошибки: в него мог попасть логин/хост.
-            self.log("НЕ удалось отправить письмо «%s»: %s" % (subject, self.mask(str(e))))
+            self.last_error = self.mask(str(e))
+            self.log("НЕ удалось отправить письмо «%s»: %s" % (subject, self.last_error))
             return False
 
     def send(self, subject, body):

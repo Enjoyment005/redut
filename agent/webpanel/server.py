@@ -1249,6 +1249,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._setup_totp_verify(body)
             if path == "/api/setup/provider":
                 return self._setup_provider(body)
+            if path == "/api/setup/smtp/test":
+                return self._setup_smtp_test(body)
             if path == "/api/setup/smtp":
                 return self._setup_smtp(body)
             if path == "/api/setup/finish":
@@ -1320,42 +1322,106 @@ class Handler(BaseHTTPRequestHandler):
         APP.setup["providers"] = keys
         return self._json(200, {"result": res})
 
-    def _setup_smtp(self, body):
-        if body.get("skip"):
-            APP.setup.pop("smtp", None)
-            APP.setup["smtp_done"] = True
-            return self._json(200, {"skipped": True})
+    # Почта включается ТОЛЬКО после реальной проверки связи: мастер шлёт код на ящик,
+    # человек вписывает его обратно. Так «сохранено» означает «письма правда доходят», а не
+    # «поля заполнены» — до этого узел дважды оставался без алертов, ничего об этом не сказав
+    # (пустой «from» 18.08, логины-не-адреса). Обойти можно только явным «Пропустить».
+    CODE_TTL_S = 20 * 60          # письмо может идти минуты — не торопим
+    CODE_TRIES = 5                # защита от подбора шестизначного кода
+
+    def _smtp_fields(self, body):
+        """(smtp, ошибка) — разбор и проверки полей шага «почта».
+
+        Ошибка возвращается СЛОВАРЁМ для _json(400, …), а не готовым ответом: _json ничего
+        не возвращает, и «return None, self._json(...)» не прерывал бы вызывающего — тот
+        дописал бы в тот же ответ второе тело (поймано тестом 18.08).
+        """
         smtp = {k: body.get(k) for k in ("host", "port", "user", "password", "from", "to")}
         if not (smtp["host"] and smtp["to"]):
-            return self._json(400, {"error": "нужны минимум host и to (или «Пропустить»)"})
+            return None, {"error": "нужны минимум host и to (или «Пропустить»)"}
         try:
             smtp["port"] = int(smtp["port"] or 587)
         except (TypeError, ValueError):
-            return self._json(400, {"error": "порт — число"})
+            return None, {"error": "порт — число"}
         # Адрес получателя проверяем на входе, а не когда первый алерт молча не уйдёт
         # (501 Invalid MAIL FROM): «to» должен быть настоящим e-mail.
         if not alerts_mod._valid_email(smtp["to"]):
-            return self._json(400, {"error": "«to» — не похоже на e-mail адрес (например you@example.com)"})
-        # «from» мастер больше НЕ спрашивает (18.08): у обычного узла адрес отправителя равен
-        # логину SMTP, а поле дважды поняли как «подпись письма» и упирались в отказ. Ключ
-        # остаётся в API для редкого случая ящика-алиаса (правка secrets.json руками) — тогда
-        # он обязан быть адресом, иначе alerts.py всё равно откатится на логин.
+            return None, {"error": "«кому слать» — не похоже на e-mail адрес "
+                                   "(например you@example.com)"}
+        # «from» мастер спрашивает только когда логин не адрес (см. need_from ниже).
         if smtp.get("from") and not alerts_mod._valid_email(smtp["from"]):
-            return self._json(400, {"error": "«from», если задан, должен быть e-mail адресом"})
+            return None, {"error": "«адрес отправителя», если задан, должен быть "
+                                   "e-mail адресом"}
         if not smtp.get("from"):
             smtp.pop("from", None)          # не сорить null-ом в secrets.json
-        # Отказываем, если с этими данными письмо УЙТИ НЕ МОЖЕТ. Проверяем ровно тем же
-        # условием, каким живёт отправка (Alerter.configured): раньше «настроено» и «умеет
-        # отправить» расходились, и почта молча выключалась (node2 18.08). Обычно отправитель
-        # берётся из логина, но логин не всегда адрес (u123456, apikey, postmaster) — тогда
-        # мастер просит адрес отправителя, а не делает вид, что письма настроены.
+        # Отказываем, если с этими данными письмо УЙТИ НЕ МОЖЕТ. Условие — то же, каким живёт
+        # отправка (Alerter.configured): обычно отправитель берётся из логина, но логин не всегда
+        # адрес (u123456, apikey, postmaster) — тогда просим адрес отправителя, а не делаем вид,
+        # что почта настроена.
         if not alerts_mod.Alerter(smtp=smtp).configured:
-            return self._json(400, {
-                "error": "письма отправлять не с чего: логин SMTP не почтовый адрес — "
-                         "укажите адрес отправителя",
-                "need_from": True})
-        APP.setup["smtp"] = smtp
+            return None, {"error": "письма отправлять не с чего: логин SMTP не почтовый адрес — "
+                                   "укажите адрес отправителя",
+                          "need_from": True}
+        return smtp, None
+
+    def _setup_smtp_test(self, body):
+        """Отправить код на указанный ящик. Ничего не сохраняем — только запоминаем ожидание."""
+        import secrets as _s
+        smtp, err = self._smtp_fields(body)
+        if err:
+            return self._json(400, err)
+        code = "%06d" % _s.randbelow(1000000)
+        alerter = alerts_mod.Alerter(smtp=smtp, server=APP.cfg.get("server") or "узел",
+                                     log=lambda m: None)
+        ok = alerter.send("проверка почты — код %s" % code,
+                          "Код проверки: %s\n\nВпишите его в мастере настройки узла — только "
+                          "после этого узел начнёт слать сюда тревожные письма.\n"
+                          "Если вы ничего не настраивали, просто удалите это письмо." % code)
+        if not ok:
+            return self._json(400, {"error": "письмо не ушло: %s"
+                                             % (alerter.last_error or "проверьте сервер, порт, "
+                                                                      "логин и пароль")})
+        APP.setup["smtp_pending"] = {"smtp": smtp, "code": code, "tries": 0, "at": time.time()}
+        return self._json(200, {"sent": True, "to": smtp["to"]})
+
+    def _setup_smtp(self, body):
+        if body.get("skip"):
+            APP.setup.pop("smtp", None)
+            APP.setup.pop("smtp_pending", None)
+            APP.setup["smtp_done"] = True
+            return self._json(200, {"skipped": True})
+        pend = APP.setup.get("smtp_pending")
+        if not pend:
+            return self._json(400, {"error": "сначала нажмите «Проверить связь» — узел пришлёт "
+                                             "код на этот ящик", "need_test": True})
+        if time.time() - pend["at"] > self.CODE_TTL_S:
+            APP.setup.pop("smtp_pending", None)
+            return self._json(400, {"error": "код устарел — проверьте связь заново",
+                                    "need_test": True})
+        if pend["tries"] >= self.CODE_TRIES:
+            APP.setup.pop("smtp_pending", None)
+            return self._json(400, {"error": "слишком много попыток — проверьте связь заново",
+                                    "need_test": True})
+        # Поля правили после отправки кода? Сохранить «проверенным» можно только то, что
+        # проверяли: иначе правка молча уехала бы мимо проверки.
+        if body.get("host"):
+            smtp, err = self._smtp_fields(body)
+            if err:
+                return self._json(400, err)
+            if smtp != pend["smtp"]:
+                APP.setup.pop("smtp_pending", None)
+                return self._json(400, {"error": "данные почты изменились — проверьте связь заново",
+                                        "need_test": True})
+        code = (body.get("code") or "").strip()
+        if not (code and auth.hmac.compare_digest(code, pend["code"])):
+            pend["tries"] += 1
+            left = self.CODE_TRIES - pend["tries"]
+            return self._json(400, {"error": "код не совпал%s"
+                                             % (" (осталось попыток: %d)" % left if left > 0 else
+                                                " — проверьте связь заново")})
+        APP.setup["smtp"] = pend["smtp"]
         APP.setup["smtp_done"] = True
+        APP.setup.pop("smtp_pending", None)
         return self._json(200, {"ok": True})
 
     def _setup_finish(self):

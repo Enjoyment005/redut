@@ -1106,6 +1106,8 @@ _SETUP_HTML = """
     <div class="ex">Куда писать, если VPN сломался, прокси умер или деньги на исходе. Нужны данные
       почтового ящика, от имени которого слать письма (те же, что вбиваются в почтовый клиент:
       сервер, порт, логин, пароль). Письма приходят с адреса логина — отдельно его указывать не нужно.
+      Заполни и нажми <b>«Проверить связь»</b>: узел отправит на этот ящик код, впиши его обратно —
+      только так почта включится, чтобы «сохранено» не означало «письма молча не ходят».
       <b>Не знаешь — жми «Пропустить»</b>, панель будет работать без писем, настроишь потом.</div>
     <label>Почтовый сервер (SMTP)</label><input id="sm_host" autocomplete="off" placeholder="mail.example.com">
     <div class="field">
@@ -1118,8 +1120,12 @@ _SETUP_HTML = """
       <div class="sub">Логин не похож на почтовый адрес — впишите, с какого адреса слать письма.</div>
     </div>
     <label>кому слать</label><input id="sm_to" autocomplete="off" placeholder="you@example.com">
-    <div style="margin-top:11px"><button class="btn g" onclick="saveSmtp()">Сохранить</button>
+    <div style="margin-top:11px"><button class="btn g" onclick="testSmtp()">Проверить связь</button>
       <button class="btn s" onclick="skipSmtp()">Пропустить</button></div>
+    <div id="sm_code_row" style="display:none;margin-top:11px">
+      <label>код из письма</label><input id="sm_code" autocomplete="off" placeholder="6 цифр">
+      <button class="btn g" style="margin-top:9px" onclick="saveSmtp()">Подтвердить и включить почту</button>
+    </div>
     <div id="smtpbox" class="sub" style="margin-top:9px"></div>
     <div style="margin-top:16px"><button class="btn s" onclick="go(3)">← Назад</button>
       <button class="btn" id="n4" disabled onclick="go(5)">Дальше →</button></div>
@@ -1178,15 +1184,30 @@ async function saveProv(){const b={proxy6:document.getElementById('proxy6').valu
     v.saved_unverified?('<span class="warn">сервис недоступен с сервера напрямую — ключ сохранён без проверки, узел будет ходить к нему через свой канал ('+esc(v.error)+')</span>'):
     ('<span class="bad">'+esc(v.error)+'</span>'))).join('<br>');
   done(3)}catch(e){document.getElementById('provbox').innerHTML='<span class="bad">'+esc(e.message)+'</span>';toast(e.message,'bad')}}
-async function saveSmtp(){const b={host:v('sm_host'),port:v('sm_port'),user:v('sm_user'),
-  password:v('sm_password'),from:v('sm_from'),to:v('sm_to')};
-  try{await sapi('/api/setup/smtp',b);document.getElementById('smtpbox').innerHTML='<span class="ok">почта сохранена</span>';done(4)}
-  catch(e){if(e.need_from)document.getElementById('sm_from_row').style.display='block';toast(e.message,'bad')}}
+const SM_FIELDS=['sm_host','sm_port','sm_user','sm_password','sm_from','sm_to'];
+function smBody(){return {host:v('sm_host'),port:v('sm_port'),user:v('sm_user'),
+  password:v('sm_password'),from:v('sm_from'),to:v('sm_to')}}
+function smBox(cls,txt){document.getElementById('smtpbox').innerHTML='<span class="'+cls+'">'+esc(txt)+'</span>'}
+// правку полей после отправки кода прячем обратно за проверку: сохраняем только проверенное
+function smReset(){document.getElementById('sm_code_row').style.display='none'}
+async function testSmtp(){const b=smBody();smBox('mut','отправляю письмо с кодом…');
+  try{const r=await sapi('/api/setup/smtp/test',b);
+    document.getElementById('sm_code_row').style.display='block';
+    document.getElementById('sm_code').focus();
+    smBox('ok','письмо с кодом отправлено на '+r.to+' — впиши код из письма (идёт до пары минут)')}
+  catch(e){if(e.need_from)document.getElementById('sm_from_row').style.display='block';
+    smBox('bad',e.message);toast(e.message,'bad')}}
+async function saveSmtp(){const b=smBody();b.code=v('sm_code');
+  try{await sapi('/api/setup/smtp',b);smBox('ok','почта проверена и включена');done(4)}
+  catch(e){if(e.need_test)smReset();if(e.need_from)document.getElementById('sm_from_row').style.display='block';
+    smBox('bad',e.message);toast(e.message,'bad')}}
 async function skipSmtp(){try{await sapi('/api/setup/smtp',{skip:true});
   document.getElementById('smtpbox').innerHTML='<span class="mut">почта пропущена — настроишь позже</span>';done(4)}catch(e){toast(e.message,'bad')}}
 function v(id){return document.getElementById(id).value.trim()}
 async function finish(){try{const r=await sapi('/api/setup/finish',{});toast('Готово! Открываю вход…','ok');
   setTimeout(()=>location.href=r.next||'/login',1200)}catch(e){toast(e.message,'bad')}}
+SM_FIELDS.forEach(function(id){var el=document.getElementById(id);
+  if(el)el.addEventListener('input',smReset)});
 stepper();
 """
 
