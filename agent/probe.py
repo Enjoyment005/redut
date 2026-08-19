@@ -121,6 +121,87 @@ def _geo_ask(url):
     return cc if re.fullmatch(r"[a-z]{2}", cc or "") else None
 
 
+# ── технический паспорт IP для карты выхода (19.08) ──────────────────────────
+# Те же публичные базы, что у geo_country (ip-api.com, фолбэк ipinfo.io) — новых
+# зависимостей и хостов узел не получает. Ответ кэшируется панелью (setting) по IP:
+# паспорт адреса меняется редко, TTL недели хватает.
+INTEL_TTL_S = 7 * 24 * 3600
+
+_INTEL_PRIMARY = ("http://ip-api.com/json/%s?fields=status,countryCode,regionName,city,"
+                  "timezone,isp,org,as,asname,reverse,mobile,proxy,hosting,lat,lon")
+_INTEL_SECONDARY = "https://ipinfo.io/%s/json"
+
+
+def _http_json(url, timeout=GEO_TIMEOUT):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
+def _intel_from_ipapi(d):
+    """Разбор ответа ip-api.com/json -> общий словарь паспорта или None."""
+    if not isinstance(d, dict) or d.get("status") != "success":
+        return None
+    asn = (d.get("as") or "").split(" ")[0] or None
+    as_rest = (d.get("as") or "").split(" ", 1)
+    return {
+        "cc": (d.get("countryCode") or "").lower() or None,
+        "region": d.get("regionName") or None,
+        "city": d.get("city") or None,
+        "tz": d.get("timezone") or None,
+        "isp": d.get("isp") or None,
+        "org": d.get("org") or None,
+        "asn": asn,
+        "asname": d.get("asname") or (as_rest[1] if len(as_rest) > 1 else None),
+        "ptr": d.get("reverse") or None,
+        "mobile": bool(d.get("mobile")) if "mobile" in d else None,
+        "proxy": bool(d.get("proxy")) if "proxy" in d else None,
+        "hosting": bool(d.get("hosting")) if "hosting" in d else None,
+        "lat": d.get("lat"), "lon": d.get("lon"),
+        "src": "ip-api",
+    }
+
+
+def _intel_from_ipinfo(d):
+    """Разбор ответа ipinfo.io/json (фолбэк): полей меньше — mobile/proxy/hosting
+    эта база бесплатно не отдаёт, оставляем None (фронт различает None и False)."""
+    if not isinstance(d, dict) or not (d.get("org") or d.get("city") or d.get("hostname")):
+        return None
+    org = (d.get("org") or "").strip()
+    asn = org.split(" ")[0] if org.startswith("AS") else None
+    name = (org.split(" ", 1)[1] if asn and " " in org else org) or None
+    lat = lon = None
+    loc = (d.get("loc") or "").split(",")
+    if len(loc) == 2:
+        try:
+            lat, lon = float(loc[0]), float(loc[1])
+        except ValueError:
+            pass
+    return {"cc": (d.get("country") or "").lower() or None,
+            "region": d.get("region") or None, "city": d.get("city") or None,
+            "tz": d.get("timezone") or None,
+            "isp": name, "org": name, "asn": asn, "asname": name,
+            "ptr": d.get("hostname") or None,
+            "mobile": None, "proxy": None, "hosting": None,
+            "lat": lat, "lon": lon, "src": "ipinfo"}
+
+
+def ip_intel(ip):
+    """Технический паспорт exit-IP (ASN, оператор, город, пояс, PTR, датацентр…).
+
+    Для оверлея на карте выхода: панель показывает человеку, ЧТО за адрес видят
+    сайты. Запрос идёт напрямую с сервера (как geo_country); обе базы молчат ->
+    None (кэшировать нечего, панель попробует позже)."""
+    if not ip:
+        return None
+    intel = _intel_from_ipapi(_http_json(_INTEL_PRIMARY % ip))
+    if intel is None:
+        intel = _intel_from_ipinfo(_http_json(_INTEL_SECONDARY % ip))
+    return intel
+
+
 def geo_country_consensus(ip):
     """Страна exit-IP по ДВУМ независимым базам сразу -> {cc, alt, agree}.
 

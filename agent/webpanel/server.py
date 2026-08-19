@@ -19,6 +19,8 @@
   POST /api/proxy/<uid>/role        {role}
   POST /api/rollback                откат из кольца
   GET  /api/events?limit=N          журнал
+  GET  /api/ipinfo                  технический паспорт текущего IP выхода (ASN, оператор,
+                                    город, пояс, PTR, датацентр; кэш по IP — для карты)
   --- настройки (§12; лимиты трат по-прежнему только по SSH) ---
   GET  /api/strategy                четыре стратегии выбора стран + предпросмотр на живых данных
   POST /api/strategy                {strategy} — сменить правило (config.json, без рестарта)
@@ -184,13 +186,18 @@ def _first_channel_kick():
 
 
 def _pool_refresh_kick():
-    """После смены ключа: подтянуть пул нового кабинета (фоновый поток, отдельный процесс).
+    """После смены ключа: подтянуть пул нового кабинета и сразу проверить новые
+    каналы (фоновый поток, отдельный процесс).
 
     Ключ сменили — значит, скорее всего, сменился и кабинет: в пуле лежат прокси
-    предыдущего аккаунта. vpn-agent перечитает secrets.json сам и сольёт список заново.
+    предыдущего аккаунта. vpn-agent перечитает secrets.json сам и сольёт список
+    заново, а --probe-new тут же прогонит пробу по каналам, которых ещё ни разу
+    не проверяли (жалоба владельца 19.08: прокси подгрузились, а проверки по
+    стратегии не дождались — до двухчасового крона висели «не проверялся»).
+    Таймаут с запасом: проба идёт по каналам последовательно, до ~30 с на каждый.
     Ошибки не роняют панель — только лог (как в _first_channel_kick)."""
     try:
-        rc, out = _run_agent(["pool-refresh"], timeout=300)
+        rc, out = _run_agent(["pool-refresh", "--probe-new"], timeout=900)
         print("[key] pool-refresh rc=%s: %s" % (rc, (out or "")[-300:].replace("\n", " | ")), flush=True)
     except Exception as e:      # noqa: BLE001 — фон, панель жить должна
         print("[key] pool-refresh не удался: %s" % e, flush=True)
@@ -581,6 +588,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, self._strategy_state())
         if path == "/api/update/status":
             return self._json(200, self._update_status())
+        if path == "/api/ipinfo":
+            return self._json(200, self._ipinfo())
         parts = path.strip("/").split("/")   # api clients <name> config|qr
         if len(parts) == 4 and parts[:2] == ["api", "clients"]:
             name = unquote(parts[2])
@@ -964,6 +973,43 @@ class Handler(BaseHTTPRequestHandler):
                 "auto": u["auto"], "window": u["window"],
                 "window_ok": update_mod.window_covers_cron(u["window"]),
                 "repo": u["repo"]}
+
+    # ------------------------------------------------ паспорт IP выхода (карта)
+    def _ipinfo(self):
+        """GET /api/ipinfo: технический паспорт ТЕКУЩЕГО IP выхода — для оверлея
+        на карте (ASN, оператор, город, пояс, PTR, датацентр).
+
+        Только текущий egress — панель не превращается в geoip-сервис по
+        произвольным адресам. Ответ публичных баз кэшируется в setting по IP
+        (probe.INTEL_TTL_S): сеть дёргается один раз на новый адрес, а не на
+        каждое открытие дашборда; чужие ключи ipintel:* подчищаются, чтобы
+        setting не пух от истории адресов."""
+        with _DB_LOCK:
+            eg = APP.pool.get_egress()
+        ip = (eg or {}).get("egress") or ""
+        if not ip:
+            return {"ok": False, "ip": "", "why": "выход ещё не проверялся"}
+        key = "ipintel:%s" % ip
+        with _DB_LOCK:
+            raw = APP.pool.get_setting(key)
+        if raw:
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                data = None
+            age = states_mod.age_seconds((data or {}).get("at"))
+            if data and data.get("intel") and age is not None and age < probe_mod.INTEL_TTL_S:
+                return {"ok": True, "ip": ip, "cached_at": data.get("at"),
+                        "intel": data["intel"]}
+        intel = probe_mod.ip_intel(ip)      # сеть (до ~8 с) — ВНЕ лока БД
+        if not intel:
+            return {"ok": False, "ip": ip, "why": "гео-базы не ответили"}
+        with _DB_LOCK:
+            APP.pool.conn.execute("DELETE FROM setting WHERE key LIKE 'ipintel:%' AND key != ?",
+                                  (key,))
+            APP.pool.set_setting(key, json.dumps({"at": pool_mod.now_iso(), "intel": intel},
+                                                 ensure_ascii=False))
+        return {"ok": True, "ip": ip, "intel": intel}
 
     # ------------------------------------------------ ключи провайдеров (§12)
     def _key_status(self):

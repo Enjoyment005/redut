@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""vpn-agent — CLI ядра: status | list | probe [uid] | pool-refresh [--probe]
+"""vpn-agent — CLI ядра: status | list | probe [uid] | pool-refresh [--probe|--probe-new]
 | apply <uid> [--dry-run] | rollback  (фаза 1)
 | buy [--country] | prolong <uid> --days N | drop <uid>  (фаза 2 — деньги §6)
 | rotate | emergency on|off | heartbeat-check  (фаза 3 — автоматика §8).
@@ -225,6 +225,11 @@ def cmd_pool_refresh(cfg, args):
                                             reason="pool-refresh")
         print("боевой у провайдера без ключа (%s): %s" % (row["provider"], r["detail"]))
 
+    if getattr(args, "probe_new", False) and not getattr(args, "probe", False):
+        # смена ключа из панели (§12 /api/key): проверить сразу ТОЛЬКО новые
+        # каналы; при --probe не дублируем — полный прогон ниже покроет и их
+        probe_new_channels(p, cfg, providers, current_host)
+
     if getattr(args, "probe", False):
         # cron раз в 2 ч (E2): держим кандидатов проверенными заранее (§6.0) + N+1 (§6.5)
         rows = p.candidates()
@@ -303,6 +308,28 @@ def _probe_one(p, cfg, providers, row, current_host, background=False):
     p.record_probe(row["uid"], res, is_current=is_cur, strategy=country_mod.strategy(cfg),
                    background=background)
     return res
+
+
+def probe_new_channels(p, cfg, providers, current_host, log=print):
+    """Проба каналов, которых ещё НИ РАЗУ не проверяли (жалоба владельца 19.08).
+
+    Панель зовёт через `pool-refresh --probe-new` сразу после смены/добавления
+    ключа: каналы нового кабинета уже в пуле, но без пробы они висят в таблице
+    «не проверялся», а превью стратегий и автоматика видят их слепыми — до
+    двухчасового крона проверка не случалась вовсе. Перебор — в порядке текущей
+    стратегии (как ротация); уже проверенные каналы не перегоняются, денег не
+    тратит (докупка N+1 остаётся дорожкой --probe). -> (ok, всего_новых)."""
+    fresh = states_mod.rank_candidates(
+        [r for r in p.candidates() if not r.get("last_probe_at")], cfg)
+    ok = 0
+    for row in fresh:
+        res = _probe_one(p, cfg, providers, row, current_host, background=True)
+        ok += 1 if res["ok"] else 0
+    if fresh:
+        p.log_event("probe-new", actor="auto", result="%d/%d ok" % (ok, len(fresh)),
+                    detail="новые каналы проверены по текущей стратегии (после смены ключа)")
+    log("проверка новых каналов: %d/%d ok" % (ok, len(fresh)))
+    return ok, len(fresh)
 
 
 def cmd_probe(cfg, args):
@@ -840,6 +867,9 @@ def main(argv=None):
     sp = sub.add_parser("pool-refresh", help="обновить пул у провайдеров (merge, gone; cron */30 мин)")
     sp.add_argument("--probe", action="store_true",
                     help="+ проба кандидатов, резерв N+1, retention (cron раз в 2 ч)")
+    sp.add_argument("--probe-new", dest="probe_new", action="store_true",
+                    help="+ проба только НОВЫХ (ещё не проверявшихся) каналов — "
+                         "панель зовёт после смены ключа провайдера; денег не тратит")
     sub.add_parser("egress-mark",
                    help="лёгкая метка выхода для дашборда: ipify через tun0, без TG (cron */5 мин)")
     sp = sub.add_parser("probe", help="проба кандидата/всех кандидатов")

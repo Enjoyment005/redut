@@ -70,6 +70,10 @@ font:400 12.5px/1.6 var(--ui);padding:8px 11px;border-radius:0 8px 8px 0;margin:
 .ex.warn{border-left-color:rgba(255,184,0,.55);background:rgba(255,184,0,.05);color:#e3c98d}
 .ex.danger{border-left-color:rgba(255,42,109,.55);background:rgba(255,42,109,.06);color:#ffb3c8}
 body.noex .ex{display:none}
+/* Справочные разделы (details: «что делает каждая кнопка», «если интернет пропал») —
+   отдельная справка по клику, а не подсказка новичку: тумблер «Объяснения» их
+   содержимое трогать не должен (жалоба владельца 19.08 — раздел открывался пустым) */
+body.noex details .ex{display:block}
 /* Подсказка. Само облачко живёт в единственном #tip на body с position:fixed —
    иначе его режут контейнеры со скроллом и overflow:hidden (плитки, таблицы, шапка). */
 .q{display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;
@@ -113,7 +117,20 @@ white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .geo .hud{position:absolute;left:0;right:0;bottom:0;display:flex;gap:12px;flex-wrap:wrap;
 justify-content:space-between;padding:7px 10px;color:var(--mut);font:400 10.5px/1.4 var(--mono);
 pointer-events:none;background:linear-gradient(180deg,transparent,rgba(4,6,12,.82) 65%)}
-@media(max-width:640px){.geo .hud{font-size:9.5px}.geo .lock{font-size:9px;letter-spacing:.06em}}
+/* паспорт IP — техпанель поверх карты справа (19.08): что за адрес видят сайты */
+.geo .intel{position:absolute;right:9px;top:9px;max-width:46%;padding:6px 9px 7px;
+border:1px solid var(--line2);border-radius:5px;background:rgba(4,7,15,.8);
+color:#cfe0f5;font:400 10.5px/1.55 var(--mono);pointer-events:none;z-index:2}
+.geo .intel .t{color:var(--cyan);font:600 10px/1 var(--mono);letter-spacing:.13em;
+text-transform:uppercase;margin-bottom:5px}
+.geo .intel .row{display:flex;gap:8px;white-space:nowrap}
+.geo .intel .row b{color:var(--mut);font:500 9.5px/1.75 var(--mono);letter-spacing:.08em;
+text-transform:uppercase;flex:none;min-width:62px}
+.geo .intel .row span{overflow:hidden;text-overflow:ellipsis}
+@media(max-width:640px){.geo .hud{font-size:9.5px}.geo .lock{font-size:9px;letter-spacing:.06em}
+/* на телефоне карта мелкая — паспорт прячем; !important, потому что видимостью
+   управляет inline display:block из geoIntel, иначе media-правило проиграет ему */
+.geo .intel{display:none !important}}
 @media(prefers-reduced-motion:reduce){.beacon .dot{animation:none}}
 
 /* ── плитки метрик ─────────────────────────────────────────────────── */
@@ -384,12 +401,17 @@ _DASH_HTML = """
     <div class="fold-body">
     <div class="ex">Где в мире сайты видят твой трафик. <b>Прицел</b> — страна прокси, через который
       сервер выходит наружу; <b>пустые квадратики</b> — запасные прокси из пула, куда панель может
-      переключиться, а пунктир между ними — эти самые запасные пути. Карта нарисована прямо в панели
-      по встроенным данным: наружу она ничего не запрашивает и точку ставит <b>по стране</b>, а не по
-      адресу — точнее geoip всё равно не знает.</div>
+      переключиться, а пунктир между ними — эти самые запасные пути. Сама картинка нарисована прямо
+      в панели по встроенным данным: браузер наружу ничего не запрашивает и точку ставит <b>по
+      стране</b>, а не по адресу — точнее geoip всё равно не знает.
+      <b>Справа — паспорт IP</b>: сервер один раз на адрес спрашивает публичные гео-базы и
+      показывает, что о нём известно, — оператор и сеть (ASN), датацентр ли это, город, часовой
+      пояс, обратное DNS-имя. Интересно и полезно: по типу сети видно, как сайты будут относиться
+      к адресу.</div>
     <div class="map">
       <canvas id="geocv" width="1200" height="420"></canvas>
       <div class="lock" id="geolock">СВЯЗЬ ЕЩЁ НЕ ПРОВЕРЕНА</div>
+      <div class="intel" id="geointel" style="display:none"></div>
       <div class="hud"><span id="geoxy">LAT — · LON —</span><span id="geowho"></span></div>
     </div>
     </div>
@@ -518,8 +540,9 @@ _DASH_HTML = """
     <div id="keys"></div>
     <div class="ex warn" style="margin-top:11px">Новый ключ начинает работать сразу — <b>и для автоматики
       тоже</b>: следующая покупка или продление пойдут уже через новый кабинет. Прокси старого кабинета
-      панель перестанет видеть, поэтому после смены ключа она сама заново спросит список прокси
-      (это занимает до минуты).</div>
+      панель перестанет видеть, поэтому после смены ключа она сама заново спросит список прокси и
+      <b>тут же проверит новые каналы</b> по текущей стратегии (страна выхода, скорость, Telegram) —
+      первые оценки появятся в таблице пула в течение пары минут, боевой канал при этом не трогается.</div>
     </div>
   </div>
 
@@ -805,7 +828,50 @@ function geoSync(s){s=s||window.__S;if(!s||!document.getElementById('geocv'))ret
   if(who)who.textContent=(s.egress_at?('проверено '+agoTxt(s.egress_age)):'проверки ещё не было')+
     (spare?(' · запасных на карте: '+spare):'');
   sum('geo',pt?((country(cc)||cc.toUpperCase())+(s.egress?(' · '+s.egress):'')):'');
+  geoIntel(s);
   geoStart()}
+/* ── паспорт IP: техпанель поверх карты справа (19.08) ──
+   Данные тянет СЕРВЕР из публичных гео-баз и кэширует по IP (/api/ipinfo);
+   браузер наружу по-прежнему не ходит (CSP). Грузим один раз на адрес,
+   при неудаче не долбим чаще раза в 5 минут. */
+function intelRow(k,v){return v?('<div class="row"><b>'+esc(k)+'</b><span>'+esc(v)+'</span></div>'):''}
+function intelHtml(ip,d){
+  const asn=[d.asn,d.asname].filter(Boolean).join(' · ');
+  const op=(d.org&&d.org!==d.asname)?d.org:((d.isp&&d.isp!==d.asname)?d.isp:'');
+  const place=[d.city,(d.region&&d.region!==d.city)?d.region:''].filter(Boolean).join(', ');
+  let time='';
+  if(d.tz){try{time=new Intl.DateTimeFormat('ru-RU',{timeZone:d.tz,hour:'2-digit',minute:'2-digit'})
+    .format(new Date())}catch(e){}}
+  const flags=[];
+  if(d.hosting)flags.push('датацентр/хостинг');
+  if(d.mobile)flags.push('мобильная сеть');
+  if(d.proxy)flags.push('в базах отмечен как прокси');
+  const typ=flags.length?flags.join(' · '):(d.hosting===false?'не датацентр — «жилой» адрес':'');
+  return '<div class="t">Паспорт IP</div>'+
+    intelRow('адрес',ip)+
+    intelRow('сеть',asn)+
+    intelRow('оператор',op)+
+    intelRow('город',place)+
+    intelRow('пояс',d.tz?(d.tz+(time?(' · там '+time):'')):'')+
+    intelRow('ptr',d.ptr)+
+    intelRow('тип',typ)+
+    ((d.lat!=null&&d.lon!=null)?intelRow('коорд.',(+d.lat).toFixed(2)+', '+(+d.lon).toFixed(2)):'')}
+async function geoIntel(s){const el=document.getElementById('geointel');if(!el)return;
+  const ip=(s&&s.egress_at&&s.egress)||'';
+  if(!ip){el.style.display='none';window.__IPINTEL=null;return}
+  if(isFolded('geo'))return;                                  /* свёрнутая карта запрос не тратит */
+  if(window.__IPINTEL&&window.__IPINTEL.ip===ip)return;       /* уже показан этот адрес */
+  if(window.__IPINTEL){window.__IPINTEL=null;el.style.display='none'} /* адрес сменился — чужой паспорт убрать */
+  if(window.__IPINTEL_BUSY)return;
+  const f=window.__IPINTEL_FAIL;
+  if(f&&f.ip===ip&&Date.now()-f.at<300000)return;
+  window.__IPINTEL_BUSY=1;
+  try{const r=await api('/api/ipinfo');
+    if(r.ok&&r.intel&&r.ip===ip){window.__IPINTEL={ip:ip,intel:r.intel};
+      el.innerHTML=intelHtml(ip,r.intel);el.style.display='block'}
+    else window.__IPINTEL_FAIL={ip:ip,at:Date.now()}}
+  catch(e){window.__IPINTEL_FAIL={ip:ip,at:Date.now()}}
+  finally{window.__IPINTEL_BUSY=0}}
 document.addEventListener('visibilitychange',()=>{document.hidden?geoStop():geoStart()});
 window.addEventListener('resize',()=>{GEO.W=0;if(!GEO.run)geoDraw(0)});
 async function api(path,opts){opts=opts||{};opts.headers=Object.assign({'X-CSRF-Token':CSRF},opts.headers||{});
