@@ -13,6 +13,7 @@ secrets.json блок "admin" (pw=scrypt-хеш, totp=base32-seed, recovery=sha2
 import argparse
 import json
 import os
+import subprocess
 import sys
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -20,6 +21,32 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from webpanel import auth  # noqa: E402
 
 DEFAULT_SECRETS = "/etc/vpn-panel/secrets.json"
+PANEL_UNIT = "vpn-panel"
+
+
+def restart_panel(secrets_path):
+    """Перезапустить панель после смены секретов. -> True, если перезапустили.
+
+    Панель кэширует secrets в памяти (server.App._load_secrets) и после сброса
+    принимает СТАРЫЙ пароль, пока её не перезапустят — живой случай 19.08 на node1.
+    Рестартуем только боевой файл узла и только активный юнит: dev-файл (--secrets)
+    живую панель не трогает, а незапущенной панели кэшировать нечего. Любая ошибка
+    -> False, main() печатает прежнее напоминание.
+    """
+    if os.name != "posix":
+        return False
+    try:
+        if os.path.realpath(secrets_path) != os.path.realpath(DEFAULT_SECRETS):
+            return False
+        p = subprocess.run(["systemctl", "is-active", PANEL_UNIT],
+                           capture_output=True, text=True, timeout=10)
+        if (p.stdout or "").strip() != "active":
+            return False
+        p = subprocess.run(["systemctl", "restart", PANEL_UNIT],
+                           capture_output=True, text=True, timeout=60)
+        return p.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def main(argv=None):
@@ -70,7 +97,10 @@ def main(argv=None):
     for i, code in enumerate(recovery_plain, 1):
         print("   %2d. %s" % (i, code))
     print("=" * 60)
-    print("Файл: %s (0600). Перезапусти vpn-panel, если работает." % a.secrets)
+    if restart_panel(a.secrets):
+        print("Файл: %s (0600). vpn-panel перезапущена — вход сразу по новым данным." % a.secrets)
+    else:
+        print("Файл: %s (0600). Перезапусти vpn-panel, если работает." % a.secrets)
     return 0
 
 
