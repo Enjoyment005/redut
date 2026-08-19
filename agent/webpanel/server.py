@@ -74,6 +74,7 @@ from providers import make_providers, ProviderError, PROVIDER_CLASSES  # noqa: E
 from webpanel import auth, views    # noqa: E402
 from webpanel import clients as clients_mod   # noqa: E402
 from webpanel import qrcode as qr_mod         # noqa: E402
+from webpanel import sysinfo as sysinfo_mod   # noqa: E402
 
 ETC_CONFIG = "/etc/vpn-panel/config.json"
 ETC_SECRETS = "/etc/vpn-panel/secrets.json"
@@ -1561,7 +1562,11 @@ class Handler(BaseHTTPRequestHandler):
         out = {"server": APP.cfg.get("server"), "role": APP.cfg.get("role"),
                "version": update_mod.node_version(),
                "subnet": APP.cfg.get("subnet"), "final": (sb.get("route") or {}).get("final"),
-               "singbox": "?", "upstream": {}, "balances": {}, "egress": None}
+               "singbox": "?", "upstream": {}, "balances": {}, "egress": None,
+               # полоска «Сервер» в шапке: нагрузка/память/диск/swap + оценка
+               # вместимости. Всё из /proc без subprocess — дёшево на каждый
+               # 30-секундный опрос; вне Linux здесь None, полоска прячется.
+               "sys": sysinfo_mod.snapshot()}
         for o in sb.get("outbounds", []):
             if o.get("tag") == "socks-out":
                 out["upstream"]["socks_out"] = "%s:%s %s" % (o.get("server"), o.get("server_port"), o.get("type"))

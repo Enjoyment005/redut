@@ -93,6 +93,19 @@ class _AppHarness(unittest.TestCase):
         return server.Handler._pool_row(None, row, cur)
 
 
+class TestStatusSysBlock(_AppHarness):
+    """/api/status отдаёт блок sys для полоски «Сервер» (1.8.0)."""
+
+    def test_status_has_sys(self):
+        out = server.Handler._status(None)
+        self.assertIn("sys", out)
+        # на Linux — словарь с показателями, на dev-Windows — None (полоска скрыта)
+        if out["sys"] is not None:
+            for k in ("cores", "load_pct", "mem_pct", "swap_pct",
+                      "disk_free_gb", "uptime_sec", "wg_up", "rec_clients"):
+                self.assertIn(k, out["sys"])
+
+
 class TestPoolRowBlocked(_AppHarness):
     def test_clean_row_not_blocked(self):
         uid = self.put_proxy("1", country="fi", exit_cc="fi", exit_cc_alt="fi")

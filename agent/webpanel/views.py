@@ -145,6 +145,11 @@ background:linear-gradient(90deg,transparent,var(--cyan),transparent);opacity:.7
 display:flex;align-items:center}
 .tile .v{font:600 15px/1.35 var(--mono);margin-top:3px;word-break:break-word}
 
+/* ── строка «Сервер»: показатели машины обычным текстом под шапкой ──
+   Владелец попросил не карточки, а текст в стиле подстроки шапки (19.08):
+   спокойная muted-строка, подсвечиваются только тревожные значения. */
+.vitals{color:var(--mut);font:400 12px/1.75 var(--mono);margin:1px 0 4px}
+
 /* ── таблицы ───────────────────────────────────────────────────────── */
 .scroll{overflow:auto;margin:0 -3px;padding:0 3px}
 table{width:100%;border-collapse:collapse;font:400 12.5px/1.5 var(--mono)}
@@ -388,6 +393,8 @@ _DASH_HTML = """
     </div>
   </div>
 
+  <div class="vitals" id="vitals" style="display:none"></div>
+
   <div class="ex">Это пульт управления VPN-сервером. Здесь ты <b>выдаёшь доступ людям</b> (раздел «Кто
     подключён»), смотришь, <b>через какой зарубежный прокси</b> сервер выпускает трафик наружу, и меняешь
     его, если он умер. Кнопки, которые тратят деньги или рвут связь, подписаны отдельно.
@@ -492,6 +499,7 @@ _DASH_HTML = """
       даёт файл для компьютера, <b>«QR»</b> — картинку для телефона. На устройстве нужно приложение
       <b>WireGuard</b> (бесплатное, есть в App Store и Google Play): в нём «+» → «Сканировать QR-код»
       или «Импорт из файла».</div>
+    <div id="crec" class="sub" style="display:none;margin:0 0 10px;font:400 12.5px/1.6 var(--ui);color:#adc0e0"></div>
     <div id="qstart" class="steps" style="display:none">
       <div class="step"><b>шаг 1</b>Придумай имя устройства (латиницей, например <span class="mono">phone-mine</span>) и нажми «Выдать доступ».</div>
       <div class="step"><b>шаг 2</b>Установи на устройство приложение WireGuard из магазина приложений.</div>
@@ -880,6 +888,59 @@ async function api(path,opts){opts=opts||{};opts.headers=Object.assign({'X-CSRF-
 function fl(v){return v===1?'<span class="ok">✓</span>':v===0?'<span class="bad">✕</span>':'<span class="mut">·</span>'}
 function tile(k,v,hint){return '<div class="tile"><div class="k">'+k+(hint?('<i class="q" tabindex="0" data-h="'+esc(hint)+'">?</i>'):'')+
   '</div><div class="v">'+v+'</div></div>'}
+
+/* ── строка «Сервер»: показатели машины из /api/status (s.sys) ──
+   Обычный текст в стиле подстроки шапки (просьба владельца 19.08): спокойная
+   muted-строка «нагрузка · память · swap · диск · службы · аптайм · устройства»,
+   цветом подсвечивается только тревожное (проценты ≥60/≥85, упавшие службы,
+   перебор устройств). Данных нет (dev-режим не на Linux) — строка скрыта. */
+function plural(n,a,b,c){n=Math.abs(n)%100;const m=n%10;
+  return (n>10&&n<20)?c:(m>1&&m<5?b:(m==1?a:c))}
+function pc(v,p){if(p==null)return v;
+  return p<60?v:('<span class="'+(p<85?'warn':'bad')+'">'+v+'</span>')}
+function gmem(mb){if(mb==null)return '?';if(mb<1024)return mb+' МБ';
+  const g=mb/1024;return (g%1?g.toFixed(1):g.toFixed(0))+' ГБ'}
+function upTxt(sec){if(sec==null)return '—';const d=Math.floor(sec/86400);
+  if(d>=1)return d+' '+plural(d,'день','дня','дней');const h=Math.floor(sec/3600);
+  if(h>=1)return h+' ч';return Math.max(1,Math.floor(sec/60))+' мин'}
+function vitals(){const el=document.getElementById('vitals');if(!el)return;
+  const s=window.__S||{};const y=s.sys;
+  if(!y){el.style.display='none';return}
+  const cores=y.cores||1,rec=y.rec_clients,n=window.__CN;
+  const t=[];
+  t.push('нагрузка '+(y.load_pct==null?'—':pc(y.load_pct+'%',y.load_pct))+
+    ' ('+cores+' '+plural(cores,'ядро','ядра','ядер')+')');
+  t.push('память '+(y.mem_pct==null?'—':pc(y.mem_pct+'%',y.mem_pct))+
+    ' ('+gmem(y.mem_used_mb)+' из '+gmem(y.mem_total_mb)+')');
+  t.push('swap '+(y.swap_total_mb?(pc(y.swap_pct+'%',y.swap_pct)+' ('+gmem(y.swap_used_mb)+' из '+gmem(y.swap_total_mb)+')'):'нет'));
+  t.push('диск: свободно '+(y.disk_free_gb==null?'—':y.disk_free_gb+' ГБ')+
+    (y.disk_pct==null?'':(' ('+pc('занято '+y.disk_pct+'%',y.disk_pct)+')')));
+  const sb=(s.singbox||'')==='active',wg=!!y.wg_up;
+  const fallen=(sb?'':'sing-box')+((!sb&&!wg)?' и ':'')+(wg?'':'wg0');
+  t.push('службы '+((sb&&wg)?'<span class="ok">✓ в строю</span>'
+    :('<span class="bad">'+esc(fallen)+' — сбой</span>')));
+  t.push('аптайм '+upTxt(y.uptime_sec));
+  if(rec)t.push('устройств '+(n==null?'':((n>rec?('<span class="warn">'+n+'</span>'):n)+' · '))+
+    'советуем ≤'+rec);
+  el.innerHTML=t.join(' · ')+' <i class="q" tabindex="0" data-h="'+esc(
+    'Показатели самого сервера. Нагрузка — насколько занят процессор (среднее за минуту к числу ядер; '+
+    'постоянные 85%+ — тормоза). Память — честно занятая, отдаваемые кэши не считаются. Swap — '+
+    'подстраховка памяти на диске («нет» — не настроен). Диск — место на системном диске. Службы: '+
+    'wg0 — VPN-туннель для устройств, sing-box — труба к зарубежному прокси; при сбое нажми «Ротация», '+
+    'не помогло — перезагрузи сервер. Устройств — оценка вместимости: ~10 одновременно работающих на '+
+    'ядро с поправкой на память; профилей можно выдать больше, важно сколько онлайн разом — все делят '+
+    'один прокси-канал.')+'">?</i>';
+  el.style.display='block'}
+/* рекомендация «сколько устройств потянет сервер» в разделе «Кто подключён» */
+function clientRec(){const el=document.getElementById('crec');if(!el)return;
+  const s=window.__S||{};const y=s.sys||null;const rec=y&&y.rec_clients;
+  if(!rec){el.style.display='none';return}
+  const n=window.__CN;const over=(n!=null&&n>rec);
+  el.innerHTML='💡 Для этого сервера ('+y.cores+' '+plural(y.cores,'ядро','ядра','ядер')+', '+
+    gmem(y.mem_total_mb)+' памяти) рекомендуется не более <b>'+rec+'</b> одновременно работающих устройств.'+
+    (n==null?'':' Профилей выдано: '+n+'.')+
+    (over?' <span class="warn">Это больше рекомендации — ничего не сломается, но если все выйдут в сеть разом, скорость заметно просядет.</span>':'');
+  el.style.display='block'}
 const CC={fi:'Финляндия',de:'Германия',nl:'Нидерланды',se:'Швеция',ee:'Эстония',lv:'Латвия',lt:'Литва',
   pl:'Польша',cz:'Чехия',at:'Австрия',ch:'Швейцария',gb:'Британия',fr:'Франция',it:'Италия',es:'Испания',
   us:'США',ca:'Канада',ru:'Россия',cr:'Коста-Рика',tr:'Турция',ua:'Украина',ng:'Нигерия',kz:'Казахстан',
@@ -999,6 +1060,7 @@ async function loadStatus(){const s=await api('/api/status');window.__S=s;
   sum('money',Object.entries(s.balances||{}).map(([k,v])=>k+': '+v).join(' · '));
   sum('upd','Редут '+(s.version||'?'));
   geoSync(s);
+  vitals();clientRec();
   maybeRecheck(s)}
 
 /* F7: пауза автоматики (FROZEN) — сторож ничего не делает сам, пока не снимешь */
@@ -1385,7 +1447,9 @@ async function loadClients(){const r=await api('/api/clients');const tb=document
       '<button class="btn r tiny" onclick="delClient(\\''+nm+'\\')">Отозвать</button></td>';
     tb.appendChild(tr)}
   window.__CN=r.clients.length;
-  sum('clients','устройств: '+r.clients.length);
+  const rec=((window.__S||{}).sys||{}).rec_clients;
+  sum('clients','устройств: '+r.clients.length+(rec?(' · советуем ≤'+rec):''));
+  vitals();clientRec();
   document.getElementById('qstart').style.display=r.clients.length?'none':'grid';
   if(!r.clients.length)tb.innerHTML='<tr><td colspan="5" class="mut">доступ пока никому не выдан — начни с шагов выше</td></tr>';
   if(window.__S)beacon(window.__S,window.__CN)}

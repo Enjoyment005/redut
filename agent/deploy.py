@@ -124,8 +124,10 @@ AGENT_FILES = ["update.py", "agent.py", "pool.py", "probe.py", "apply.py", "mone
                "states.py", "alerts.py", "country.py",
                "providers/__init__.py", "providers/base.py",
                "providers/proxyline.py", "providers/proxy6.py"]
-PANEL_FILES = ["webpanel/__init__.py", "webpanel/auth.py", "webpanel/server.py",
-               "webpanel/views.py", "webpanel/setup_admin.py",
+# sysinfo.py — ДО server.py: тот его импортирует, окно между копиями на живом
+# узле не должно ловить ImportError при рестарте панели (случай node1 19.08)
+PANEL_FILES = ["webpanel/__init__.py", "webpanel/auth.py", "webpanel/sysinfo.py",
+               "webpanel/server.py", "webpanel/views.py", "webpanel/setup_admin.py",
                "webpanel/clients.py", "webpanel/qrcode.py"]
 
 WRAPPER = "#!/bin/bash\nexec python3 /opt/vpn-panel/agent.py \"$@\"\n"

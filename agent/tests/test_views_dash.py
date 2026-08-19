@@ -41,5 +41,34 @@ class TestMapIntelMarkup(unittest.TestCase):
         self.assertIn(".geo .intel{position:absolute;right:", views._BASE_CSS)
 
 
+class TestVitalsMarkup(unittest.TestCase):
+    """Строка «Сервер» в шапке (1.8.0): блок, рендерер и стили обязаны быть —
+    пропадут при рефакторинге, и показатели молча исчезнут. Владелец просил
+    ОБЫЧНЫЙ ТЕКСТ в стиле подстроки шапки, а не карточки (19.08)."""
+
+    def test_vitals_line_present(self):
+        html = views._DASH_HTML
+        self.assertIn('id="vitals"', html)
+        self.assertIn("function vitals", html)
+        self.assertIn("s.sys", html)              # данные — из /api/status
+        self.assertIn(".vitals{", views._BASE_CSS)
+        # текстовая строка, а не плитки: карточных классов быть не должно
+        self.assertNotIn(".vit{", views._BASE_CSS)
+        self.assertNotIn(".vbar", views._BASE_CSS)
+        self.assertIn("советуем ≤", html)
+
+    def test_vitals_wired_into_both_loaders(self):
+        # вызовы из loadStatus И loadClients: рекомендация зависит и от железа,
+        # и от числа выданных профилей — кто пришёл последним, тот и дорисовал
+        html = views._DASH_HTML
+        self.assertGreaterEqual(html.count("vitals();clientRec()"), 2)
+
+    def test_clients_recommendation_present(self):
+        html = views._DASH_HTML
+        self.assertIn('id="crec"', html)
+        self.assertIn("function clientRec", html)
+        self.assertIn("рекомендуется не более", html)
+
+
 if __name__ == "__main__":
     unittest.main()
