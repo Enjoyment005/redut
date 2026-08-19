@@ -32,9 +32,10 @@ AGENT_FILES = ["update.py", "agent.py", "pool.py", "probe.py", "apply.py", "mone
                "states.py", "alerts.py", "country.py",
                "providers/__init__.py", "providers/base.py",
                "providers/proxyline.py", "providers/proxy6.py"]
-# server.py импортирует sysinfo — класть ДО server.py, чтобы окно между копиями
-# на живом узле не ловило ImportError при рестарте панели (случай node1 19.08)
+# server.py импортирует sysinfo и hygiene — класть ДО server.py, чтобы окно между
+# копиями на живом узле не ловило ImportError при рестарте панели (случай node1 19.08)
 PANEL_FILES = ["webpanel/__init__.py", "webpanel/auth.py", "webpanel/sysinfo.py",
+               "webpanel/hygiene.py",
                "webpanel/server.py", "webpanel/views.py", "webpanel/setup_admin.py",
                "webpanel/clients.py", "webpanel/qrcode.py"]
 

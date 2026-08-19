@@ -10,6 +10,18 @@
 #   - tmp файлы
 #   - dmesg
 #   - lastlog
+#
+# Побочно пишет статистику для панели (сколько освободили, когда) в
+# /var/lib/vpn-panel/cleanup-stat.json с накоплением за сутки — карточка статуса
+# показывает «за сутки удалено N». Сам стат-файл следом клиента не является.
+
+# ── объём ДО чистки (для панели): каталоги журнала + логи + tmp ───────────────
+_du(){ du -bc "$@" 2>/dev/null | tail -1 | awk '{print $1+0}'; }
+J0=$(_du /var/log/journal /run/log/journal)
+LOGS=$(_du /var/log/wtmp /var/log/wtmp.db /var/log/btmp /var/log/lastlog \
+           /var/log/dpkg.log /var/log/apt/history.log /var/log/apt/term.log \
+           /var/log/apt/eipp.log.xz /var/log/alternatives.log /root/.bash_history)
+TMPB=$(_du /tmp/*.py /tmp/*.zip /tmp/*.gz /tmp/*.tar /opt/telegram_ws_relay.py)
 
 # ── journald — главный источник следов ────────────────────────────────────────
 journalctl --rotate 2>/dev/null
@@ -52,3 +64,26 @@ fi
 
 # ── systemd failed units ─────────────────────────────────────────────────────
 systemctl reset-failed 2>/dev/null
+
+# ── статистика для панели (накопление за сутки) ───────────────────────────────
+J1=$(_du /var/log/journal /run/log/journal)
+FREED=$(( (J0 > J1 ? J0 - J1 : 0) + LOGS + TMPB ))
+STAT=/var/lib/vpn-panel/cleanup-stat.json
+if command -v python3 >/dev/null 2>&1; then
+    python3 - "$STAT" "$FREED" 2>/dev/null <<'PY'
+import json, os, sys, time
+path, freed = sys.argv[1], int(sys.argv[2] or 0)
+now = time.time()
+try:
+    d = json.load(open(path))
+    runs = [r for r in d.get("runs", []) if isinstance(r, list) and len(r) == 2 and now - r[0] < 86400]
+except Exception:
+    runs = []
+runs.append([now, freed])
+out = {"last_at": now, "freed_24h": sum(int(r[1]) for r in runs), "runs_24h": len(runs), "runs": runs}
+os.makedirs(os.path.dirname(path), exist_ok=True)
+tmp = path + ".tmp"
+json.dump(out, open(tmp, "w"))
+os.replace(tmp, path)
+PY
+fi

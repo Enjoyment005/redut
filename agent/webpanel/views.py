@@ -32,7 +32,12 @@ a{color:var(--cyan)}
 ::selection{background:rgba(0,240,255,.25)}
 
 /* ── шапка ─────────────────────────────────────────────────────────── */
-.top{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap;margin-bottom:6px}
+/* Тулбар — отдельным рядом на всю ширину ПОД шапкой (19.08: раньше жался
+   справа от бренда, и «Выход» сползал на свою строку). Кнопки компактные,
+   группы разделены .vsep, переключатели интерфейса и «Выход» — прижаты
+   вправо (.grow). Подсказки живут на самих кнопках (data-h), кружки «?»
+   в тулбаре убраны — меньше шума, наведение/фокус показывает то же. */
+.top{margin-bottom:6px}
 .brand{font:700 20px/1.1 var(--ui);letter-spacing:.16em;text-transform:uppercase;
 background:linear-gradient(90deg,var(--cyan),var(--purple));-webkit-background-clip:text;background-clip:text;color:transparent}
 .brand small{display:block;font:400 11px/1.6 var(--mono);letter-spacing:.08em;color:var(--mut);
@@ -40,7 +45,9 @@ background:linear-gradient(90deg,var(--cyan),var(--purple));-webkit-background-c
 .cursor{display:inline-block;width:8px;height:14px;background:var(--cyan);vertical-align:-2px;margin-left:4px;
 animation:blink 1.1s steps(2,start) infinite;box-shadow:0 0 8px var(--cyan)}
 @keyframes blink{50%{opacity:0}}
-.tools{display:flex;gap:7px;flex-wrap:wrap;align-items:center;justify-content:flex-end}
+.tools{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:10px}
+.tools .grow{margin-left:auto}
+.vsep{width:1px;height:16px;background:var(--line2);margin:0 3px;flex:none}
 
 /* ── карточки с HUD-уголками ───────────────────────────────────────── */
 .card{position:relative;background-color:var(--card);border:1px solid var(--line);border-radius:12px;
@@ -81,7 +88,6 @@ border:1px solid rgba(0,240,255,.45);background:rgba(0,240,255,.08);color:var(--
 font:600 10px/1 var(--mono);cursor:help;margin-left:5px;vertical-align:1px;flex:none}
 .q:hover{background:rgba(0,240,255,.2)}
 .q:focus{outline:none;box-shadow:0 0 0 2px rgba(0,240,255,.25)}
-.btnq{display:inline-flex;align-items:center;gap:3px}   /* кнопка и её «?» не разъезжаются */
 #tip{position:fixed;z-index:200;max-width:300px;background:#08101f;border:1px solid rgba(0,240,255,.4);
 border-radius:9px;padding:9px 11px;color:#cfe0f5;font:400 12px/1.55 var(--ui);text-align:left;
 letter-spacing:0;text-transform:none;box-shadow:0 12px 34px rgba(0,0,0,.75);pointer-events:none;
@@ -145,10 +151,18 @@ background:linear-gradient(90deg,transparent,var(--cyan),transparent);opacity:.7
 display:flex;align-items:center}
 .tile .v{font:600 15px/1.35 var(--mono);margin-top:3px;word-break:break-word}
 
-/* ── строка «Сервер»: показатели машины обычным текстом под шапкой ──
-   Владелец попросил не карточки, а текст в стиле подстроки шапки (19.08):
-   спокойная muted-строка, подсвечиваются только тревожные значения. */
-.vitals{color:var(--mut);font:400 12px/1.75 var(--mono);margin:1px 0 4px}
+/* ── строка «Сервер»: показатели машины обычным текстом ──────────────
+   Владелец попросил не карточки, а текст ПРЯМО ПОД подстрокой шапки (19.08),
+   поэтому строка живёт внутри .brand — а тот красит текст градиентом через
+   background-clip:text + color:transparent: каждому цвету здесь нужен свой
+   -webkit-text-fill-color, иначе WebKit зальёт всё градиентом/муттом.
+   Строка спокойная, подсвечивается только тревожное. */
+.vitals{color:var(--mut);-webkit-text-fill-color:var(--mut);font:400 11px/1.65 var(--mono);
+letter-spacing:.06em;text-transform:none;margin-top:4px;white-space:normal}
+.vitals .ok{-webkit-text-fill-color:var(--green)}
+.vitals .warn{-webkit-text-fill-color:var(--amber)}
+.vitals .bad{-webkit-text-fill-color:var(--pink)}
+.vitals .q{-webkit-text-fill-color:var(--cyan)}
 
 /* ── таблицы ───────────────────────────────────────────────────────── */
 .scroll{overflow:auto;margin:0 -3px;padding:0 3px}
@@ -230,7 +244,7 @@ box-shadow:0 10px 30px rgba(0,0,0,.6);word-break:break-word}
 .flags span{display:inline-block;width:16px;text-align:center;font-weight:700}
 .qrwrap{background:#fff;display:inline-block;padding:9px;border-radius:9px;box-shadow:0 0 24px rgba(0,240,255,.25)}
 .foot{color:var(--dim);font:400 11px/1.6 var(--mono);text-align:center;margin-top:26px}
-@media(max-width:640px){.top{flex-direction:column}.tools{justify-content:flex-start}.card{padding:13px 13px}}
+@media(max-width:640px){.tools .grow{margin-left:0}.card{padding:13px 13px}}
 """
 
 
@@ -372,28 +386,23 @@ _DASH_HTML = """
 <div class="wrap">
   <div class="top">
     <div class="brand">VPN&nbsp;PANEL · <span id="srv">__SRV__</span>
-      <small><span id="subline">соединяюсь с сервером…</span><span class="cursor"></span></small></div>
-    <div class="tools">
-      <button class="btn s tiny" id="exbtn" onclick="toggleEx()" title="Показать/скрыть подсказки простым языком">💡 Объяснения: вкл</button>
-      <button class="btn s tiny" id="foldbtn" onclick="foldToggleAll()" title="Развернуть или свернуть сразу все разделы">▾ Развернуть всё</button>
-      <span class="btnq"><button class="btn s" onclick="egress()">Проверить выход</button><i class="q" tabindex="0"
-        data-h="Безопасно, ничего не меняет. Сервер спрашивает у внешнего сайта: «какой у меня IP?» — и показывает ответ. Так видно, доходит ли трафик до зарубежного прокси.">?</i></span>
-      <span class="btnq"><button class="btn s" onclick="refresh()">Обновить пул</button><i class="q" tabindex="0"
-        data-h="Безопасно, денег не тратит. Заново спрашивает у провайдера список твоих прокси: какие живы, сколько дней осталось, какой баланс.">?</i></span>
-      <span class="btnq"><button class="btn a" onclick="doRotate()">Ротация</button><i class="q" tabindex="0"
-        data-h="Автоматическая починка. Панель проверяет текущий прокси и, если он мёртв, по порядку: подстраивает настройки → переключается на живой из пула → докупает новый (в рамках лимитов) → как крайняя мера включает аварийный режим. Может сменить прокси и потратить деньги. Если всё и так работает — ничего не делает.">?</i></span>
-      <span class="btnq"><button class="btn r" id="embtn" onclick="doEmergency()">Аварийный режим</button><i class="q" tabindex="0"
-        data-h="Спасательный круг, когда прокси мёртв. Трафик клиентов идёт напрямую через сервер: интернет появляется, но выход — с российского IP, то есть блокировки НЕ обходятся. Включённая вручную авария держится, пока сам её не снимешь — автоматика её не отменит. Нажми ещё раз, чтобы вернуть трафик на прокси.">?</i></span>
-      <span class="btnq"><button class="btn s" id="frbtn" onclick="doFreeze()">⏸ Пауза автоматики</button><i class="q" tabindex="0"
-        data-h="Пока пауза включена, сторож ничего не меняет сам: не переключает прокси, не покупает, не включает аварию. Полезно на время ручных работ. Не забудь снять — на паузе узел сам не чинится.">?</i></span>
-      <span class="btnq"><button class="btn r" onclick="rollback()">Откат</button><i class="q" tabindex="0"
-        data-h="Машина времени на один шаг: возвращает предыдущий рабочий конфиг из резервных копий. Нужен, если после смены прокси стало хуже, а автоматический откат не сработал.">?</i></span>
+      <small><span id="subline">соединяюсь с сервером…</span><span class="cursor"></span></small>
+      <div class="vitals" id="vitals" style="display:none"></div></div>
+    <div class="tools" role="toolbar">
+      <button class="btn s tiny" onclick="egress()" data-h="Безопасно, ничего не меняет. Сервер спрашивает у внешнего сайта: «какой у меня IP?» — и показывает ответ. Так видно, доходит ли трафик до зарубежного прокси.">Проверить выход</button>
+      <button class="btn s tiny" onclick="refresh()" data-h="Безопасно, денег не тратит. Заново спрашивает у провайдера список твоих прокси: какие живы, сколько дней осталось, какой баланс.">Обновить пул</button>
+      <span class="vsep"></span>
+      <button class="btn a tiny" onclick="doRotate()" data-h="Автоматическая починка. Панель проверяет текущий прокси и, если он мёртв, по порядку: подстраивает настройки → переключается на живой из пула → докупает новый (в рамках лимитов) → как крайняя мера включает аварийный режим. Может сменить прокси и потратить деньги. Если всё и так работает — ничего не делает.">Ротация</button>
+      <button class="btn r tiny" id="embtn" onclick="doEmergency()" data-h="Спасательный круг, когда прокси мёртв. Трафик клиентов идёт напрямую через сервер: интернет появляется, но выход — с российского IP, то есть блокировки НЕ обходятся. Включённая вручную авария держится, пока сам её не снимешь — автоматика её не отменит. Нажми ещё раз, чтобы вернуть трафик на прокси.">Аварийный режим</button>
+      <button class="btn s tiny" id="frbtn" onclick="doFreeze()" data-h="Пока пауза включена, сторож ничего не меняет сам: не переключает прокси, не покупает, не включает аварию. Полезно на время ручных работ. Не забудь снять — на паузе узел сам не чинится.">⏸ Пауза автоматики</button>
+      <button class="btn r tiny" onclick="rollback()" data-h="Машина времени на один шаг: возвращает предыдущий рабочий конфиг из резервных копий. Нужен, если после смены прокси стало хуже, а автоматический откат не сработал.">Откат</button>
+      <span class="grow"></span>
+      <button class="btn s tiny" id="exbtn" onclick="toggleEx()" data-h="Показать или скрыть пояснения простым языком по всей панели.">💡 Объяснения: вкл</button>
+      <button class="btn s tiny" id="foldbtn" onclick="foldToggleAll()" data-h="Развернуть или свернуть сразу все разделы.">▾ Развернуть всё</button>
       <form method="POST" action="/logout" style="display:inline"><input type="hidden" name="csrf" value="__CSRF__">
-        <button class="btn s" type="submit">Выход</button></form>
+        <button class="btn s tiny" type="submit">Выход</button></form>
     </div>
   </div>
-
-  <div class="vitals" id="vitals" style="display:none"></div>
 
   <div class="ex">Это пульт управления VPN-сервером. Здесь ты <b>выдаёшь доступ людям</b> (раздел «Кто
     подключён»), смотришь, <b>через какой зарубежный прокси</b> сервер выпускает трафик наружу, и меняешь
@@ -411,10 +420,17 @@ _DASH_HTML = """
       переключиться, а пунктир между ними — эти самые запасные пути. Сама картинка нарисована прямо
       в панели по встроенным данным: браузер наружу ничего не запрашивает и точку ставит <b>по
       стране</b>, а не по адресу — точнее geoip всё равно не знает.
-      <b>Справа — паспорт IP</b>: сервер один раз на адрес спрашивает публичные гео-базы и
-      показывает, что о нём известно, — оператор и сеть (ASN), датацентр ли это, город, часовой
-      пояс, обратное DNS-имя. Интересно и полезно: по типу сети видно, как сайты будут относиться
-      к адресу.</div>
+      <b>Справа — паспорт IP</b>: сервер один раз на адрес спрашивает публичные гео- и
+      антифрод-базы и показывает, что о нём известно, — оператор и сеть (ASN), датацентр ли это,
+      город, пояс, PTR, а ниже — <b>риск-разведка</b>: светится ли адрес как прокси/VPN/Tor
+      (proxycheck, IPQS), баллы риска и жалобы (0–100, меньше — лучше), числится ли в
+      спам-чёрных списках (Spamhaus, SpamCop, Barracuda — прямые DNS-проверки), пинг до прокси
+      и <b>итоговая оценка 0–100</b>: 75+ — сайты примут спокойно, ниже 50 — жди капчи и
+      подозрения. Бесплатные источники работают сразу; впишешь на сервере ключи AbuseIPDB и
+      IPQualityScore (файл <span class="mono">secrets.json</span>, раздел
+      <span class="mono">ipintel</span>) — добавятся жалобы и fraud-балл. Честности ради:
+      утечки DNS/WebRTC отсюда проверить нельзя — они проверяются только с устройства клиента
+      (например, browserleaks.com), сервер про них знать не может.</div>
     <div class="map">
       <canvas id="geocv" width="1200" height="420"></canvas>
       <div class="lock" id="geolock">СВЯЗЬ ЕЩЁ НЕ ПРОВЕРЕНА</div>
@@ -623,9 +639,14 @@ function esc(s){return (s==null?'':''+s).replace(/[&<>"']/g,c=>({'&':'&amp;','<'
 function toast(t,cls){const d=document.createElement('div');d.className='msg '+(cls||'');d.textContent=t;
   document.getElementById('toast').appendChild(d);setTimeout(()=>d.remove(),9000)}
 /* ── подсказки: одно облачко на всю страницу, позиционируем сами ──
-   Делегирование, потому что «?» рождаются и в JS (плитки, строки пула). */
+   Делегирование, потому что «?» рождаются и в JS (плитки, строки пула).
+   Кроме кружков .q облачко показывают и элементы с data-h (кнопки тулбара,
+   19.08: кружки рядом с кнопками убраны ради компактности) — но по клику
+   тоггл работает только у .q: клик по кнопке должен жать кнопку, а не
+   играть с подсказкой. */
 (function(){const tip=document.createElement('div');tip.id='tip';document.body.appendChild(tip);
   let cur=null;
+  function tgt(e){return e.target.closest?e.target.closest('.q,[data-h]'):null}
   function show(q){const t=q.getAttribute('data-h');if(!t)return;cur=q;
     tip.textContent=t;tip.classList.add('on');place(q)}
   function place(q){const r=q.getBoundingClientRect();const b=tip.getBoundingClientRect();
@@ -636,9 +657,9 @@ function toast(t,cls){const d=document.createElement('div');d.className='msg '+(
     if(top+b.height>window.innerHeight-M)top=Math.max(M,window.innerHeight-b.height-M);
     tip.style.left=left+'px';tip.style.top=top+'px'}
   function hide(){cur=null;tip.classList.remove('on')}
-  document.addEventListener('mouseover',e=>{const q=e.target.closest?e.target.closest('.q'):null;
+  document.addEventListener('mouseover',e=>{const q=tgt(e);
     if(q&&q!==cur)show(q);else if(!q&&cur)hide()});
-  document.addEventListener('focusin',e=>{const q=e.target.closest?e.target.closest('.q'):null;if(q)show(q)});
+  document.addEventListener('focusin',e=>{const q=tgt(e);if(q)show(q)});
   document.addEventListener('focusout',hide);
   document.addEventListener('click',e=>{const q=e.target.closest?e.target.closest('.q'):null;
     if(q){cur===q?hide():show(q)}});              // на телефоне подсказка открывается тапом
@@ -843,6 +864,11 @@ function geoSync(s){s=s||window.__S;if(!s||!document.getElementById('geocv'))ret
    браузер наружу по-прежнему не ходит (CSP). Грузим один раз на адрес,
    при неудаче не долбим чаще раза в 5 минут. */
 function intelRow(k,v){return v?('<div class="row"><b>'+esc(k)+'</b><span>'+esc(v)+'</span></div>'):''}
+function intelRowH(k,h){return h?('<div class="row"><b>'+esc(k)+'</b><span>'+h+'</span></div>'):''}
+/* Паспорт IP + риск-разведка (19.08): чем адрес светится в антифрод-базах.
+   Источники собирает СЕРВЕР (proxycheck без ключа; AbuseIPDB/IPQS — по ключам
+   из secrets.ipintel; DNSBL — прямые DNS-запросы) и кэширует по IP на 7 дней.
+   Чего источник не сказал — строки просто нет: неизвестность не рисуем. */
 function intelHtml(ip,d){
   const asn=[d.asn,d.asname].filter(Boolean).join(' · ');
   const op=(d.org&&d.org!==d.asname)?d.org:((d.isp&&d.isp!==d.asname)?d.isp:'');
@@ -853,9 +879,35 @@ function intelHtml(ip,d){
   const flags=[];
   if(d.hosting)flags.push('датацентр/хостинг');
   if(d.mobile)flags.push('мобильная сеть');
-  if(d.proxy)flags.push('в базах отмечен как прокси');
+  if(d.pc_type&&!/^(vpn|socks|http|tor)/i.test(d.pc_type))flags.push(esc(d.pc_type).toLowerCase());
   const typ=flags.length?flags.join(' · '):(d.hosting===false?'не датацентр — «жилой» адрес':'');
-  return '<div class="t">Паспорт IP</div>'+
+  /* строка «прокси»: что видят антифрод-базы */
+  let px='';
+  const tor=d.ipqs_tor||/^tor$/i.test(d.pc_type||'');
+  if(tor)px='<span class="bad">TOR — сайты будут блокировать</span>';
+  else{const seen=[];
+    if(d.pc_proxy)seen.push('proxycheck: '+esc(d.pc_type||'прокси'));
+    if(d.ipqs_vpn)seen.push('IPQS: VPN');
+    if(d.proxy&&!seen.length)seen.push('ip-api: прокси');
+    px=seen.length?('<span class="warn">'+seen.join(' · ')+'</span>')
+      :((d.pc_proxy===false||d.ipqs_vpn===false||d.proxy===false)?'<span class="ok">не светится</span>':'')}
+  /* строка «риск»: баллы источников 0-100 (меньше = лучше) */
+  const rr=[];
+  if(d.pc_risk!=null)rr.push('pc '+d.pc_risk);
+  if(d.ipqs_fraud!=null)rr.push('fraud '+d.ipqs_fraud);
+  if(d.abuse_score!=null)rr.push('abuse '+d.abuse_score+(d.abuse_reports?(' ('+d.abuse_reports+' жал.)'):''));
+  const rmax=Math.max(d.pc_risk||0,d.ipqs_fraud||0,d.abuse_score||0);
+  const risk=rr.length?('<span class="'+(rmax<40?'ok':(rmax<70?'warn':'bad'))+'">'+esc(rr.join(' · '))+'</span>'):'';
+  /* чёрные списки DNSBL */
+  let bl='';
+  const z=d.dnsbl||null;
+  if(z&&z.checked)bl=z.listed&&z.listed.length
+    ?('<span class="bad">'+esc(z.listed.map(x=>x.split('.')[1]||x).join(', '))+'!</span>')
+    :('<span class="ok">чист · '+z.checked+' зоны</span>');
+  const q=(d.quality!=null)?d.quality:null;
+  const qc=q==null?'':(q>=75?'ok':(q>=50?'warn':'bad'));
+  const qt=q==null?'':(q>=75?'хороший':(q>=50?'средний':'плохой'));
+  return '<div class="t">Паспорт IP'+(q!=null?(' · <span class="'+qc+'">'+q+'/100 '+qt+'</span>'):'')+'</div>'+
     intelRow('адрес',ip)+
     intelRow('сеть',asn)+
     intelRow('оператор',op)+
@@ -863,6 +915,10 @@ function intelHtml(ip,d){
     intelRow('пояс',d.tz?(d.tz+(time?(' · там '+time):'')):'')+
     intelRow('ptr',d.ptr)+
     intelRow('тип',typ)+
+    intelRowH('прокси',px)+
+    intelRowH('риск',risk)+
+    intelRowH('чс',bl)+
+    intelRow('пинг',d.ping_ms!=null?(d.ping_ms+' мс до прокси'):'')+
     ((d.lat!=null&&d.lon!=null)?intelRow('коорд.',(+d.lat).toFixed(2)+', '+(+d.lon).toFixed(2)):'')}
 async function geoIntel(s){const el=document.getElementById('geointel');if(!el)return;
   const ip=(s&&s.egress_at&&s.egress)||'';
@@ -889,55 +945,55 @@ function fl(v){return v===1?'<span class="ok">✓</span>':v===0?'<span class="ba
 function tile(k,v,hint){return '<div class="tile"><div class="k">'+k+(hint?('<i class="q" tabindex="0" data-h="'+esc(hint)+'">?</i>'):'')+
   '</div><div class="v">'+v+'</div></div>'}
 
-/* ── строка «Сервер»: показатели машины из /api/status (s.sys) ──
-   Обычный текст в стиле подстроки шапки (просьба владельца 19.08): спокойная
-   muted-строка «нагрузка · память · swap · диск · службы · аптайм · устройства»,
-   цветом подсвечивается только тревожное (проценты ≥60/≥85, упавшие службы,
-   перебор устройств). Данных нет (dev-режим не на Linux) — строка скрыта. */
-function plural(n,a,b,c){n=Math.abs(n)%100;const m=n%10;
-  return (n>10&&n<20)?c:(m>1&&m<5?b:(m==1?a:c))}
+/* ── блок «Сервер»: показатели машины из /api/status (s.sys) ──
+   Формат владельца (19.08, финальный), две строки прямо под подстрокой шапки,
+   разделитель «|»:
+     4 vCPU/4 GB RAM/69 GB|CPU 0%|RAM 9%|Диск 1%     (+ |Swap N%, если настроен)
+     Службы ✓|Аптайм 19ч|Устр. 2 из 40 max
+   Спокойный muted-текст, цветом подсвечивается только тревожное (проценты
+   ≥60/≥85, упавшие службы, перебор устройств). Не Linux — блок скрыт. */
 function pc(v,p){if(p==null)return v;
   return p<60?v:('<span class="'+(p<85?'warn':'bad')+'">'+v+'</span>')}
-function gmem(mb){if(mb==null)return '?';if(mb<1024)return mb+' МБ';
-  const g=mb/1024;return (g%1?g.toFixed(1):g.toFixed(0))+' ГБ'}
+function gbt(mb){if(mb==null)return '?';
+  return mb>=1024?(Math.round(mb/1024)+' GB'):(mb+' MB')}
 function upTxt(sec){if(sec==null)return '—';const d=Math.floor(sec/86400);
-  if(d>=1)return d+' '+plural(d,'день','дня','дней');const h=Math.floor(sec/3600);
-  if(h>=1)return h+' ч';return Math.max(1,Math.floor(sec/60))+' мин'}
+  if(d>=1)return d+'дн';const h=Math.floor(sec/3600);
+  if(h>=1)return h+'ч';return Math.max(1,Math.floor(sec/60))+'мин'}
 function vitals(){const el=document.getElementById('vitals');if(!el)return;
   const s=window.__S||{};const y=s.sys;
   if(!y){el.style.display='none';return}
   const cores=y.cores||1,rec=y.rec_clients,n=window.__CN;
-  const t=[];
-  t.push('нагрузка '+(y.load_pct==null?'—':pc(y.load_pct+'%',y.load_pct))+
-    ' ('+cores+' '+plural(cores,'ядро','ядра','ядер')+')');
-  t.push('память '+(y.mem_pct==null?'—':pc(y.mem_pct+'%',y.mem_pct))+
-    ' ('+gmem(y.mem_used_mb)+' из '+gmem(y.mem_total_mb)+')');
-  t.push('swap '+(y.swap_total_mb?(pc(y.swap_pct+'%',y.swap_pct)+' ('+gmem(y.swap_used_mb)+' из '+gmem(y.swap_total_mb)+')'):'нет'));
-  t.push('диск: свободно '+(y.disk_free_gb==null?'—':y.disk_free_gb+' ГБ')+
-    (y.disk_pct==null?'':(' ('+pc('занято '+y.disk_pct+'%',y.disk_pct)+')')));
+  const l1=cores+' vCPU/'+gbt(y.mem_total_mb)+' RAM/'+
+    (y.disk_total_gb==null?'? GB':(Math.round(y.disk_total_gb)+' GB'))+
+    '|CPU '+(y.load_pct==null?'—':pc(y.load_pct+'%',y.load_pct))+
+    '|RAM '+(y.mem_pct==null?'—':pc(y.mem_pct+'%',y.mem_pct))+
+    (y.swap_total_mb?('|Swap '+pc(y.swap_pct+'%',y.swap_pct)):'')+
+    '|Диск '+(y.disk_pct==null?'—':pc(y.disk_pct+'%',y.disk_pct));
   const sb=(s.singbox||'')==='active',wg=!!y.wg_up;
   const fallen=(sb?'':'sing-box')+((!sb&&!wg)?' и ':'')+(wg?'':'wg0');
-  t.push('службы '+((sb&&wg)?'<span class="ok">✓ в строю</span>'
-    :('<span class="bad">'+esc(fallen)+' — сбой</span>')));
-  t.push('аптайм '+upTxt(y.uptime_sec));
-  if(rec)t.push('устройств '+(n==null?'':((n>rec?('<span class="warn">'+n+'</span>'):n)+' · '))+
-    'советуем ≤'+rec);
-  el.innerHTML=t.join(' · ')+' <i class="q" tabindex="0" data-h="'+esc(
-    'Показатели самого сервера. Нагрузка — насколько занят процессор (среднее за минуту к числу ядер; '+
-    'постоянные 85%+ — тормоза). Память — честно занятая, отдаваемые кэши не считаются. Swap — '+
-    'подстраховка памяти на диске («нет» — не настроен). Диск — место на системном диске. Службы: '+
-    'wg0 — VPN-туннель для устройств, sing-box — труба к зарубежному прокси; при сбое нажми «Ротация», '+
-    'не помогло — перезагрузи сервер. Устройств — оценка вместимости: ~10 одновременно работающих на '+
-    'ядро с поправкой на память; профилей можно выдать больше, важно сколько онлайн разом — все делят '+
-    'один прокси-канал.')+'">?</i>';
+  const l2='Службы '+((sb&&wg)?'<span class="ok">✓</span>'
+    :('<span class="bad">✕ '+esc(fallen)+'</span>'))+
+    '|Аптайм '+upTxt(y.uptime_sec)+
+    (rec?('|Устр. '+(n==null?('до '+rec+' max')
+      :((n>rec?('<span class="warn">'+n+'</span>'):n)+' из '+rec+' max'))):'');
+  const q=' <i class="q" tabindex="0" data-h="'+esc(
+    'Показатели самого сервера. Начало — железо: ядра, память, диск. CPU — насколько занят '+
+    'процессор (среднее за минуту к числу ядер; постоянные 85%+ — тормоза). RAM — честно занятая '+
+    'память, отдаваемые кэши не считаются. Swap — подстраховка памяти на диске (поля нет — swap '+
+    'не настроен). Диск — сколько занято. Службы: sing-box — труба к зарубежному прокси, wg0 — '+
+    'VPN-туннель устройств; при ✕ нажми «Ротация», не помогло — перезагрузи сервер. Устр. — '+
+    'оценка вместимости: ~10 одновременно работающих устройств на ядро с поправкой на память '+
+    'и минус 20% запаса на стабильность; профилей можно выдать больше, важно сколько онлайн '+
+    'разом — все делят один прокси-канал.')+'">?</i>';
+  el.innerHTML=l1+'<br>'+l2+q;
   el.style.display='block'}
 /* рекомендация «сколько устройств потянет сервер» в разделе «Кто подключён» */
 function clientRec(){const el=document.getElementById('crec');if(!el)return;
   const s=window.__S||{};const y=s.sys||null;const rec=y&&y.rec_clients;
   if(!rec){el.style.display='none';return}
   const n=window.__CN;const over=(n!=null&&n>rec);
-  el.innerHTML='💡 Для этого сервера ('+y.cores+' '+plural(y.cores,'ядро','ядра','ядер')+', '+
-    gmem(y.mem_total_mb)+' памяти) рекомендуется не более <b>'+rec+'</b> одновременно работающих устройств.'+
+  el.innerHTML='💡 Для этого сервера ('+y.cores+' vCPU, '+gbt(y.mem_total_mb)+' RAM)'+
+    ' рекомендуется не более <b>'+rec+'</b> одновременно работающих устройств.'+
     (n==null?'':' Профилей выдано: '+n+'.')+
     (over?' <span class="warn">Это больше рекомендации — ничего не сломается, но если все выйдут в сеть разом, скорость заметно просядет.</span>':'');
   el.style.display='block'}
@@ -975,6 +1031,32 @@ function agoTxt(sec){if(sec==null)return '';
   if(sec<90)return 'только что';if(sec<5400)return Math.max(1,Math.floor(sec/60))+' мин назад';
   if(sec<172800)return Math.floor(sec/3600)+' ч назад';return Math.floor(sec/86400)+' дн назад'}
 const STALE=900;   // 15 мин — после этого метку считаем несвежей
+
+/* ── гигиена узла (белый список РФ + очистка следов) под маяком ── */
+function fmtInt(n){return (n==null?0:+n).toLocaleString('ru-RU')}
+function fmtBytes(b){if(b==null)return '—';b=+b;if(b<1024)return b+' Б';
+  const u=['КБ','МБ','ГБ','ТБ'];let i=-1;do{b/=1024;i++}while(b>=1024&&i<3);
+  return (b<10?b.toFixed(1):Math.round(b))+' '+u[i]}
+/* дату форматирует браузер — в часовом поясе владельца */
+function relDay(ep){if(!ep)return '';const d=new Date(ep*1000),now=new Date();
+  const hm=d.toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
+  if(now.toDateString()===d.toDateString())return 'сегодня '+hm;
+  if(new Date(now-864e5).toDateString()===d.toDateString())return 'вчера '+hm;
+  const days=Math.floor((now-d)/864e5);
+  return days<7?(days+' дн назад'):d.toLocaleDateString('ru-RU')}
+function hygieneLines(s){const h=s&&s.hygiene;if(!h)return '';
+  const LN=' style="font-size:11px;opacity:.72;margin-top:3px;line-height:1.5"';
+  const ON='<b style="color:#05ffa1">вкл</b>',OFF='<span style="opacity:.6">выкл</span>';
+  let out='';const w=h.whitelist,c=h.cleanup;
+  if(w)out+='<div'+LN+'>Белые списки РФ: '+(w.on
+    ?(ON+' · '+fmtInt(w.domains)+' доменов, '+fmtInt(w.nets)+' сетей'
+      +(w.updated_at?(' · обновлён '+relDay(w.updated_at)):''))
+    :OFF+' — весь трафик уходит через прокси')+'</div>';
+  if(c)out+='<div'+LN+'>Очистка следов: '+(c.on
+    ?(ON+(c.freed_24h!=null?(' · за сутки удалено '+fmtBytes(c.freed_24h)):'')
+      +(c.last_at?(' · последняя '+relDay(c.last_at)):''))
+    :OFF)+'</div>';
+  return out}
 
 /* ── маяк: одно предложение о том, всё ли хорошо ── */
 function beacon(s,clients){
@@ -1018,7 +1100,7 @@ function beacon(s,clients){
   else if(s.frozen&&cls!=='b-ok'){ttl+=' · автоматика на паузе';
     txt+=' ⏸ Автоматика на паузе: сама не починится, пока паузу не снимешь (кнопка сверху).'}
   b.className='beacon '+cls;
-  b.innerHTML='<div class="dot"></div><div><div class="ttl">'+ttl+'</div><div class="txt">'+txt+'</div></div>'}
+  b.innerHTML='<div class="dot"></div><div><div class="ttl">'+ttl+'</div><div class="txt">'+txt+'</div>'+hygieneLines(s)+'</div>'}
 
 async function loadStatus(){const s=await api('/api/status');window.__S=s;
   document.getElementById('subline').textContent=
@@ -1049,10 +1131,10 @@ async function loadStatus(){const s=await api('/api/status');window.__S=s;
       'Когда сторож последний раз отчитывался. Пусто сразу после установки — появится в течение часа.'),
   ].join('');
   const eb=document.getElementById('embtn');
-  if(eb){eb.textContent=s.emergency?'Снять аварию':'Аварийный режим';eb.className='btn '+(s.emergency?'g':'r');}
+  if(eb){eb.textContent=s.emergency?'Снять аварию':'Аварийный режим';eb.className='btn tiny '+(s.emergency?'g':'r');}
   const fb=document.getElementById('frbtn');
-  if(fb){fb.textContent=s.frozen?'▶ Возобновить автоматику':'⏸ Пауза автоматики';
-    fb.className='btn '+(s.frozen?'a':'s')}
+  if(fb){fb.textContent=s.frozen?'▶ Снять паузу':'⏸ Пауза автоматики';
+    fb.className='btn tiny '+(s.frozen?'a':'s')}
   beacon(s,window.__CN);
   /* сводки в шапках: свёрнутый раздел всё равно говорит главное */
   sum('pool','живых прокси: '+(s.pool_alive==null?'?':s.pool_alive)+

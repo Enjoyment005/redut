@@ -75,6 +75,7 @@ from webpanel import auth, views    # noqa: E402
 from webpanel import clients as clients_mod   # noqa: E402
 from webpanel import qrcode as qr_mod         # noqa: E402
 from webpanel import sysinfo as sysinfo_mod   # noqa: E402
+from webpanel import hygiene as hygiene_mod   # noqa: E402
 
 ETC_CONFIG = "/etc/vpn-panel/config.json"
 ETC_SECRETS = "/etc/vpn-panel/secrets.json"
@@ -683,9 +684,7 @@ class Handler(BaseHTTPRequestHandler):
                     if name in summary["errors"]:
                         continue
                     try:
-                        b = prov.balance()
-                        APP.pool.conn.execute("INSERT OR REPLACE INTO setting(key,value) VALUES(?,?)",
-                                              ("balance:%s" % name, "%s %s" % (b.get("balance"), b.get("currency"))))
+                        money_mod.store_balance(APP.pool, name, prov.balance())
                     except ProviderError:
                         pass
                 APP.pool.conn.commit()
@@ -999,10 +998,25 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 data = None
             age = states_mod.age_seconds((data or {}).get("at"))
-            if data and data.get("intel") and age is not None and age < probe_mod.INTEL_TTL_S:
+            # кэш старого формата (без риск-разведки, v < INTEL_VERSION) не годится —
+            # перечитываем источники, как будто кэша не было
+            if (data and data.get("intel") and age is not None
+                    and age < probe_mod.INTEL_TTL_S
+                    and (data["intel"] or {}).get("v") == probe_mod.INTEL_VERSION):
                 return {"ok": True, "ip": ip, "cached_at": data.get("at"),
                         "intel": data["intel"]}
-        intel = probe_mod.ip_intel(ip)      # сеть (до ~8 с) — ВНЕ лока БД
+        # пинг до боевого прокси — из последнего замера пула (ничего не меряем)
+        ping = None
+        cur = APP.current_host()
+        if cur:
+            with _DB_LOCK:
+                for r in APP.pool.list(include_gone=True):
+                    if r["host"] == cur and _has(r, "latency_ms"):
+                        ping = r["latency_ms"]
+                        break
+        # риск-источники по ключам (не обязательны): secrets.json -> "ipintel"
+        keys = (APP.secrets.get("ipintel") or {}) if isinstance(APP.secrets, dict) else {}
+        intel = probe_mod.ip_intel_full(ip, keys=keys, ping_ms=ping)  # сеть — ВНЕ лока БД
         if not intel:
             return {"ok": False, "ip": ip, "why": "гео-базы не ответили"}
         with _DB_LOCK:
@@ -1060,8 +1074,7 @@ class Handler(BaseHTTPRequestHandler):
         APP.save_provider_key(name, key)
         if ok:
             with _DB_LOCK:
-                APP.pool.set_setting("balance:%s" % name,
-                                     "%s %s" % (info.get("balance"), info.get("currency")))
+                money_mod.store_balance(APP.pool, name, info)
         with _DB_LOCK:
             APP.pool.log_event("key-set", actor="user", result="ok" if ok else "unverified",
                                detail=name, src_ip=self._client_ip())
@@ -1136,8 +1149,7 @@ class Handler(BaseHTTPRequestHandler):
         ok, info = check_key(name, key)
         with _DB_LOCK:
             if ok:
-                APP.pool.set_setting("balance:%s" % name,
-                                     "%s %s" % (info.get("balance"), info.get("currency")))
+                money_mod.store_balance(APP.pool, name, info)
             APP.pool.log_event("key-check", actor="user",
                                result="ok" if ok else ("no-link" if info.get("network") else "fail"),
                                detail="%s: %s" % (name, info.get("error", "")) if not ok else name,
@@ -1566,7 +1578,11 @@ class Handler(BaseHTTPRequestHandler):
                # полоска «Сервер» в шапке: нагрузка/память/диск/swap + оценка
                # вместимости. Всё из /proc без subprocess — дёшево на каждый
                # 30-секундный опрос; вне Linux здесь None, полоска прячется.
-               "sys": sysinfo_mod.snapshot()}
+               "sys": sysinfo_mod.snapshot(),
+               # гигиена узла для карточки статуса: белый список РФ (домены/сети/когда
+               # обновляли) и очистка следов (когда, сколько за сутки) — из файлов, без
+               # subprocess, как sys. has_dnsmasq берём из конфига узла.
+               "hygiene": hygiene_mod.snapshot(APP.cfg)}
         for o in sb.get("outbounds", []):
             if o.get("tag") == "socks-out":
                 out["upstream"]["socks_out"] = "%s:%s %s" % (o.get("server"), o.get("server_port"), o.get("type"))
@@ -1686,6 +1702,39 @@ def requires_tls(cfg):
     return bool(server_ip) and not server_ip.startswith("127.") and server_ip != "::1"
 
 
+# Таймаут клиентского соединения (с): TLS-рукопожатие, чтение запроса и простой keep-alive
+# не должны длиться вечно. Без него медленный/молчащий клиент (сканер, slowloris) держит
+# поток и сокет бесконечно.
+_CONN_TIMEOUT = 30
+
+
+class PanelHTTPSServer(ThreadingHTTPServer):
+    """HTTPS-сервер панели: TLS-рукопожатие НЕ в главном потоке приёма + таймаут соединения.
+
+    Штатный приём оборачивает СЛУШАЮЩИЙ сокет (`ctx.wrap_socket(httpd.socket)`), из-за чего
+    accept() выполняет TLS-рукопожатие прямо в главном потоке: один клиент, не завершающий
+    рукопожатие (сканер/slowloris), блокирует приём ВСЕХ остальных — процесс жив, порт слушает,
+    а панель «висит» (найдено на node2 19.08). Здесь accept() отдаёт сокет сразу
+    (`do_handshake_on_connect=False` — рукопожатие откладывается до первого чтения, а оно уже
+    в потоке-обработчике), и на соединение поставлен таймаут: медленный клиент занимает лишь
+    свой поток и отваливается сам, не трогая остальных."""
+
+    daemon_threads = True
+    ssl_ctx = None            # ставится в main(), когда есть cert/key (иначе dev-HTTP)
+
+    def get_request(self):
+        sock, addr = self.socket.accept()      # обычный TCP-приём — без рукопожатия, быстрый
+        sock.settimeout(_CONN_TIMEOUT)
+        if self.ssl_ctx is not None:
+            # рукопожатие отложено (do_handshake_on_connect=False): произойдёт при первом
+            # чтении в рабочем потоке под таймаутом выше, а не здесь, в главном цикле приёма
+            sock = self.ssl_ctx.wrap_socket(sock, server_side=True, do_handshake_on_connect=False)
+        return sock, addr
+
+    def handle_error(self, request, client_address):
+        pass                  # битые/медленные соединения (сканеры) не шумят в лог (OPSEC, как log_message)
+
+
 def main():
     global APP
     APP = App()
@@ -1694,7 +1743,7 @@ def main():
         print("⚠️ Панель НЕ настроена — открой https://<host>:%d/setup (мастер первого входа: "
               "провайдер, 2FA, пароль, почта)" % port, file=sys.stderr)
     threading.Thread(target=_pulse_monitor, daemon=True).start()   # §6.3 пульс агента
-    httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    httpd = PanelHTTPSServer(("0.0.0.0", port), Handler)
     # На РЕАЛЬНОМ узле (в конфиге прописан внешний server_ip) панель обязана работать по HTTPS:
     # пароль и TOTP не должны идти открытым текстом. При гонке старта (установщик ещё выпускает
     # cert) коротко подождём его появления, и только dev-запуск без server_ip уходит в HTTP.
@@ -1709,7 +1758,7 @@ def main():
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(CERT, KEY)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        httpd.ssl_ctx = ctx     # рукопожатие делает PanelHTTPSServer.get_request (в потоке, под таймаутом)
         scheme = "https"
     elif on_server:
         # cert так и не появился, но это боевой узел — HTTP недопустим, лучше упасть (systemd

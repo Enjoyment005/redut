@@ -127,6 +127,7 @@ AGENT_FILES = ["update.py", "agent.py", "pool.py", "probe.py", "apply.py", "mone
 # sysinfo.py — ДО server.py: тот его импортирует, окно между копиями на живом
 # узле не должно ловить ImportError при рестарте панели (случай node1 19.08)
 PANEL_FILES = ["webpanel/__init__.py", "webpanel/auth.py", "webpanel/sysinfo.py",
+               "webpanel/hygiene.py",
                "webpanel/server.py", "webpanel/views.py", "webpanel/setup_admin.py",
                "webpanel/clients.py", "webpanel/qrcode.py"]
 

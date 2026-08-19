@@ -10,6 +10,7 @@ Telegram-проба (CONNECT по домену), латентность = мед
 """
 import json
 import re
+import socket
 import statistics
 import subprocess
 import urllib.request
@@ -132,9 +133,15 @@ _INTEL_PRIMARY = ("http://ip-api.com/json/%s?fields=status,countryCode,regionNam
 _INTEL_SECONDARY = "https://ipinfo.io/%s/json"
 
 
+# proxycheck.io отвечает 403 на дефолтный UA «Python-urllib/…» (анти-бот);
+# честный узнаваемый UA пропускают все наши источники (живой случай node1 19.08)
+_HTTP_UA = "Mozilla/5.0 (compatible; redut-panel)"
+
+
 def _http_json(url, timeout=GEO_TIMEOUT):
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
+        req = urllib.request.Request(url, headers={"User-Agent": _HTTP_UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8", "replace"))
     except Exception:
         return None
@@ -200,6 +207,170 @@ def ip_intel(ip):
     if intel is None:
         intel = _intel_from_ipinfo(_http_json(_INTEL_SECONDARY % ip))
     return intel
+
+
+# ── риск-разведка exit-IP (19.08): чем адрес светится в антифрод-базах ────────
+# Поверх паспорта — сигналы риска из независимых источников. Без ключей работают
+# proxycheck.io (анонимный лимит ~100/день — при нашем кэше 7 дн это капля) и
+# DNSBL-зоны (обычные DNS-запросы, HTTP вообще нет). Ключи в secrets.json,
+# раздел {"ipintel": {"proxycheck": …, "abuseipdb": …, "ipqs": …}} — все
+# бесплатные тарифы, вписывает владелец; появился ключ — источник сам включится
+# при следующем протухании кэша. Любой источник молчит — его поля None, оценка
+# считается по тому, что есть: неизвестность не карается.
+INTEL_VERSION = 2          # формат кэша ipintel:*; старые записи перечитываются
+
+_PROXYCHECK_URL = "https://proxycheck.io/v2/%s?vpn=3&asn=1&risk=1"
+_ABUSEIPDB_URL = "https://api.abuseipdb.com/api/v2/check?ipAddress=%s&maxAgeInDays=90"
+_IPQS_URL = "https://www.ipqualityscore.com/api/json/ip/%s/%s"
+# три классические зоны: спам-репутация Spamhaus/SpamCop + Barracuda
+_DNSBL_ZONES = ("zen.spamhaus.org", "bl.spamcop.net", "b.barracudacentral.org")
+
+
+def _http_json_hdr(url, headers, timeout=GEO_TIMEOUT):
+    """_http_json с заголовками (AbuseIPDB требует ключ в Key:)."""
+    try:
+        hdrs = {"User-Agent": _HTTP_UA}
+        hdrs.update(headers or {})
+        req = urllib.request.Request(url, headers=hdrs)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
+def _intel_from_proxycheck(d, ip):
+    """proxycheck.io/v2 -> {pc_proxy, pc_type, pc_risk} (+ запасные geo-поля).
+
+    Ответ: {"status":"ok", "<ip>": {proxy:"yes|no", type:"VPN|SOCKS…", risk:0-100,
+    asn, provider, isocode…}}. status warning|denied|error без блока IP -> None.
+    """
+    if not isinstance(d, dict):
+        return None
+    row = d.get(ip)
+    if not isinstance(row, dict) or str(d.get("status", "ok")) not in ("ok", "warning"):
+        return None
+    out = {"pc_proxy": str(row.get("proxy", "")).lower() == "yes",
+           "pc_type": (row.get("type") or None)}
+    try:
+        out["pc_risk"] = max(0, min(100, int(row.get("risk"))))
+    except (TypeError, ValueError):
+        out["pc_risk"] = None
+    # запасные поля паспорта: пригодятся, если гео-базы молчали
+    out["_pc_cc"] = (row.get("isocode") or "").lower() or None
+    out["_pc_asn"] = row.get("asn") or None
+    out["_pc_org"] = row.get("provider") or None
+    return out
+
+
+def _intel_from_abuseipdb(d):
+    """AbuseIPDB /v2/check -> {abuse_score, abuse_reports} (жалобы за 90 дней)."""
+    data = (d or {}).get("data") if isinstance(d, dict) else None
+    if not isinstance(data, dict) or "abuseConfidenceScore" not in data:
+        return None
+    try:
+        return {"abuse_score": max(0, min(100, int(data["abuseConfidenceScore"]))),
+                "abuse_reports": int(data.get("totalReports") or 0)}
+    except (TypeError, ValueError):
+        return None
+
+
+def _intel_from_ipqs(d):
+    """IPQualityScore -> {ipqs_fraud, ipqs_vpn, ipqs_tor}."""
+    if not isinstance(d, dict) or not d.get("success"):
+        return None
+    out = {"ipqs_vpn": bool(d.get("vpn")), "ipqs_tor": bool(d.get("tor"))}
+    try:
+        out["ipqs_fraud"] = max(0, min(100, int(d.get("fraud_score"))))
+    except (TypeError, ValueError):
+        out["ipqs_fraud"] = None
+    return out
+
+
+def dnsbl_check(ip, zones=_DNSBL_ZONES, resolver=None):
+    """Числится ли IPv4 в DNS-чёрных списках -> {"checked": N, "listed": [зоны]}.
+
+    Обычный DNS-запрос <перевёрнутый-ip>.<зона>: ответ есть — числится, NXDOMAIN —
+    чист. Ошибка/таймаут зоны считается «не числится» (лучше недоглядеть, чем
+    пугать по сетевому чиху). resolver подменяется в тестах."""
+    resolver = resolver or socket.gethostbyname
+    parts = (ip or "").split(".")
+    if len(parts) != 4 or not all(p.isdigit() for p in parts):
+        return {"checked": 0, "listed": []}
+    rev = ".".join(reversed(parts))
+    listed = []
+    for zone in zones:
+        try:
+            resolver("%s.%s" % (rev, zone))
+            listed.append(zone)
+        except OSError:
+            pass
+    return {"checked": len(zones), "listed": listed}
+
+
+def ip_quality(d):
+    """Итоговая оценка качества exit-IP 0–100 (больше = лучше).
+
+    Мягкая свёртка: наш выход — почти всегда датацентровый прокси, топить оценку
+    за сам факт нельзя; топят РИСКИ — высокие баллы антифрод-баз, жалобы, чёрные
+    списки, Tor. Неизвестный сигнал (None) не участвует."""
+    score = 100.0
+    if d.get("pc_risk") is not None:
+        score -= d["pc_risk"] * 0.35
+    if d.get("ipqs_fraud") is not None:
+        score -= d["ipqs_fraud"] * 0.35
+    if d.get("abuse_score") is not None:
+        score -= d["abuse_score"] * 0.4
+    listed = len((d.get("dnsbl") or {}).get("listed") or [])
+    score -= 14 * min(listed, 3)
+    if d.get("ipqs_tor") or str(d.get("pc_type") or "").lower() == "tor":
+        score -= 35
+    if d.get("hosting"):
+        score -= 10
+    if d.get("proxy") or d.get("pc_proxy") or d.get("ipqs_vpn"):
+        score -= 6
+    if d.get("ping_ms") is not None and d["ping_ms"] > 250:
+        score -= 5
+    return int(max(0, min(100, round(score))))
+
+
+def ip_intel_full(ip, keys=None, ping_ms=None):
+    """Полный паспорт + риск-разведка одним словарём (кэшируется панелью).
+
+    Паспорт (ip-api/ipinfo) + proxycheck (без ключа) + AbuseIPDB/IPQS (по ключам)
+    + DNSBL + пинг до прокси (замер последней пробы пула, приходит снаружи).
+    Совсем никто не ответил -> None (кэшировать нечего)."""
+    if not ip:
+        return None
+    keys = keys or {}
+    base = ip_intel(ip)
+    url = _PROXYCHECK_URL % ip
+    if keys.get("proxycheck"):
+        url += "&key=%s" % keys["proxycheck"]
+    pc = _intel_from_proxycheck(_http_json(url), ip)
+    if base is None and pc is None:
+        return None
+    out = dict(base or {})
+    if pc:
+        # запасные geo-поля proxycheck — только в дыры паспорта
+        for src, dst in (("_pc_cc", "cc"), ("_pc_asn", "asn"), ("_pc_org", "org")):
+            if not out.get(dst) and pc.get(src):
+                out[dst] = pc[src]
+        out.update({k: v for k, v in pc.items() if not k.startswith("_")})
+    if keys.get("abuseipdb"):
+        ab = _intel_from_abuseipdb(_http_json_hdr(
+            _ABUSEIPDB_URL % ip, {"Key": keys["abuseipdb"], "Accept": "application/json"}))
+        if ab:
+            out.update(ab)
+    if keys.get("ipqs"):
+        qs = _intel_from_ipqs(_http_json(_IPQS_URL % (keys["ipqs"], ip)))
+        if qs:
+            out.update(qs)
+    out["dnsbl"] = dnsbl_check(ip)
+    if ping_ms is not None:
+        out["ping_ms"] = ping_ms
+    out["quality"] = ip_quality(out)
+    out["v"] = INTEL_VERSION
+    return out
 
 
 def geo_country_consensus(ip):

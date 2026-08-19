@@ -329,5 +329,27 @@ class TestDeleteRecord(Base):
         self.assertEqual(len(self.money_rows("delete")), 1)
 
 
+class TestStoreBalance(Base):
+    """store_balance: единый писатель setting balance:<name>. Баг 19.08 — крон
+    pool-refresh баланс не сохранял, панель показывала пусто до ручного клика."""
+
+    def test_writes_setting(self):
+        ok = money.store_balance(self.pool, "proxy6", {"balance": "2308.01", "currency": "RUB"})
+        self.assertTrue(ok)
+        self.assertEqual(self.pool.get_setting("balance:proxy6"), "2308.01 RUB")
+
+    def test_missing_amount_keeps_previous(self):
+        self.pool.set_setting("balance:proxy6", "500 RUB")
+        # провайдер молчит суммой — прежний баланс НЕ затираем «None»
+        self.assertFalse(money.store_balance(self.pool, "proxy6", {"currency": "RUB"}))
+        self.assertFalse(money.store_balance(self.pool, "proxy6", None))
+        self.assertFalse(money.store_balance(self.pool, "proxy6", {"balance": "", "currency": "RUB"}))
+        self.assertEqual(self.pool.get_setting("balance:proxy6"), "500 RUB")
+
+    def test_no_currency_no_trailing_space(self):
+        money.store_balance(self.pool, "proxyline", {"balance": "12.3"})
+        self.assertEqual(self.pool.get_setting("balance:proxyline"), "12.3")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

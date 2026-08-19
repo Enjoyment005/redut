@@ -22,6 +22,9 @@ _CLIENTS_PER_CORE = 10
 # на соединения одного активного устройства
 _BASE_MB = 256
 _MB_PER_CLIENT = 24
+# запас на стабильность: рекомендация — 80% расчётного потолка (просьба
+# владельца 19.08), чтобы не подводить узел к границе железа вплотную
+_SAFETY = 0.8
 
 
 def _read(path):
@@ -70,8 +73,9 @@ def recommend_clients(cores, mem_total_kb):
 
     По процессору: _CLIENTS_PER_CORE на ядро (шифрование + прокси-цепочка).
     По памяти: что остаётся после базовых служб, по _MB_PER_CLIENT на устройство.
-    Берём худшее из двух; меньше 2 не отдаём — даже самый маленький VPS тянет
-    телефон и ноутбук. Это про АКТИВНЫХ одновременно, не про число профилей.
+    Берём худшее из двух и оставляем _SAFETY (80%) — запас на стабильность;
+    меньше 2 не отдаём — даже самый маленький VPS тянет телефон и ноутбук.
+    Это про АКТИВНЫХ одновременно, не про число профилей.
     """
     try:
         cores = int(cores or 0)
@@ -82,7 +86,7 @@ def recommend_clients(cores, mem_total_kb):
         return None
     by_cpu = cores * _CLIENTS_PER_CORE
     by_ram = int((mem_mb - _BASE_MB) // _MB_PER_CLIENT)
-    return max(2, min(by_cpu, by_ram))
+    return max(2, int(min(by_cpu, by_ram) * _SAFETY))
 
 
 def snapshot(proc="/proc", disk_path="/", cores=None, sys_net="/sys/class/net",

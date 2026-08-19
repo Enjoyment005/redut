@@ -196,6 +196,9 @@ def cmd_pool_refresh(cfg, args):
             continue
         try:
             b = prov.balance()
+            # держим баланс в setting свежим — панель читает его отсюда (раньше
+            # писал только веб, и до первого клика «Обновить пул» баланс пустовал)
+            money_mod.store_balance(p, name, b)
             print("%-10s: баланс %s %s" % (name, b.get("balance"), b.get("currency")))
         except ProviderError as e:
             print("%-10s: баланс недоступен — %s" % (name, e))

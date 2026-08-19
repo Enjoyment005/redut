@@ -49,16 +49,24 @@ class TestParsers(unittest.TestCase):
 
 
 class TestRecommend(unittest.TestCase):
+    """Формула: min(ядра×10, (RAM−256МБ)/24МБ) × 0.8 (запас −20%, просьба
+    владельца 19.08), floor, но не меньше 2."""
+
     def test_one_core_one_gb_cpu_bound(self):
-        # 1 ядро ограничивает раньше памяти: 10 устройств
-        self.assertEqual(sysinfo.recommend_clients(1, 1024 * 1024), 10)
+        # 1 ядро ограничивает раньше памяти: 10 × 0.8 = 8 устройств
+        self.assertEqual(sysinfo.recommend_clients(1, 1024 * 1024), 8)
 
     def test_two_cores_two_gb(self):
-        self.assertEqual(sysinfo.recommend_clients(2, 2 * 1024 * 1024), 20)
+        # 20 × 0.8 = 16
+        self.assertEqual(sysinfo.recommend_clients(2, 2 * 1024 * 1024), 16)
+
+    def test_four_cores_node1(self):
+        # живой node1: 4 ядра / ~3.9 ГБ → потолок 40, с запасом 32
+        self.assertEqual(sysinfo.recommend_clients(4, 2027840 * 2), 32)
 
     def test_small_ram_bounds(self):
-        # 384 МБ: после базовых служб памяти хватает лишь на 5 устройств
-        self.assertEqual(sysinfo.recommend_clients(1, 384 * 1024), 5)
+        # 384 МБ: по памяти потолок 5, с запасом −20% → 4
+        self.assertEqual(sysinfo.recommend_clients(1, 384 * 1024), 4)
 
     def test_tiny_ram_floor(self):
         # совсем маленький VPS: меньше 2 не отдаём
@@ -104,7 +112,7 @@ class TestSnapshot(unittest.TestCase):
         self.assertEqual(y["swap_pct"], 50)
         self.assertEqual(y["uptime_sec"], 123456.78)
         self.assertTrue(y["wg_up"])
-        self.assertEqual(y["rec_clients"], 20)          # 2 ядра × 10
+        self.assertEqual(y["rec_clients"], 16)          # 2 ядра × 10, −20% запаса
         # диск меряется настоящим shutil.disk_usage по временному каталогу
         self.assertIsNotNone(y["disk_total_gb"])
         self.assertIsNotNone(y["disk_free_gb"])

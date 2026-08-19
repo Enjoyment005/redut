@@ -397,6 +397,24 @@ def can_delete(row, cfg, *, current_host=None, provider_check=None, min_fail=2):
     return True, "все условия §6.4 выполнены"
 
 
+def store_balance(pool, name, bal):
+    """Записать баланс провайдера в setting `balance:<name>` единым форматом.
+
+    Панель показывает баланс из этой строки (GET /api/status → balances). Пишут
+    сюда И крон `pool-refresh` (agent.py), И веб (кнопка/сохранение ключа) — раньше
+    писал только веб, поэтому после установки/деплоя баланс висел пустым, пока
+    человек не нажмёт «Обновить пул» (баг 19.08). bal — словарь prov.balance()
+    {"balance": "...", "currency": "..."}; пустой/без суммы НЕ затирает прежний."""
+    if not bal:
+        return False
+    val = bal.get("balance")
+    if val is None or str(val).strip() == "":
+        return False
+    pool.set_setting("balance:%s" % name,
+                     ("%s %s" % (val, bal.get("currency") or "")).strip())
+    return True
+
+
 def delete_and_record(pool, provider, row, *, actor="auto", src_ip="",
                       price=None, currency=None, balance_after=None, note=""):
     """Удаление по ЯВНОМУ ext_id (delete?descr= запрещён навсегда, §5) + запись.
