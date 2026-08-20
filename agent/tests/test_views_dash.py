@@ -37,8 +37,9 @@ class TestMapIntelMarkup(unittest.TestCase):
         self.assertIn('id="geointel"', html)
         self.assertIn("/api/ipinfo", html)
         self.assertIn("function intelHtml", html)
-        # оверлей позиционируется поверх карты справа
-        self.assertIn(".geo .intel{position:absolute;right:", views._BASE_CSS)
+        # оверлей стоит слева внизу, в пустом океане (просьба владельца 20.08:
+        # справа сверху он закрывал Азию); bottom — чтобы не лечь на строку .hud
+        self.assertIn(".geo .intel{position:absolute;left:9px;bottom:", views._BASE_CSS)
 
 
 class TestVitalsMarkup(unittest.TestCase):

@@ -123,8 +123,10 @@ white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .geo .hud{position:absolute;left:0;right:0;bottom:0;display:flex;gap:12px;flex-wrap:wrap;
 justify-content:space-between;padding:7px 10px;color:var(--mut);font:400 10.5px/1.4 var(--mono);
 pointer-events:none;background:linear-gradient(180deg,transparent,rgba(4,6,12,.82) 65%)}
-/* паспорт IP — техпанель поверх карты справа (19.08): что за адрес видят сайты */
-.geo .intel{position:absolute;right:9px;top:9px;max-width:46%;padding:6px 9px 7px;
+/* паспорт IP — техпанель поверх карты: что за адрес видят сайты. Слева внизу,
+   в пустом океане (просьба владельца 20.08): справа сверху панель закрывала Азию.
+   bottom с запасом — чтобы не лечь на строку координат .hud */
+.geo .intel{position:absolute;left:9px;bottom:36px;max-width:46%;padding:6px 9px 7px;
 border:1px solid var(--line2);border-radius:5px;background:rgba(4,7,15,.8);
 color:#cfe0f5;font:400 10.5px/1.55 var(--mono);pointer-events:none;z-index:2}
 .geo .intel .t{color:var(--cyan);font:600 10px/1 var(--mono);letter-spacing:.13em;
@@ -420,7 +422,7 @@ _DASH_HTML = """
       переключиться, а пунктир между ними — эти самые запасные пути. Сама картинка нарисована прямо
       в панели по встроенным данным: браузер наружу ничего не запрашивает и точку ставит <b>по
       стране</b>, а не по адресу — точнее geoip всё равно не знает.
-      <b>Справа — паспорт IP</b>: сервер один раз на адрес спрашивает публичные гео- и
+      <b>Слева внизу — паспорт IP</b>: сервер один раз на адрес спрашивает публичные гео- и
       антифрод-базы и показывает, что о нём известно, — оператор и сеть (ASN), датацентр ли это,
       город, пояс, PTR, а ниже — <b>риск-разведка</b>: светится ли адрес как прокси/VPN/Tor
       (proxycheck, IPQS), баллы риска и жалобы (0–100, меньше — лучше), числится ли в
@@ -859,7 +861,7 @@ function geoSync(s){s=s||window.__S;if(!s||!document.getElementById('geocv'))ret
   sum('geo',pt?((country(cc)||cc.toUpperCase())+(s.egress?(' · '+s.egress):'')):'');
   geoIntel(s);
   geoStart()}
-/* ── паспорт IP: техпанель поверх карты справа (19.08) ──
+/* ── паспорт IP: техпанель поверх карты, слева внизу (19.08; переезд в океан 20.08) ──
    Данные тянет СЕРВЕР из публичных гео-баз и кэширует по IP (/api/ipinfo);
    браузер наружу по-прежнему не ходит (CSP). Грузим один раз на адрес,
    при неудаче не долбим чаще раза в 5 минут. */
