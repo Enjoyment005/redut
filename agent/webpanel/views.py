@@ -1169,6 +1169,15 @@ function maybeRecheck(s){
   const нет=!s.egress_at, старая=(s.egress_age!=null&&s.egress_age>STALE), плохая=(s.egress_at&&!s.egress_ok);
   if(нет||старая||плохая){window.__EGLAST=now;egress(true)}}
 
+/* API ProxyWing использует составной технический id: family|order|proxy.
+   В таблице оставляем только узнаваемый хвост proxy-id, полный uid доступен
+   по наведению и по-прежнему передаётся кнопкам без сокращения. */
+function proxyLabel(p){
+  const raw=(p.uid||'').replace(/^proxy6:|^proxyline:|^proxywing:/,'');
+  if(p.provider!=='proxywing')return raw;
+  const a=raw.split('|'),family=a[0]==='datacenter'?'DC':'ISP',leaf=a[2]||a[1]||raw;
+  return family+' · …'+leaf.slice(-6)}
+
 async function loadPool(){const rows=(await api('/api/pool')).proxies;const tb=document.querySelector('#pool tbody');tb.innerHTML='';
   /* П1: строки запрещённых стран не рендерим вовсе — только счётчик под таблицей,
      чтобы купленное не исчезало молча. Исключение: заблокированный боевой виден всегда. */
@@ -1181,13 +1190,13 @@ async function loadPool(){const rows=(await api('/api/pool')).proxies;const tb=d
     const roles=['auto','off'];
     const inact=!p.provider_active;
     const cc=p.exit_cc||p.country;
-    const id=esc(p.uid).replace(/^proxy6:|^proxyline:|^proxywing:/,'');
+    const id=esc(proxyLabel(p));
     const sold=(p.exit_cc&&p.country&&p.exit_cc!=p.country)?'продан как '+esc(country(p.country)):'';
     const argue=(p.geo_agree===false)?'спор: '+esc(country(p.exit_cc))+'/'+esc(country(p.exit_cc_alt)):'';
     const note=sold||argue;
     const ports=(p.port_socks5||'—')+(p.port_http&&p.port_http!=p.port_socks5?('/'+p.port_http):'');
     tr.innerHTML=
-      '<td>'+id+(p.is_current?' <span class="pill ok">боевой</span>':'')+(p.gone?' <span class="pill bad">пропал</span>':'')+
+      '<td title="'+esc(p.uid)+'">'+id+(p.is_current?' <span class="pill ok">боевой</span>':'')+(p.gone?' <span class="pill bad">пропал</span>':'')+
         (inact?' <span class="pill warn" title="Ключ провайдера удалён: панель этим прокси не управляет. Боевой канал будет переключён по стратегии автоматически.">без ключа</span>':'')+
         '<div class="sub" style="font-size:10px">'+esc(p.provider)+'</div></td>'+
       '<td>'+esc(country(cc)||'??')+' '+ccBadge(p)+

@@ -127,5 +127,14 @@ class TestToolbarCompact(unittest.TestCase):
         self.assertIn("'.q,[data-h]'", views._DASH_HTML)
 
 
+class TestProxyLabels(unittest.TestCase):
+    def test_proxywing_technical_id_is_compacted(self):
+        html = views._DASH_HTML
+        self.assertIn("function proxyLabel(p)", html)
+        self.assertIn("family+' · …'+leaf.slice(-6)", html)
+        self.assertIn("title=\"'+esc(p.uid)+'\"", html)
+        self.assertIn("const id=esc(proxyLabel(p))", html)
+
+
 if __name__ == "__main__":
     unittest.main()
