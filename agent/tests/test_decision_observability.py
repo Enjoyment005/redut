@@ -76,7 +76,7 @@ class TestDecisionEventStorage(unittest.TestCase):
         self.assertIsNone(event["decision"])
         json.dumps(event, allow_nan=False)
 
-    def test_migrates_existing_event_table_to_schema_six(self):
+    def test_migrates_existing_event_table_to_current_schema(self):
         self.pool.close()
         os.unlink(self.db)
         conn = sqlite3.connect(self.db)
@@ -89,7 +89,7 @@ class TestDecisionEventStorage(unittest.TestCase):
         self.pool = pool_mod.Pool(self.db, server="test")
         columns = {row[1] for row in self.pool.conn.execute("PRAGMA table_info(event)")}
         self.assertIn("payload_json", columns)
-        self.assertEqual(self.pool.get_setting("schema_version"), "6")
+        self.assertEqual(self.pool.get_setting("schema_version"), pool_mod.SCHEMA_VERSION)
 
 
 class _JSONHandler:

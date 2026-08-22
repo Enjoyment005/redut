@@ -79,6 +79,22 @@ class TestFormatting(unittest.TestCase):
         self.assertIn("900", body)
         self.assertIn("fi", body)
 
+    def test_proxy_vanished_names_uid_and_paid_days(self):
+        a = _mk()
+        self.assertTrue(a.proxy_vanished(items=[
+            {"uid": "proxyline:28172036", "host": "155.212.127.143", "country": "lt",
+             "date_end": "2026-08-26 12:00:00", "days_left": 4.0}]))
+        subj, body = a.sent[-1]
+        self.assertIn("оплаченный прокси", subj)
+        self.assertIn("proxyline:28172036", body)
+        self.assertIn("4.0", body)
+        self.assertIn("2026-08-26", body)
+
+    def test_proxy_vanished_without_items_is_silent(self):
+        a = _mk()
+        self.assertFalse(a.proxy_vanished(items=[]))
+        self.assertEqual(a.sent, [])
+
     def test_emergency_and_recovered(self):
         a = _mk()
         a.emergency(reason="денег не хватило")

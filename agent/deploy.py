@@ -100,12 +100,16 @@ MONEY_CONFIG = {
         # возвращается ручной канал после подтверждённого отказа.
         "strategy": "speed",
     },
+    # Свежесть измерений и гистерезис проактивной смены стратегии. Аварийная
+    # ротация при подтверждённом отказе эти ограничения не использует.
     "health": {
         "fresh_seconds": 7200, "stale_seconds": 86400,
         "switch_margin": 15, "min_hold_time": 1800,
         "max_latency_regression": 500,
         "quorum_window_seconds": 60, "quorum_min_targets": 2,
     },
+    # Learning v2 только считает shadow-рекомендации. owner_approved — readiness
+    # gate для будущего canary; actuator на этом релизе намеренно не подключён.
     "learning": {"mode": "shadow", "shadow_min_days": 30,
                  "owner_approved": False, "canary_servers": [],
                  "exploration_enabled": False, "exploration_rate": 0.05,

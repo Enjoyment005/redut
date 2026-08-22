@@ -1743,13 +1743,16 @@ def try_replenish(cfg, providers, pool, alerter, log, actor):
 def postbuy_check(cfg, pool, providers, bought, actor, log):
     """§6.1 постфактум: подтянуть паспорт (getproxy) и проверить РЕАЛЬНУЮ страну
     выхода. Выход в жёстком блоке СНГ -> off + алерт, не используем."""
+    current_host = apply_mod.current_upstream(apply_mod.load_json(cfg["singbox_config"]))
     prov = providers.get("proxy6")
     if prov is not None:
         try:
-            pool.refresh({"proxy6": prov}, actor=actor)
+            # keep_hosts: refresh убирает из пула всё, чего провайдер не отдал, —
+            # строка боевого канала должна пережить постпокупочный опрос
+            pool.refresh({"proxy6": prov}, actor=actor,
+                         keep_hosts={current_host} if current_host else None)
         except Exception:
             pass
-    current_host = apply_mod.current_upstream(apply_mod.load_json(cfg["singbox_config"]))
     out = []
     for pxy in bought:
         uid = "%s:%s" % (pxy["provider"], pxy["ext_id"])
@@ -1779,6 +1782,36 @@ def auto_prolong_cfg(cfg):
     m = dict(DEFAULT_AUTO_PROLONG)
     m.update((cfg or {}).get("auto_prolong") or {})
     return m
+
+
+def notify_vanished(pool, alerter, log=print, actor="auto"):
+    """Письмо о прокси, которые провайдер снял с обслуживания РАНЬШЕ конца аренды.
+
+    Само исчезновение — рутина: pool показывает то, что провайдер отдал, и лишние
+    строки убирает молча (решение владельца 22.08). Повод для письма ровно один —
+    деньги: за оставшиеся дни уже заплачено, значит с провайдера причитается замена
+    или возврат. Очередь ведёт pool (_queue_vanished): постпокупочный refresh зовётся
+    без alerter, и без очереди повод бы потерялся вместе с удалённой строкой.
+    -> {"notified": n, "seen": m}
+    """
+    items = pool.take_vanished_pending()
+    paid = []
+    for item in items:
+        days = probe_mod.days_left(item.get("date_end"))
+        if days is None or days <= 0:
+            continue                     # аренда и так кончилась — это не потеря денег
+        paid.append(dict(item, days_left=round(days, 1)))
+    if not paid:
+        return {"notified": 0, "seen": len(items)}
+    detail = "; ".join("%s (%s, оплачено ещё %s дн)"
+                       % (x.get("uid"), x.get("host") or "?", x["days_left"]) for x in paid)
+    pool.log_event("proxy-vanished", actor=actor, result="paid",
+                   detail="провайдер снял %d оплаченных прокси: %s" % (len(paid), detail))
+    try:
+        alerter.proxy_vanished(items=paid)
+    except Exception as e:                # почта не должна ронять обновление пула
+        log("  письмо об исчезнувших прокси не ушло: %s" % e)
+    return {"notified": len(paid), "seen": len(items)}
 
 
 def auto_prolong(cfg, providers, pool, alerter, log=print, actor="auto"):

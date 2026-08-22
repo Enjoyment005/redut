@@ -33,7 +33,7 @@ class TestOperationSaga(unittest.TestCase):
         columns = {r[1] for r in self.pool.conn.execute("PRAGMA table_info(operation)")}
         self.assertLessEqual({"id", "kind", "desired_state", "phase", "idempotency_key",
                               "before_checksum", "after_checksum", "error"}, columns)
-        self.assertEqual(self.pool.get_setting("schema_version"), "6")
+        self.assertEqual(self.pool.get_setting("schema_version"), pool_mod.SCHEMA_VERSION)
 
     def test_migration_never_downgrades_future_schema_marker(self):
         self.pool.set_setting("schema_version", "999")

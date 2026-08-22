@@ -40,7 +40,7 @@ def collect(path, logs, tmpb, before, after, vacuum):
 
 class TestCleanupCollector(unittest.TestCase):
     def test_vacuum_result_wins_when_total_disk_usage_is_unchanged(self):
-        """Регрессия узла: новый active-файл заменил удалённый 8 MiB."""
+        """Главная регрессия node2: новый active-файл заменил удалённый 8 MiB."""
         with tempfile.TemporaryDirectory() as d:
             out = collect(os.path.join(d, "stat.json"), 100, 20,
                           "Archived journals take up 8M.",

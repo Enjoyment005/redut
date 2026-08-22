@@ -68,25 +68,83 @@ class TestPool(unittest.TestCase):
         self.assertEqual(self.pool.get("proxy6:21")["role"], "auto")
         self.assertEqual(self.pool.get("proxyline:12345")["role"], "auto")
 
-    def test_merge_preserves_role_and_marks_gone(self):
+    def test_merge_removes_vanished_and_keeps_owner_decision(self):
+        """Жалоба владельца 22.08: провайдер удалил прокси, а панель помнила его
+        вечно с меткой «пропал». Теперь после успешного опроса пул показывает факт —
+        строки нет; ручное решение владельца (роль off) переживает удаление."""
         items = p6_items()
         self.pool.refresh({"proxy6": FakeProvider("proxy6", items)})
         self.pool.set_role("proxy6:21", "off")
+        self.pool.record_probe("proxy6:21", {"ok": False})
         # второй refresh: запись 21 пропала из выдачи, у 11 сменился пароль
         rest = [dict(it) for it in items if it["ext_id"] != "21"]
         for it in rest:
             if it["ext_id"] == "11":
                 it["password"] = "новый"
-        self.pool.refresh({"proxy6": FakeProvider("proxy6", rest)})
-        gone_row = self.pool.get("proxy6:21")
-        self.assertEqual(gone_row["gone"], 1, "пропавшие помечаются gone, не удаляются")
-        self.assertEqual(gone_row["role"], "off", "роль переживает merge")
+        summary = self.pool.refresh({"proxy6": FakeProvider("proxy6", rest)})
+        self.assertIsNone(self.pool.get("proxy6:21"),
+                          "исчезнувшего у живого провайдера в пуле не остаётся")
+        self.assertEqual(summary["providers"]["proxy6"]["removed"], 1)
+        self.assertEqual([v["uid"] for v in summary["vanished"]], ["proxy6:21"])
         self.assertEqual(self.pool.get("proxy6:11")["password"], "новый")
-        # третий refresh: 21 вернулся -> gone снимается, роль всё ещё off
+        # событие в журнале — владельцу видно, куда делся оплаченный прокси
+        actions = [e["action"] for e in self.pool.events(limit=20)]
+        self.assertIn("proxy-vanished", actions)
+        # третий refresh: 21 вернулся (мигнула выдача) -> роль off и провал целы
         self.pool.refresh({"proxy6": FakeProvider("proxy6", items)})
         back = self.pool.get("proxy6:21")
         self.assertEqual(back["gone"], 0)
-        self.assertEqual(back["role"], "off")
+        self.assertEqual(back["role"], "off", "роль владельца пережила удаление строки")
+        self.assertEqual(back["fail_count"], 1, "счётчик провалов вернулся вместе с записью")
+
+    def test_battle_row_survives_vanishing(self):
+        """Боевой канал не стираем: панель обязана показывать, на чём сидит трафик."""
+        items = p6_items()
+        self.pool.refresh({"proxy6": FakeProvider("proxy6", items)})
+        battle = self.pool.get("proxy6:21")
+        rest = [dict(it) for it in items if it["ext_id"] != "21"]
+        summary = self.pool.refresh({"proxy6": FakeProvider("proxy6", rest)},
+                                    keep_hosts={battle["host"]})
+        row = self.pool.get("proxy6:21")
+        self.assertIsNotNone(row, "строка боевого канала остаётся до переключения")
+        self.assertEqual(row["gone"], 1)
+        self.assertEqual(summary["providers"]["proxy6"]["kept"], 1)
+        self.assertEqual(summary["providers"]["proxy6"]["removed"], 0)
+
+    def test_empty_listing_is_suspected_before_wiping_pool(self):
+        """Успешный, но пустой ответ API не должен обнулять кабинет с первого раза."""
+        items = p6_items()
+        self.pool.refresh({"proxy6": FakeProvider("proxy6", items)})
+        n = len(self.pool.list(include_gone=True))
+        summary = self.pool.refresh({"proxy6": FakeProvider("proxy6", [])})
+        self.assertEqual(summary["suspect"]["proxy6"], n)
+        self.assertEqual(len(self.pool.list(include_gone=True)), n,
+                         "первый пустой ответ только метит, но не стирает")
+        self.assertTrue(all(r["gone"] == 1 for r in self.pool.list(include_gone=True)))
+        # выдача снова непустая — подозрение снимается, метка уходит
+        self.pool.refresh({"proxy6": FakeProvider("proxy6", items)})
+        self.assertTrue(all(r["gone"] == 0 for r in self.pool.list(include_gone=True)))
+        # а вот два пустых ответа подряд — уже факт: кабинет действительно пуст
+        self.pool.refresh({"proxy6": FakeProvider("proxy6", [])})
+        summary = self.pool.refresh({"proxy6": FakeProvider("proxy6", [])})
+        self.assertEqual(self.pool.list(include_gone=True), [])
+        self.assertEqual(summary["providers"]["proxy6"]["removed"], n)
+
+    def test_memo_expires_with_prune(self):
+        """Посмертная память не копится вечно — retention MEMO_KEEP_DAYS."""
+        import datetime
+        items = p6_items()
+        self.pool.refresh({"proxy6": FakeProvider("proxy6", items)})
+        self.pool.set_role("proxy6:21", "off")
+        rest = [dict(it) for it in items if it["ext_id"] != "21"]
+        self.pool.refresh({"proxy6": FakeProvider("proxy6", rest)})
+        self.assertEqual(self.pool.conn.execute(
+            "SELECT COUNT(*) FROM proxy_memo").fetchone()[0], 1)
+        later = datetime.datetime.now() + datetime.timedelta(days=pool_mod.MEMO_KEEP_DAYS + 1)
+        self.assertEqual(self.pool.prune(now=later)["proxy_memo"], 1)
+        # память истекла — вернувшийся прокси приходит с ролью по умолчанию
+        self.pool.refresh({"proxy6": FakeProvider("proxy6", items)})
+        self.assertEqual(self.pool.get("proxy6:21")["role"], "auto")
 
     def test_provider_error_keeps_cache(self):
         self.pool.refresh({"proxy6": FakeProvider("proxy6", p6_items())})

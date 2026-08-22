@@ -510,7 +510,7 @@ _DASH_HTML = """
 
   <div class="card fold folded" id="card_clients">
     <h2 onclick="foldClick(event,'clients')">Кто подключён<span class="sub" id="sum_clients"></span><span class="r">
-      <input id="cname" style="width:180px" placeholder="имя, например phone-node2" autocomplete="off">
+      <input id="cname" style="width:180px" placeholder="имя, например phone-mine" autocomplete="off">
       <button class="btn g" onclick="addClient()">Выдать доступ</button><span class="arr" id="fa_clients">▸</span></span></h2>
     <div class="fold-body">
     <div class="ex">Каждому устройству — свой профиль. Нажми «Выдать доступ» → появится строка → <b>«Скачать»</b>
@@ -519,7 +519,7 @@ _DASH_HTML = """
       или «Импорт из файла».</div>
     <div id="crec" class="sub" style="display:none;margin:0 0 10px;font:400 12.5px/1.6 var(--ui);color:#adc0e0"></div>
     <div id="qstart" class="steps" style="display:none">
-      <div class="step"><b>шаг 1</b>Придумай имя устройства (латиницей, например <span class="mono">phone-node2</span>) и нажми «Выдать доступ».</div>
+      <div class="step"><b>шаг 1</b>Придумай имя устройства (латиницей, например <span class="mono">phone-mine</span>) и нажми «Выдать доступ».</div>
       <div class="step"><b>шаг 2</b>Установи на устройство приложение WireGuard из магазина приложений.</div>
       <div class="step"><b>шаг 3</b>Телефон — нажми «QR» и отсканируй. Компьютер — «Скачать» и открой файл в WireGuard.</div>
     </div>
@@ -1210,7 +1210,7 @@ async function loadPool(){const rows=(await api('/api/pool')).proxies;const tb=d
     const note=sold||argue;
     const ports=(p.port_socks5||'—')+(p.port_http&&p.port_http!=p.port_socks5?('/'+p.port_http):'');
     tr.innerHTML=
-      '<td title="'+esc(p.uid)+'">'+id+(p.is_current?' <span class="pill ok">боевой</span>':'')+(p.gone?' <span class="pill bad">пропал</span>':'')+
+      '<td title="'+esc(p.uid)+'">'+id+(p.is_current?' <span class="pill ok">боевой</span>':'')+(p.gone?' <span class="pill bad" title="Провайдер больше не отдаёт этот прокси. Строка держится только потому, что на ней сейчас стоит боевой канал (или провайдер ответил пустым списком и мы ждём подтверждения) — остальные снятые прокси панель убирает сама.">пропал</span>':'')+
         (inact?' <span class="pill warn" title="Ключ провайдера удалён: панель этим прокси не управляет. Боевой канал будет переключён по стратегии автоматически.">без ключа</span>':'')+
         '<div class="sub" style="font-size:10px">'+esc(p.provider)+'</div></td>'+
       '<td>'+esc(country(cc)||'??')+' '+ccBadge(p)+
@@ -1616,8 +1616,20 @@ async function qrClient(n){try{const r=await fetch('/api/clients/'+encodeURIComp
   document.getElementById('qrname').textContent='Профиль «'+n+'» — открой WireGuard на телефоне, нажми «+» → «Сканировать QR-код»';
   document.getElementById('qrpanel').style.display='block';document.getElementById('qrpanel').scrollIntoView({behavior:'smooth'})}catch(e){toast(e.message,'bad')}}
 
+/* Сводка по-человечески: сколько провайдер отдал, сколько строк ушло из пула
+   (снятые с обслуживания прокси удаляются — панель показывает факт выдачи). */
 async function refresh(){toast('Спрашиваю у провайдера список прокси…');try{const r=await api('/api/pool/refresh',{method:'POST'});
-  toast('Пул обновлён: '+JSON.stringify(r.providers),'ok');await reloadAll()}catch(e){toast(e.message,'bad')}}
+  const parts=Object.entries(r.providers||{}).map(([n,s])=>n+': '+s.total+
+    (s.added?', новых '+s.added:'')+(s.removed?', убрано '+s.removed:''));
+  for(const [n,e] of Object.entries(r.errors||{}))parts.push(n+': ОШИБКА — '+e);
+  const susp=Object.keys(r.suspect||{});
+  const bad=susp.length||Object.keys(r.errors||{}).length;
+  toast('Пул обновлён — '+(parts.join('; ')||'пусто')+
+    (susp.length?('. ВНИМАНИЕ: '+susp.join(', ')+' ответил без единого прокси — строки оставлены '+
+      'с меткой «пропал» до следующего опроса, пул не стёрт'):'')+
+    (r.notified_vanished?('. Письмо отправлено: провайдер снял '+r.notified_vanished+
+      ' прокси с ещё оплаченной арендой'):''),bad?'bad':'ok');
+  await reloadAll()}catch(e){toast(e.message,'bad')}}
 
 async function egress(auto){window.__EGBUSY=1;
   if(window.__S)beacon(window.__S,window.__CN);
@@ -1753,7 +1765,7 @@ _SETUP_HTML = """
       <b>Нужен хотя бы один рабочий ключ</b> — без него мастер не завершится. Если сервис недоступен с сервера
       напрямую (у российских хостеров так бывает с PROXY6), ключ сохранится без проверки рядом с рабочим:
       узел будет ходить к такому сервису через собственный канал.</div>
-    <label>PROXY6 · API-ключ (рекомендуется)</label><input id="proxy6" autocomplete="off" placeholder="например 77b5edfa90-…">
+    <label>PROXY6 · API-ключ (рекомендуется)</label><input id="proxy6" autocomplete="off" placeholder="например 0000000000-…">
     <label>ProxyLine · API-ключ (необязательно)</label><input id="proxyline" autocomplete="off">
     <label>ProxyWing · API-ключ (необязательно)</label><input id="proxywing" autocomplete="off" placeholder="pk_live_…">
     <button class="btn g" style="margin-top:9px" onclick="saveProv()">Проверить и сохранить</button>

@@ -36,6 +36,8 @@ the plan and not presented as a passed global guarantee.
 | packet loss and latency jitter | PASS | `test_probe_log.TestProbeNetworkChaos.test_packet_loss_and_latency_jitter_use_median_of_successful_samples`, `test_strategy_convergence.TestSwitchDecision.test_latency_regression_and_invalid_config` |
 | provider 401/429/500/timeout/bad JSON | PASS | `test_provider_contract.TestTypedProviderErrors.test_http_statuses_have_stable_kinds`, `test_transport.TestCurlParsing.test_http_429_reads_retry_after_header`, `test_http_500_is_typed_and_not_retried_as_network`, `test_bad_json_is_protocol_error`, `test_transport.TestUrlopenClassification.test_success_with_bad_json_is_typed_protocol_error`, `test_transport.TestTransport.test_mutating_read_timeout_never_retried` |
 | IPv4/IPv6 normalization and geo mismatch | PASS | `test_normalize.TestNormProxy6.test_ipv4_auto`, `test_ipv6_host_vs_ip`, `test_country.TestRating.test_geo_mismatch_penalty`, `TestProbeIntegration.test_score_punishes_geo_mismatch` |
+| provider silently drops an active proxy from its listing | PASS | `test_pool.TestPool.test_merge_removes_vanished_and_keeps_owner_decision`, `test_pool.TestPool.test_battle_row_survives_vanishing`, `test_states.TestNotifyVanished` |
+| provider answers with an empty listing while the pool is not empty | PASS | `test_pool.TestPool.test_empty_listing_is_suspected_before_wiping_pool` |
 
 ## Money faults
 

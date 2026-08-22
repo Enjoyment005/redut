@@ -369,5 +369,76 @@ class TestHeartbeatCheck(unittest.TestCase):
         self.assertEqual(len(a.calls), 1)           # повтор про тот же пульс — молчим
 
 
+class _VanishAlerter:
+    def __init__(self):
+        self.calls = []
+
+    def proxy_vanished(self, **kw):
+        self.calls.append(kw)
+        return True
+
+
+class TestNotifyVanished(unittest.TestCase):
+    """Провайдер снял прокси с обслуживания: письмо — только если аренда ещё
+    оплачена (решение владельца 22.08; сама уборка пула в почту не идёт)."""
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.pool = pool_mod.Pool(self.db, server="test")
+
+    def tearDown(self):
+        self.pool.close()
+        os.unlink(self.db)
+
+    def _queue(self, *items):
+        self.pool._queue_vanished(list(items))
+        self.pool.conn.commit()
+
+    @staticmethod
+    def _item(uid, days):
+        end = (datetime.datetime.now() + datetime.timedelta(days=days)
+               ).replace(microsecond=0).isoformat(sep=" ")
+        return {"uid": uid, "provider": "proxyline", "host": "10.0.0.1",
+                "country": "lt", "date_end": end, "role": "auto"}
+
+    def test_paid_days_left_sends_letter(self):
+        self._queue(self._item("proxyline:28172036", 4))
+        a = _VanishAlerter()
+        r = states.notify_vanished(self.pool, a, log=lambda *x: None)
+        self.assertEqual(r["notified"], 1)
+        self.assertEqual(len(a.calls), 1)
+        self.assertEqual(a.calls[0]["items"][0]["uid"], "proxyline:28172036")
+        self.assertGreater(a.calls[0]["items"][0]["days_left"], 3)
+        actions = [(e["action"], e["result"]) for e in self.pool.events(limit=10)]
+        self.assertIn(("proxy-vanished", "paid"), actions)
+
+    def test_expired_rent_is_not_worth_a_letter(self):
+        self._queue(self._item("proxyline:1", -2), {"uid": "proxy6:2", "date_end": ""})
+        a = _VanishAlerter()
+        r = states.notify_vanished(self.pool, a, log=lambda *x: None)
+        self.assertEqual(r["notified"], 0)
+        self.assertEqual(r["seen"], 2)
+        self.assertEqual(a.calls, [])
+
+    def test_queue_is_taken_once(self):
+        self._queue(self._item("proxyline:3", 9))
+        a = _VanishAlerter()
+        states.notify_vanished(self.pool, a, log=lambda *x: None)
+        again = states.notify_vanished(self.pool, a, log=lambda *x: None)
+        self.assertEqual(again, {"notified": 0, "seen": 0}, "повторного письма быть не должно")
+        self.assertEqual(len(a.calls), 1)
+
+    def test_broken_mail_does_not_break_refresh(self):
+        class Boom:
+            def proxy_vanished(self, **kw):
+                raise RuntimeError("SMTP лёг")
+        self._queue(self._item("proxyline:4", 5))
+        said = []
+        r = states.notify_vanished(self.pool, Boom(), log=said.append)
+        self.assertEqual(r["notified"], 1)
+        self.assertTrue(any("не ушло" in s for s in said))
+
+
 if __name__ == "__main__":
     unittest.main()

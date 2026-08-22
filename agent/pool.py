@@ -2,14 +2,22 @@
 """Пул прокси: SQLite-кэш (схема §13), роли (§5), refresh с merge.
 
 Ключ записи — uid = provider:ext_id (не IP: при продлении/замене IP меняется).
-Пропавшие из выдачи провайдера записи помечаются gone=1, но НЕ удаляются:
-при недоступности API работаем на кэше (§10), креды всех известных прокси локально.
+После УСПЕШНОГО опроса живого провайдера пул показывает ровно то, что провайдер
+отдал: записей, которых в выдаче больше нет, в пуле не остаётся — они УДАЛЯЮТСЯ
+(решение владельца 22.08: «пул обновился — показывай факт»). Вечная метка «пропал»
+захламляла панель: все три адаптера просят только активные прокси (status/state=
+active), поэтому снятый провайдером с обслуживания в выдачу уже не вернётся.
+При недоступности API уборки нет — работаем на кэше (§10), креды известных прокси
+лежат локально. Ручные решения владельца удаление переживают: роль off, cooldown и
+счётчик провалов уходят в proxy_memo и возвращаются, если запись всё же воскреснет
+(мигнувшая пагинация) — см. _save_memo/_take_memo, retention MEMO_KEEP_DAYS.
 Исключение (П7-2, 1.6.0): провайдер, у которого УДАЛИЛИ КЛЮЧ, выбывает целиком —
 его строки удаляются из пула (см. purge_provider), потому что управлять ими больше
 нечем, а «пропал» на весь кабинет захламлял панель навсегда (жалоба владельца 18.08).
-Держится только строка боевого канала — до планового переключения (states.switch_
-from_provider). gone=1 остаётся мягкой меткой для ЖИВОГО провайдера: его выдача
-может мигнуть (пагинация, сбой на стороне API), и запись вернётся с ролью и историей.
+gone=1 остаётся мягкой меткой ровно для двух случаев, где стирать нельзя: строка
+боевого канала (keep_hosts — панель видит, на чём сидит трафик, до планового
+переключения states.switch_from_provider) и подозрительно ПУСТАЯ выдача живого
+провайдера при непустом пуле (один битый ответ API не должен обнулить кабинет).
 Роль записи pool никогда не меняет сам — только владелец (исключение: успешный
 apply переводит off->auto, иначе боевой канал невидим подсчёту резерва).
 
@@ -248,6 +256,20 @@ _SCHEMA = [
         error TEXT,
         idempotency_key TEXT NOT NULL UNIQUE
     )""",
+    # Посмертная память о ручных решениях владельца (1.12.1): строку исчезнувшего
+    # прокси refresh удаляет, но роль off («автоматике не трогать»), cooldown и
+    # счётчик провалов держим MEMO_KEEP_DAYS. Мигнула выдача провайдера — запись
+    # вернётся не «чистой»: иначе автоматика тут же взяла бы в бой то, что владелец
+    # запретил, а прокси со свежим провалом снова пошёл бы в ротацию без остывания.
+    """CREATE TABLE IF NOT EXISTS proxy_memo(
+        uid TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        role TEXT,
+        fail_count INTEGER,
+        cooldown_until TEXT,
+        note TEXT,
+        saved_at TEXT NOT NULL
+    )""",
     "CREATE INDEX IF NOT EXISTS idx_proxy_provider ON proxy(provider)",
     "CREATE INDEX IF NOT EXISTS idx_event_ts ON event(ts)",
     "CREATE INDEX IF NOT EXISTS idx_probe_log_ts ON probe_log(ts)",
@@ -265,8 +287,12 @@ _SCHEMA = [
 # money НЕ трогаем — финансовая история вечная.
 PROBE_LOG_KEEP_DAYS = 90
 EVENT_KEEP_DAYS = 180
+# Посмертная память об исчезнувшем прокси (proxy_memo): месяц — вдвое больше
+# максимального срока аренды, который провайдер способен «прокрутить» молча;
+# дальше уже не воскрешение мигнувшей выдачи, а новая покупка того же id.
+MEMO_KEEP_DAYS = 30
 
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "7"
 
 # Поля, которые обновляет refresh (остальные — роль/проба/счётчики — сохраняются)
 _REFRESH_FIELDS = ("ip", "host", "port_http", "port_socks5", "user", "password",
@@ -721,13 +747,97 @@ class Pool:
         return [self._operation_dict(row) for row in rows]
 
     # ---------- пул ----------
+    def _save_memo(self, row):
+        """Запомнить ручные решения по строке, которую сейчас удалим из пула.
+
+        Храним не всю строку (паспорт всё равно придёт от провайдера заново), а
+        то, что автоматике самой не восстановить: роль off («не трогать»), остаток
+        cooldown и счётчик провалов. Живёт MEMO_KEEP_DAYS, чистится prune().
+        """
+        self.conn.execute(
+            "INSERT OR REPLACE INTO proxy_memo(uid, provider, role, fail_count,"
+            " cooldown_until, note, saved_at) VALUES(?,?,?,?,?,?,?)",
+            (row["uid"], row["provider"], row["role"], row["fail_count"],
+             row["cooldown_until"], row["note"], now_iso()))
+
+    def _take_memo(self, uid):
+        """Снять посмертную память вернувшегося uid (одноразово) -> dict|None."""
+        row = self.conn.execute("SELECT * FROM proxy_memo WHERE uid=?", (uid,)).fetchone()
+        if row is None:
+            return None
+        self.conn.execute("DELETE FROM proxy_memo WHERE uid=?", (uid,))
+        return dict(row)
+
+    def _queue_vanished(self, items, limit=50):
+        """Очередь «о чём написать владельцу»: сам pool писем не шлёт, но и не теряет.
+
+        Постпокупочный refresh зовётся там, где alerter под рукой не всегда, а
+        строка исчезнувшего прокси удаляется сразу — без очереди повод для письма
+        (деньги за неотработанные дни) пропал бы вместе с ней. Долг разгребает
+        ближайший pool-refresh крона или кнопка панели — states.notify_vanished.
+        Пишем без commit: его делает refresh.
+        """
+        try:
+            prev = json.loads(self.get_setting("vanished_pending") or "[]")
+        except ValueError:
+            prev = []
+        if not isinstance(prev, list):
+            prev = []
+        prev.extend(items)
+        self.conn.execute(
+            "INSERT OR REPLACE INTO setting(key, value) VALUES(?, ?)",
+            ("vanished_pending", json.dumps(prev[-limit:], ensure_ascii=False)))
+
+    def take_vanished_pending(self):
+        """Забрать очередь исчезнувших прокси (одноразово) -> [dict, …]."""
+        try:
+            items = json.loads(self.get_setting("vanished_pending") or "[]")
+        except ValueError:
+            items = []
+        if not isinstance(items, list):
+            items = []
+        if items:
+            self.set_setting("vanished_pending", "[]")
+        return [x for x in items if isinstance(x, dict)]
+
+    def _empty_listing_repeated(self, name):
+        """Пустая выдача провайдера: первый раз — подозрение, второй — факт.
+
+        Счётчик подряд идущих пустых ответов живёт в setting; непустая выдача его
+        обнуляет (см. refresh). Пишем без commit — его сделает сам refresh.
+        """
+        key = "empty-listing:%s" % name
+        try:
+            prev = int(self.get_setting(key) or 0)
+        except (TypeError, ValueError):
+            prev = 0
+        self.conn.execute("INSERT OR REPLACE INTO setting(key, value) VALUES(?, ?)",
+                          (key, str(prev + 1)))
+        return prev >= 1
+
     def refresh(self, providers, actor="user", active=None, keep_hosts=None):
         """Слить пул со всех провайдеров. Ошибка одного не роняет остальных.
 
-        merge: новые — insert (роль по DEFAULT_ROLE), существующие — update
-        только полей _REFRESH_FIELDS (роль/проба/счётчики нетронуты), пропавшие
-        у УСПЕШНО опрошенного провайдера — gone=1. Провайдер с ошибкой
-        не трогается вообще (работаем на кэше, §10).
+        merge: новые — insert (роль по DEFAULT_ROLE либо из proxy_memo, если этот
+        uid у нас уже был и вернулся), существующие — update только полей
+        _REFRESH_FIELDS (роль/проба/счётчики нетронуты), пропавшие у УСПЕШНО
+        опрошенного провайдера — УДАЛЯЮТСЯ. Провайдер с ошибкой не трогается
+        вообще (работаем на кэше, §10).
+
+        Почему удаляем, а не метим (решение владельца 22.08): адаптеры просят у
+        провайдеров только активные прокси, снятый с обслуживания в выдачу уже не
+        вернётся — и метка «пропал» висела в панели вечно, со старым временем
+        теста. Ручное решение владельца при этом не теряется: роль/cooldown/
+        fail_count уходят в proxy_memo и вернутся вместе с записью.
+
+        Две страховки, где вместо удаления остаётся gone=1:
+        * keep_hosts (П7-2) — боевой канал: панель обязана видеть, на чём сидит
+          трафик, пока плановое переключение не уведёт его к живому провайдеру;
+        * пустая выдача при непустом пуле — успешный ответ без единой позиции
+          похож на сбой у провайдера, а не на «кабинет опустел». Первый такой
+          ответ только метит gone и пишет событие; если провайдер повторит пустую
+          выдачу (счётчик empty-listing:<провайдер> в setting, крон — раз в
+          30 мин), уборка проходит как обычно: кабинет действительно пуст.
 
         active (П7, 🔴 C2): множество провайдеров, у которых ЕСТЬ ключ на диске.
         Строки провайдеров вне этого множества УДАЛЯЮТСЯ из пула (П7-2, 1.6.0:
@@ -744,7 +854,9 @@ class Pool:
         плановое переключение не уведёт трафик к живому провайдеру.
         """
         self.observe_provider_errors(providers, actor=actor)
-        summary = {"providers": {}, "errors": {}, "stale": {}}
+        summary = {"providers": {}, "errors": {}, "stale": {}, "vanished": [], "suspect": {}}
+        keep = {h for h in (keep_hosts or ()) if h}
+        notes = []     # (action, uid, result, detail) — пишутся после commit
         for name, prov in providers.items():
             try:
                 items = prov.list()
@@ -753,6 +865,9 @@ class Pool:
                 continue
             seen = []
             added = updated = 0
+            if items:      # выдача снова непустая — подозрение снято
+                self.conn.execute("INSERT OR REPLACE INTO setting(key, value) VALUES(?, ?)",
+                                  ("empty-listing:%s" % name, "0"))
             for it in items:
                 uid = "%s:%s" % (it["provider"], it["ext_id"])
                 seen.append(uid)
@@ -764,23 +879,68 @@ class Pool:
                         tuple(it.get(f) for f in _REFRESH_FIELDS) + (uid,))
                     updated += 1
                 else:
+                    # вернулся тот же uid — поднимаем посмертную память (роль off,
+                    # cooldown, счётчик провалов), иначе воскресшая запись пришла бы
+                    # «чистой» и автоматика забыла бы решение владельца
+                    memo = self._take_memo(uid)
                     self.conn.execute(
                         "INSERT INTO proxy(uid, provider, ext_id, %s, role, gone)"
                         " VALUES(%s)" % (", ".join(_REFRESH_FIELDS),
                                          ",".join("?" * (3 + len(_REFRESH_FIELDS) + 2))),
                         (uid, it["provider"], it["ext_id"])
                         + tuple(it.get(f) for f in _REFRESH_FIELDS)
-                        + (DEFAULT_ROLE.get(name, "auto"), 0))
+                        + ((memo or {}).get("role") or DEFAULT_ROLE.get(name, "auto"), 0))
+                    if memo:
+                        self.conn.execute(
+                            "UPDATE proxy SET fail_count=?, cooldown_until=?, note=? WHERE uid=?",
+                            (memo.get("fail_count") or 0, memo.get("cooldown_until"),
+                             memo.get("note") or "", uid))
                     added += 1
-            # пропавшие: только у этого провайдера, только при успешном list()
+            # ушедшие из выдачи: только у этого провайдера, только при успешном list()
             qmarks = ",".join("?" * len(seen)) or "''"
-            cur = self.conn.execute(
-                "UPDATE proxy SET gone=1 WHERE provider=? AND uid NOT IN (%s)" % qmarks,
-                (name, *seen))
+            missing = [dict(r) for r in self.conn.execute(
+                "SELECT * FROM proxy WHERE provider=? AND uid NOT IN (%s)" % qmarks,
+                (name, *seen)).fetchall()]
+            gone = removed = kept = 0
+            if missing and not items and not self._empty_listing_repeated(name):
+                # успешный, но пустой ответ при непустом пуле: похоже на сбой у
+                # провайдера — метим мягко и ждём подтверждения следующим опросом
+                cur = self.conn.execute(
+                    "UPDATE proxy SET gone=1 WHERE provider=?", (name,))
+                gone = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                summary["suspect"][name] = gone
+                # события пишем ПОСЛЕ commit: log_event идёт своей транзакцией,
+                # а здесь открыта наша (run_transaction вложенность запрещает)
+                notes.append(("pool-refresh", None, "empty-listing",
+                              "%s ответил успешно, но не вернул ни одного прокси —"
+                              " %d строк оставлены в пуле с меткой «пропал» до"
+                              " следующего опроса" % (name, gone)))
+            else:
+                for row in missing:
+                    if row["host"] and row["host"] in keep:
+                        # боевой канал: панель должна видеть, на чём сидит трафик
+                        self.conn.execute("UPDATE proxy SET gone=1 WHERE uid=?", (row["uid"],))
+                        gone += 1
+                        kept += 1
+                        continue
+                    self._save_memo(row)
+                    self.conn.execute("DELETE FROM proxy WHERE uid=?", (row["uid"],))
+                    removed += 1
+                    summary["vanished"].append({
+                        "uid": row["uid"], "provider": name, "host": row["host"],
+                        "country": row["country"], "exit_cc": row.get("exit_cc"),
+                        "date_end": row["date_end"], "role": row["role"]})
+                    notes.append((
+                        "proxy-vanished", row["uid"], "removed",
+                        "%s больше не отдаёт этот прокси (%s) — строка убрана из пула;"
+                        " аренда была оплачена до %s"
+                        % (name, row["host"] or "?", row["date_end"] or "?")))
             summary["providers"][name] = {
                 "total": len(items), "added": added, "updated": updated,
-                "gone": cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0,
+                "gone": gone, "removed": removed, "kept": kept,
             }
+        if summary["vanished"]:
+            self._queue_vanished(summary["vanished"])
         if active is not None:
             known = {r[0] for r in self.conn.execute("SELECT DISTINCT provider FROM proxy")}
             for name in sorted(known - set(active)):
@@ -788,6 +948,8 @@ class Pool:
                 if r["deleted"]:
                     summary["stale"][name] = r["deleted"]
         self.conn.commit()
+        for action, uid, result, detail in notes:
+            self.log_event(action, actor=actor, to_uid=uid, result=result, detail=detail)
         self.log_event("pool-refresh", actor=actor,
                        result="ok" if not summary["errors"] else "partial",
                        detail=json.dumps(summary, ensure_ascii=False))
@@ -808,6 +970,18 @@ class Pool:
         -> {"deleted": n, "kept": m}
         """
         keep = [h for h in (keep_hosts or ()) if h]
+        if keep:
+            qm = ",".join("?" * len(keep))
+            doomed = self.conn.execute(
+                "SELECT * FROM proxy WHERE provider=? AND host NOT IN (%s)" % qm,
+                (name, *keep)).fetchall()
+        else:
+            doomed = self.conn.execute(
+                "SELECT * FROM proxy WHERE provider=?", (name,)).fetchall()
+        # ключ вернут — refresh вставит строки заново; роль off и cooldown должны
+        # пережить эту паузу так же, как при обычном исчезновении из выдачи
+        for row in doomed:
+            self._save_memo(dict(row))
         if keep:
             qm = ",".join("?" * len(keep))
             cur = self.conn.execute(
@@ -911,11 +1085,13 @@ class Pool:
         return self.run_transaction(write)
 
     def prune(self, now=None):
-        """Retention (E1): probe_log > 90 дн и event > 180 дн — DELETE; money вечно.
+        """Retention (E1): probe_log > 90 дн, event > 180 дн, proxy_memo > 30 дн —
+        DELETE; money вечно.
 
         Не чаще раза в сутки (отметка prune_last в setting) — зовётся из цикла
         `pool-refresh --probe`, чтобы не дёргать DELETE каждый прогон.
-        -> {'probe_log': n, 'event': m} или None, если сегодня уже чистили."""
+        -> {'probe_log': n, 'event': m, 'proxy_memo': k} или None, если сегодня
+        уже чистили."""
         now = now or datetime.datetime.now()
         day = now.strftime("%Y-%m-%d")
         if self.get_setting("prune_last") == day:
@@ -924,10 +1100,14 @@ class Pool:
                  ).replace(microsecond=0).isoformat(sep=" ")
         cut_e = (now - datetime.timedelta(days=EVENT_KEEP_DAYS)
                  ).replace(microsecond=0).isoformat(sep=" ")
+        cut_m = (now - datetime.timedelta(days=MEMO_KEEP_DAYS)
+                 ).replace(microsecond=0).isoformat(sep=" ")
         a = self.conn.execute("DELETE FROM probe_log WHERE ts < ?", (cut_p,)).rowcount
         b = self.conn.execute("DELETE FROM event WHERE ts < ?", (cut_e,)).rowcount
+        c = self.conn.execute("DELETE FROM proxy_memo WHERE saved_at < ?", (cut_m,)).rowcount
         self.set_setting("prune_last", day)      # заодно коммитит DELETE'ы
-        return {"probe_log": a if a and a > 0 else 0, "event": b if b and b > 0 else 0}
+        return {"probe_log": a if a and a > 0 else 0, "event": b if b and b > 0 else 0,
+                "proxy_memo": c if c and c > 0 else 0}
 
     def mark_used(self, uid):
         self.conn.execute("UPDATE proxy SET last_used_at=? WHERE uid=?", (now_iso(), uid))
@@ -947,7 +1127,9 @@ class Pool:
             if role:
                 self.conn.execute("UPDATE proxy SET role=? WHERE uid=?", (role, uid))
         else:
-            r = role or DEFAULT_ROLE.get(norm["provider"], "auto")
+            # тот же uid уже был у нас и ушёл — поднимаем решение владельца (роль off)
+            memo = self._take_memo(uid)
+            r = role or (memo or {}).get("role") or DEFAULT_ROLE.get(norm["provider"], "auto")
             self.conn.execute(
                 "INSERT INTO proxy(uid, provider, ext_id, %s, role, gone) VALUES(%s)"
                 % (", ".join(_REFRESH_FIELDS), ",".join("?" * (3 + len(_REFRESH_FIELDS) + 2))),

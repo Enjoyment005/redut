@@ -254,12 +254,21 @@ def cmd_pool_refresh(cfg, args):
     summary = p.refresh(providers, actor="user", active=set(providers),
                         keep_hosts={current_host} if current_host else None)
     for name, s in summary["providers"].items():
-        print("%-10s: всего %d, новых %d, обновлено %d, gone %d"
-              % (name, s["total"], s["added"], s["updated"], s["gone"]))
+        print("%-10s: всего %d, новых %d, обновлено %d, убрано %d%s"
+              % (name, s["total"], s["added"], s["updated"], s.get("removed", 0),
+                 (", помечено «пропал» %d" % s["gone"]) if s["gone"] else ""))
+    for name, n in (summary.get("suspect") or {}).items():
+        print("%-10s: ВНИМАНИЕ — успешный ответ без единого прокси; %d строк оставлены"
+              " до следующего опроса (пул не стёрт)" % (name, n))
     for name, n in (summary.get("stale") or {}).items():
         print("%-10s: ключа больше нет — %d строк удалено из пула" % (name, n))
     for name, err in summary["errors"].items():
         print("%-10s: ОШИБКА — %s" % (name, err))
+    # провайдер снял с обслуживания прокси, аренда которого ещё оплачена -> письмо
+    told = states_mod.notify_vanished(p, _make_alerter(cfg, secrets))
+    if told["notified"]:
+        print("исчезли с неистёкшей арендой: %d — письмо владельцу отправлено"
+              % told["notified"])
     for name, prov in providers.items():
         if name in summary["errors"]:
             continue
@@ -623,13 +632,17 @@ def _balance_num(prov):
 def _postbuy_check(cfg, p, providers, bought):
     """§6.1 постфактум: подтянуть паспорт (getproxy) и прогнать пробу на РЕАЛЬНУЮ
     страну выхода. Выход в жёстком блоке СНГ -> off + алерт, не используем."""
+    current_host = apply_mod.current_upstream(read_singbox(cfg) or {})
     prov = providers.get("proxy6")
     if prov is not None:
         try:
-            p.refresh({"proxy6": prov})   # getproxy: полные паспортные поля новых uid
+            # getproxy: полные паспортные поля новых uid. keep_hosts обязателен:
+            # refresh теперь убирает из пула всё, чего провайдер не отдал, а строку
+            # боевого канала стирать нельзя — панель по ней показывает текущий выход
+            p.refresh({"proxy6": prov},
+                      keep_hosts={current_host} if current_host else None)
         except Exception:
             pass
-    current_host = apply_mod.current_upstream(read_singbox(cfg) or {})
     out = []
     for pxy in bought:
         uid = "%s:%s" % (pxy["provider"], pxy["ext_id"])

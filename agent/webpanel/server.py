@@ -801,6 +801,11 @@ class Handler(BaseHTTPRequestHandler):
                     except ProviderError:
                         pass
                 APP.pool.conn.commit()
+            # письмо про снятые провайдером прокси с ЕЩЁ ОПЛАЧЕННОЙ арендой
+            # (под общим локом БД — как heartbeat_check в _pulse_monitor)
+            with _DB_LOCK:
+                summary["notified_vanished"] = states_mod.notify_vanished(
+                    APP.pool, APP.alerter)["notified"]
             return self._json(200, summary)
         if path == "/api/egress":
             v = apply_mod.verify_egress()
@@ -1385,12 +1390,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _postbuy(self, prov, proxies):
         post = []
+        cur = APP.current_host()
         try:
             with _DB_LOCK:
-                APP.pool.refresh({"proxy6": prov})   # getproxy: полные поля новых uid
+                # getproxy: полные поля новых uid. keep_hosts — чтобы уборка
+                # исчезнувших не стёрла строку, на которой сейчас стоит канал
+                APP.pool.refresh({"proxy6": prov},
+                                 keep_hosts={cur} if cur else None)
         except Exception:
             pass
-        cur = APP.current_host()
         for pxy in proxies:
             uid = "%s:%s" % (pxy["provider"], pxy["ext_id"])
             with _DB_LOCK:
