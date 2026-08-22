@@ -94,6 +94,11 @@ DEFAULT_REPO = "Enjoyment005/redut"
 BRANCH = "main"
 USER_AGENT = "redut-update/1.0"
 BEACON_URL = "https://raw.githubusercontent.com/%s/%s/VERSION"
+# Основной источник маяка — Contents API: он отдаёт файл с max-age=60, тогда как
+# raw.githubusercontent идёт через Fastly с max-age=300 и своей копией на каждом
+# узле CDN (см. beacon_sources). Без ключа лимит API — 60 запросов в час на адрес;
+# мы тратим единицы в сутки (крон + кнопка панели).
+BEACON_API_URL = "https://api.github.com/repos/%s/contents/VERSION?ref=%s"
 
 # Дефолты блока `update` в /etc/vpn-panel/config.json. Владелец меняет auto из
 # панели; окно/репозиторий — по SSH (repo подменяют только для обкатки на тестовом
@@ -178,28 +183,33 @@ def _curl(url, args=(), timeout=20, iface=None):
     return p.returncode, p.stdout or "", p.stderr or ""
 
 
-def beacon_url(repo, branch=BRANCH, stamp=None):
-    """URL маяка версии с обходом кэша CDN.
+def beacon_sources(repo, branch=BRANCH):
+    """Откуда спрашивать версию маяка, по приоритету -> ((url, доп. заголовки), …).
 
-    raw.githubusercontent отдаёт файл через Fastly с `Cache-Control: max-age=300`,
-    и копия кэшируется на каждом узле CDN отдельно. Сразу после публикации узел
-    честно получает СТАРУЮ версию и говорит «обновляться не на что» — грабля 15.08,
-    повторившаяся на выкате 1.12.1 (панель проверила через 5 минут после пуша и
-    показала «стоит последняя версия»). Кэш ключуется полным URL, поэтому меняющийся
-    параметр даёт свежий ответ; запросов тут единицы в сутки (крон + кнопка панели),
-    нагрузки это не создаёт.
+    Грабля 15.08, повторившаяся на выкате 1.12.1: панель через пять минут после
+    публикации отвечала «стоит последняя версия». Виноват кэш raw.githubusercontent
+    (Fastly, `max-age=300`, отдельная копия на каждом узле CDN). Cache-buster в
+    query там НЕ помогает — проверено 22.08: Fastly не берёт query в ключ кэша,
+    ответ приходит с `X-Cache: HIT` и старым содержимым.
+
+    Поэтому основной источник — Contents API (`max-age=60`, отдаёт свежий файл
+    сразу после пуша), а raw остаётся запасным на случай, если API недоступен или
+    исчерпан лимит: он честно отстаёт максимум на пять минут, но это лучше, чем
+    «маяк недоступен».
     """
-    return "%s?ts=%d" % (BEACON_URL % (repo, branch),
-                         int(time.time() if stamp is None else stamp))
+    return ((BEACON_API_URL % (repo, branch),
+             ("-H", "Accept: application/vnd.github.raw")),
+            (BEACON_URL % (repo, branch), ()))
 
 
-def fetch_text(url, timeout=20, max_bytes=4096):
+def fetch_text(url, timeout=20, max_bytes=4096, headers=()):
     """GET маленького текстового файла тем же правилом транспорта, что у провайдеров:
     предпочтительный -> запасной (tun0 только живой), успех запасного запоминается
     в общей подсказке /run — GitHub и API провайдеров блокируются одинаково.
 
-    Заголовки no-cache — вторая половина обхода кэша (первая — параметр в
-    beacon_url): промежуточный прокси провайдера тоже способен придержать ответ."""
+    Заголовки no-cache идут всегда: придержать ответ способен не только CDN
+    GitHub, но и прокси провайдера. headers — дополнительные аргументы curl
+    (например Accept для Contents API, см. beacon_sources)."""
     from providers import base as _tb     # лениво: не тянуть транспорт при импорте
     order = ["direct", "tun0"] if _tb.preferred_transport() == "direct" else ["tun0", "direct"]
     last = None
@@ -208,7 +218,7 @@ def fetch_text(url, timeout=20, max_bytes=4096):
             continue
         rc, out, err = _curl(url, args=("--max-filesize", str(max_bytes),
                                         "-H", "Cache-Control: no-cache",
-                                        "-H", "Pragma: no-cache"),
+                                        "-H", "Pragma: no-cache") + tuple(headers),
                              timeout=timeout, iface=("tun0" if tr == "tun0" else None))
         if rc == 0:
             if i > 0:
@@ -216,6 +226,37 @@ def fetch_text(url, timeout=20, max_bytes=4096):
             return out
         last = "curl rc=%s (%s): %s" % (rc, tr, (err or "нет ответа").strip()[:200])
     raise UpdateError("маяк недоступен — %s" % (last or "канал узла не поднят"), network=True)
+
+
+def fetch_beacon(repo, branch=BRANCH, log=None):
+    """Версия маяка (строка X.Y.Z) из первого источника, который ответил внятно.
+
+    Источники — beacon_sources: сперва Contents API (свежий), затем raw (может
+    отставать до пяти минут из-за кэша CDN). Мусор вместо версии считаем отказом
+    источника, а не поводом сдаться: API без нужного Accept вернул бы JSON, и
+    раньше это стало бы ошибкой проверки вместо перехода к запасному адресу.
+    """
+    log = log or (lambda m: None)
+    problems = []
+    network = True          # «все отказы были сетевые» — тогда это ретрай, не битый релиз
+    for url, headers in beacon_sources(repo, branch):
+        host = url.split("/")[2]
+        try:
+            raw = fetch_text(url, headers=headers)
+        except UpdateError as e:
+            problems.append(str(e))
+            network = network and bool(e.network)
+            continue
+        remote = (raw or "").strip()
+        if parse_version(remote):
+            if problems:
+                log("маяк: %s не ответил (%s), версия взята с %s"
+                    % (beacon_sources(repo, branch)[0][0].split("/")[2], problems[0], host))
+            return remote
+        problems.append("%s отдал не X.Y.Z: %r" % (host, remote[:40]))
+        network = False
+    raise UpdateError("маяк недоступен — %s" % "; ".join(problems or ["источников нет"]),
+                      network=network)
 
 
 # ── проверка: есть ли новая версия ───────────────────────────────────────────
@@ -234,10 +275,7 @@ def check(cfg, pool=None, alerter=None, log=None):
     out = {"local": local, "remote": None, "newer": False, "bad": False,
            "error": None, "repo": u["repo"], "auto": u["auto"]}
     try:
-        raw = fetch_text(beacon_url(u["repo"]))
-        remote = (raw or "").strip()
-        if not parse_version(remote):
-            raise UpdateError("маяк VERSION отдал не X.Y.Z: %r" % remote[:40])
+        remote = fetch_beacon(u["repo"], log=log)
         out["remote"] = remote
     except UpdateError as e:
         out["error"] = str(e)

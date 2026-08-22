@@ -164,14 +164,14 @@ class TestStateAndCheck(unittest.TestCase):
             f.write("{битый json")
         self.assertEqual(update.load_state(self.cfg), {})   # битый файл = пустое состояние
 
-    def test_check_asks_beacon_with_cache_buster(self):
+    def test_check_asks_the_api_source_first(self):
         asked = []
         def f(url, **kw):
             asked.append(url)
             return "1.3.0"
         update.fetch_text = f
         update.check(self.cfg, pool=self.pool, alerter=self.alerter)
-        self.assertRegex(asked[0], r"/VERSION\?ts=\d+$")
+        self.assertTrue(asked[0].startswith("https://api.github.com/repos/"), asked)
 
     def test_newer_notifies_once(self):
         self._beacon("1.3.0\n")
@@ -304,23 +304,57 @@ class TestFetchTransport(unittest.TestCase):
         self.assertEqual(update.fetch_text("http://x"), "1.2.3\n")
         self.assertEqual(self.calls, ["direct"])
 
-    def test_beacon_request_defeats_cdn_cache(self):
-        """Грабля 15.08 и 22.08: raw.githubusercontent держит VERSION 5 минут, и
-        сразу после публикации узел видит СТАРУЮ версию («обновляться не на что»).
-        Обходим двумя способами: меняющийся параметр URL (это ключ кэша CDN) и
-        заголовки no-cache для промежуточных прокси."""
-        seen = {}
+    def test_beacon_prefers_api_over_cached_raw(self):
+        """Грабля 15.08 и 22.08: raw.githubusercontent держит VERSION 5 минут
+        (Fastly, max-age=300, копия на каждом узле CDN), и сразу после публикации
+        узел видит СТАРУЮ версию. Cache-buster в query там не работает — проверено
+        22.08: ответ приходит с X-Cache: HIT. Поэтому спрашиваем Contents API
+        (max-age=60), а raw остаётся запасным."""
+        seen = []
         def f(url, args=(), timeout=20, iface=None):
-            seen["url"], seen["args"] = url, list(args)
+            seen.append((url, list(args)))
             return 0, "9.9.9", ""
         update._curl = f
-        update.fetch_text(update.beacon_url("owner/repo"))
-        self.assertTrue(seen["url"].startswith(
-            "https://raw.githubusercontent.com/owner/repo/main/VERSION?ts="), seen["url"])
-        self.assertIn("Cache-Control: no-cache", seen["args"])
-        self.assertIn("Pragma: no-cache", seen["args"])
-        self.assertNotEqual(update.beacon_url("owner/repo", stamp=100),
-                            update.beacon_url("owner/repo", stamp=101))
+        self.assertEqual(update.fetch_beacon("owner/repo"), "9.9.9")
+        url, args = seen[0]
+        self.assertEqual(url, "https://api.github.com/repos/owner/repo/contents/VERSION?ref=main")
+        self.assertIn("Accept: application/vnd.github.raw", args)
+        self.assertIn("Cache-Control: no-cache", args)
+        self.assertIn("Pragma: no-cache", args)
+        self.assertEqual(len(seen), 1, "запасной источник дёргать незачем — API ответил")
+
+    def test_beacon_falls_back_to_raw_when_api_fails(self):
+        answers = {"api.github.com": (22, "", "rate limit"),
+                   "raw.githubusercontent.com": (0, "9.9.9", "")}
+        seen = []
+        def f(url, args=(), timeout=20, iface=None):
+            host = url.split("/")[2]
+            seen.append(host)
+            return answers[host]
+        update._curl = f
+        self.assertEqual(update.fetch_beacon("owner/repo"), "9.9.9")
+        # API пробуется обоими транспортами (direct -> tun0), и лишь потом raw
+        self.assertEqual(seen[0], "api.github.com")
+        self.assertEqual(seen[-1], "raw.githubusercontent.com")
+        self.assertEqual(seen.count("raw.githubusercontent.com"), 1)
+
+    def test_beacon_json_instead_of_version_is_not_fatal(self):
+        """API без нужного Accept отдаёт JSON — это отказ источника, а не проверки."""
+        def f(url, args=(), timeout=20, iface=None):
+            if url.startswith("https://api."):
+                return 0, '{"name":"VERSION","encoding":"base64"}', ""
+            return 0, "9.9.9", ""
+        update._curl = f
+        self.assertEqual(update.fetch_beacon("owner/repo"), "9.9.9")
+
+    def test_beacon_all_sources_dead_is_one_error(self):
+        def f(url, args=(), timeout=20, iface=None):
+            return 7, "", "connect refused"
+        update._curl = f
+        with self.assertRaises(update.UpdateError) as cm:
+            update.fetch_beacon("owner/repo")
+        self.assertTrue(cm.exception.network)
+        self.assertIn("маяк недоступен", str(cm.exception))
 
     def test_fallback_to_tun0_and_hint_saved(self):
         self._curl_fake({"direct": (7, "", "refused"), "tun0": (0, "1.2.3", "")})
