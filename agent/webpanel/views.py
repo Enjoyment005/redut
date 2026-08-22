@@ -1347,13 +1347,17 @@ async function loadStrategy(){try{const r=await api('/api/strategy');
   catch(e){document.getElementById('strategies').innerHTML='<span class="bad">'+esc(e.message)+'</span>'}}
 
 async function setStrategy(id,title){
-  if(!confirm('Включить стратегию «'+title+'»?\\n\\nТекущий канал продолжит работать — правило применится '+
-    'при следующей смене прокси (ротация, «В бой», покупка). Числа и порядок в таблице пула '+
-    'пересчитаются сразу, без новой проверки.'))return;
+  if(!confirm('Включить стратегию «'+title+'»?\\n\\nПанель сразу выберет лучший канал по новому правилу. '+
+    'Если это не текущий прокси, она безопасно проверит новый, переключит сервер и сама откатится при провале.'))return;
   try{const r=await api('/api/strategy',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({strategy:id})});
-    toast(r.changed?('Стратегия: «'+title+'» включена'):'Эта стратегия и так была включена','ok');
-    await loadStrategy();await loadStatus();await loadMoney();await loadPool()}
+    if(r.switch_started)toast('Стратегия «'+title+'» включена — переключаю на '+
+      esc((r.target||{}).host||'лучший канал')+' по схеме проверка → смена → проверка','warn');
+    else if(r.switch_error)toast('Стратегия включена, но переключение не запустилось: '+r.switch_error,'bad');
+    else toast(r.changed?('Стратегия «'+title+'» включена; текущий канал уже лучший по этому правилу'):
+      'Эта стратегия и так была включена','ok');
+    await loadStrategy();await loadStatus();await loadMoney();await loadPool();
+    if(r.switch_started)setTimeout(async()=>{try{await reloadAll()}catch(_){}},15000)}
   catch(e){toast('стратегия: '+e.message,'bad')}}
 
 /* ── ключи провайдеров: вписать или заменить прямо здесь ──

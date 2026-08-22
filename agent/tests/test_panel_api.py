@@ -356,6 +356,17 @@ class _PreviewHandler:
     _strategy_state = server.Handler._strategy_state
 
 
+class _StrategyHandler(_PreviewHandler):
+    _do_strategy = server.Handler._do_strategy
+
+    def _json(self, status, payload):
+        self.status = status
+        return payload
+
+    def _client_ip(self):
+        return "127.0.0.1"
+
+
 class TestStrategyPreview(_AppHarness):
     """П3: превью «Сейчас с ней» стратегийно-разное и видит текущий канал.
 
@@ -415,6 +426,36 @@ class TestStrategyPreview(_AppHarness):
         s = self.by_id(st, "balanced")
         self.assertLessEqual(len(s["buy"]), 8)
         self.assertGreaterEqual(s["buy_total"], len(s["buy"]))
+
+    def test_change_immediately_applies_new_best_channel(self):
+        self.app.current_host = lambda: "10.0.0.2"
+        with mock.patch.object(server, "_strategy_switch_kick", return_value=(True, "")) as kick:
+            r = _StrategyHandler()._do_strategy({"strategy": "speed"})
+        self.assertEqual(r["current"], "speed")
+        self.assertTrue(r["switch_needed"])
+        self.assertTrue(r["switch_started"])
+        self.assertEqual(r["target"]["host"], "10.0.0.1")
+        kick.assert_called_once_with("proxy6:f")
+        with open(self.app.cfg["_source"], encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["countries"]["strategy"], "speed")
+
+    def test_no_restart_when_current_is_already_best(self):
+        self.app.current_host = lambda: "10.0.0.1"
+        with mock.patch.object(server, "_strategy_switch_kick") as kick:
+            r = _StrategyHandler()._do_strategy({"strategy": "speed"})
+        self.assertFalse(r["switch_needed"])
+        self.assertFalse(r["switch_started"])
+        kick.assert_not_called()
+
+    def test_reselect_active_strategy_repairs_channel_drift(self):
+        self.app.cfg["countries"]["strategy"] = "speed"
+        self.app.current_host = lambda: "10.0.0.2"
+        with mock.patch.object(server, "_strategy_switch_kick", return_value=(True, "")) as kick:
+            r = _StrategyHandler()._do_strategy({"strategy": "speed"})
+        self.assertFalse(r["changed"])
+        self.assertTrue(r["switch_needed"])
+        self.assertTrue(r["switch_started"])
+        kick.assert_called_once_with("proxy6:f")
 
 
 class TestPoolRowStrategyBadge(_AppHarness):

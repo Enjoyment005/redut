@@ -225,6 +225,25 @@ def _switch_provider_kick(name):
     return False, (out or "systemd-run rc=%s" % rc)[:200]
 
 
+def _strategy_switch_kick(uid):
+    """Фоном применить лучший канал после смены стратегии.
+
+    ``apply`` уже содержит безопасную цепочку probe -> config check -> backup ->
+    apply -> verify -> rollback. Здесь лишь не держим HTTP-запрос открытым на
+    время сетевых проб. uid приходит из нашей БД, а не из тела запроса.
+    """
+    if os.name != "posix":
+        threading.Thread(target=lambda: _run_agent(["apply", uid], timeout=900),
+                         name="strategy-switch", daemon=True).start()
+        return True, ""
+    rc, out = apply_mod.run_cmd(["systemd-run", "--collect", "-p", "RuntimeMaxSec=900",
+                                 "--unit", "redut-strategy-switch",
+                                 "/usr/local/bin/vpn-agent", "apply", uid])
+    if rc == 0 or "already" in (out or "").lower():
+        return True, ""
+    return False, (out or "systemd-run rc=%s" % rc)[:200]
+
+
 # ── ключи провайдеров: правка из панели (§12 POST /api/key) ──────────────────────────
 # Ключ ходит только в одну сторону: панель принимает новый и показывает хвост
 # (mask_key), но никогда не отдаёт сохранённый обратно — ни в API, ни в HTML.
@@ -924,8 +943,8 @@ class Handler(BaseHTTPRequestHandler):
     def _do_strategy(self, body):
         """POST /api/strategy {strategy} — сменить правило выбора стран.
 
-        На УЖЕ работающий канал не влияет: правило применится при следующей смене
-        (ротация, «В бой», покупка). Чёрный список не трогает никакая стратегия."""
+        Если лучший канал новой стратегии отличается от текущего, сразу запускаем
+        штатный безопасный apply в фоне. Чёрный список не трогает никакая стратегия."""
         name = str(body.get("strategy") or "").strip().lower()
         if name not in country_mod.STRATEGIES:
             return self._json(400, {"error": "неизвестная стратегия"})
@@ -936,7 +955,23 @@ class Handler(BaseHTTPRequestHandler):
                 APP.pool.log_event("strategy", actor="user", result=name,
                                    detail="было: %s" % was, src_ip=self._client_ip())
         state = self._strategy_state()
-        state.update({"ok": True, "was": was, "changed": name != was})
+        selected = next((s for s in state["strategies"] if s["id"] == name), None)
+        pick = (selected or {}).get("pick")
+        # Повторный выбор активной стратегии тоже должен исправить дрейф:
+        # пул мог обновиться уже после её сохранения, и лучшим стал другой канал.
+        switch_needed = bool(pick and not pick.get("is_current"))
+        switch_started, switch_error = False, ""
+        if switch_needed:
+            switch_started, switch_error = _strategy_switch_kick(pick["uid"])
+            with _DB_LOCK:
+                APP.pool.log_event("strategy-apply", actor="user",
+                                   result="started" if switch_started else "fail",
+                                   detail="%s -> %s%s" % (name, pick["uid"],
+                                          (": " + switch_error) if switch_error else ""),
+                                   src_ip=self._client_ip())
+        state.update({"ok": True, "was": was, "changed": name != was,
+                      "switch_needed": switch_needed, "switch_started": switch_started,
+                      "switch_error": switch_error, "target": pick})
         return self._json(200, state)
 
     # ------------------------------------------------ обновления (UPDATE-PLAN)
