@@ -178,17 +178,37 @@ def _curl(url, args=(), timeout=20, iface=None):
     return p.returncode, p.stdout or "", p.stderr or ""
 
 
+def beacon_url(repo, branch=BRANCH, stamp=None):
+    """URL маяка версии с обходом кэша CDN.
+
+    raw.githubusercontent отдаёт файл через Fastly с `Cache-Control: max-age=300`,
+    и копия кэшируется на каждом узле CDN отдельно. Сразу после публикации узел
+    честно получает СТАРУЮ версию и говорит «обновляться не на что» — грабля 15.08,
+    повторившаяся на выкате 1.12.1 (панель проверила через 5 минут после пуша и
+    показала «стоит последняя версия»). Кэш ключуется полным URL, поэтому меняющийся
+    параметр даёт свежий ответ; запросов тут единицы в сутки (крон + кнопка панели),
+    нагрузки это не создаёт.
+    """
+    return "%s?ts=%d" % (BEACON_URL % (repo, branch),
+                         int(time.time() if stamp is None else stamp))
+
+
 def fetch_text(url, timeout=20, max_bytes=4096):
     """GET маленького текстового файла тем же правилом транспорта, что у провайдеров:
     предпочтительный -> запасной (tun0 только живой), успех запасного запоминается
-    в общей подсказке /run — GitHub и API провайдеров блокируются одинаково."""
+    в общей подсказке /run — GitHub и API провайдеров блокируются одинаково.
+
+    Заголовки no-cache — вторая половина обхода кэша (первая — параметр в
+    beacon_url): промежуточный прокси провайдера тоже способен придержать ответ."""
     from providers import base as _tb     # лениво: не тянуть транспорт при импорте
     order = ["direct", "tun0"] if _tb.preferred_transport() == "direct" else ["tun0", "direct"]
     last = None
     for i, tr in enumerate(order):
         if tr == "tun0" and not _tb._tun0_alive():
             continue
-        rc, out, err = _curl(url, args=("--max-filesize", str(max_bytes)),
+        rc, out, err = _curl(url, args=("--max-filesize", str(max_bytes),
+                                        "-H", "Cache-Control: no-cache",
+                                        "-H", "Pragma: no-cache"),
                              timeout=timeout, iface=("tun0" if tr == "tun0" else None))
         if rc == 0:
             if i > 0:
@@ -214,7 +234,7 @@ def check(cfg, pool=None, alerter=None, log=None):
     out = {"local": local, "remote": None, "newer": False, "bad": False,
            "error": None, "repo": u["repo"], "auto": u["auto"]}
     try:
-        raw = fetch_text(BEACON_URL % (u["repo"], BRANCH))
+        raw = fetch_text(beacon_url(u["repo"]))
         remote = (raw or "").strip()
         if not parse_version(remote):
             raise UpdateError("маяк VERSION отдал не X.Y.Z: %r" % remote[:40])

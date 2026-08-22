@@ -164,6 +164,15 @@ class TestStateAndCheck(unittest.TestCase):
             f.write("{битый json")
         self.assertEqual(update.load_state(self.cfg), {})   # битый файл = пустое состояние
 
+    def test_check_asks_beacon_with_cache_buster(self):
+        asked = []
+        def f(url, **kw):
+            asked.append(url)
+            return "1.3.0"
+        update.fetch_text = f
+        update.check(self.cfg, pool=self.pool, alerter=self.alerter)
+        self.assertRegex(asked[0], r"/VERSION\?ts=\d+$")
+
     def test_newer_notifies_once(self):
         self._beacon("1.3.0\n")
         r1 = update.check(self.cfg, pool=self.pool, alerter=self.alerter)
@@ -294,6 +303,24 @@ class TestFetchTransport(unittest.TestCase):
         self._curl_fake({"direct": (0, "1.2.3\n", "")})
         self.assertEqual(update.fetch_text("http://x"), "1.2.3\n")
         self.assertEqual(self.calls, ["direct"])
+
+    def test_beacon_request_defeats_cdn_cache(self):
+        """Грабля 15.08 и 22.08: raw.githubusercontent держит VERSION 5 минут, и
+        сразу после публикации узел видит СТАРУЮ версию («обновляться не на что»).
+        Обходим двумя способами: меняющийся параметр URL (это ключ кэша CDN) и
+        заголовки no-cache для промежуточных прокси."""
+        seen = {}
+        def f(url, args=(), timeout=20, iface=None):
+            seen["url"], seen["args"] = url, list(args)
+            return 0, "9.9.9", ""
+        update._curl = f
+        update.fetch_text(update.beacon_url("owner/repo"))
+        self.assertTrue(seen["url"].startswith(
+            "https://raw.githubusercontent.com/owner/repo/main/VERSION?ts="), seen["url"])
+        self.assertIn("Cache-Control: no-cache", seen["args"])
+        self.assertIn("Pragma: no-cache", seen["args"])
+        self.assertNotEqual(update.beacon_url("owner/repo", stamp=100),
+                            update.beacon_url("owner/repo", stamp=101))
 
     def test_fallback_to_tun0_and_hint_saved(self):
         self._curl_fake({"direct": (7, "", "refused"), "tun0": (0, "1.2.3", "")})
