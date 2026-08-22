@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Адаптеры провайдеров. Добавить третьего провайдера = один файл (§4)."""
-from .base import Provider, ProviderError
+from .base import (Provider, ProviderError, ProviderErrorKind, Capability,
+                   ProviderCapabilities)
 from .proxyline import ProxyLine
 from .proxy6 import Proxy6
 from .proxywing import ProxyWing
@@ -13,7 +14,8 @@ PROVIDER_CLASSES = {
 
 
 def make_providers(secrets):
-    """secrets: {"proxyline": {"api_key": "…"}, "proxy6": {"api_key": "…"}}
+    """secrets: {"proxyline": {"api_key": "…"}, "proxy6": {"api_key": "…"},
+                  "proxywing": {"api_key": "…"}}
     -> dict name->Provider только для провайдеров с ключом."""
     out = {}
     for name, cls in PROVIDER_CLASSES.items():

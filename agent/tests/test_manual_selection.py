@@ -139,6 +139,23 @@ class TestSelectionMode(unittest.TestCase):
         self.assertEqual(self.pool.get_setting("selection_strategy_override"), "speed")
         self.assertEqual(self.mode()["mode"], "auto")
 
+    def test_fault_release_cannot_override_newer_owner_strategy(self):
+        self.pin()
+        old = states.selection_state(self.pool, self.cfg)
+        expected = {"manual_uid": old["manual_uid"], "manual_host": old["manual_host"],
+                    "revision": states.selection_revision_state(self.pool, self.cfg)["desired"]}
+        latest = states.request_strategy_selection(
+            self.pool, self.cfg, "reputation", pending_config=True,
+            reason="newer owner choice")
+        r = states._persist_auto_strategy(
+            self.cfg, self.pool, "speed", "auto", "old proxy fault", lambda *_: None,
+            expected_manual=expected)
+        self.assertTrue(r["superseded"])
+        revision = states.selection_revision_state(self.pool, self.cfg)
+        self.assertEqual(revision["desired"], latest)
+        self.assertEqual(revision["payload"], {"strategy": "reputation"})
+        self.assertEqual(self.pool.get_setting("selection_strategy_override"), "reputation")
+
     def test_explicit_apply_source_controls_mode(self):
         states.finish_explicit_apply(self.cfg, self.pool, self.uid, "10.0.0.1",
                                      _verify(True), source="strategy")

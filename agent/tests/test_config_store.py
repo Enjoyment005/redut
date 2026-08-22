@@ -2,7 +2,10 @@
 """Атомарная запись config.json из панели и агента."""
 import json
 import os
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 
 import _ctx  # noqa: F401
@@ -51,6 +54,47 @@ class TestConfigStore(unittest.TestCase):
         with open(self.path, "rb") as f:
             self.assertEqual(f.read(), before)
         self.assertFalse(any(n.startswith(".redut-config-") for n in os.listdir(self.tmp.name)))
+
+    def test_writer_lock_serializes_separate_processes(self):
+        first_flag = os.path.join(self.tmp.name, "first.locked")
+        second_flag = os.path.join(self.tmp.name, "second.locked")
+        release = os.path.join(self.tmp.name, "release")
+        script = (
+            "import os,sys,time,config_store; cfg={'_source':sys.argv[1]}; "
+            "cm=config_store.writer(cfg); cm.__enter__(); "
+            "open(sys.argv[2],'w').close(); "
+            "deadline=time.time()+5; "
+            "exec(\"while sys.argv[3] != '-' and not os.path.exists(sys.argv[3]) "
+            "and time.time() < deadline: time.sleep(.02)\"); cm.__exit__(None,None,None)")
+        cwd = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        first = subprocess.Popen(
+            [sys.executable, "-c", script, self.path, first_flag, release], cwd=cwd)
+        second = None
+        try:
+            deadline = time.time() + 3
+            while not os.path.exists(first_flag) and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(os.path.exists(first_flag))
+            second = subprocess.Popen(
+                [sys.executable, "-c", script, self.path, second_flag, "-"], cwd=cwd)
+            time.sleep(0.15)
+            self.assertFalse(os.path.exists(second_flag),
+                             "другой процесс вошёл в writer до освобождения lock")
+            with open(release, "w", encoding="ascii"):
+                pass
+            self.assertEqual(first.wait(timeout=3), 0)
+            self.assertEqual(second.wait(timeout=3), 0)
+            self.assertTrue(os.path.exists(second_flag))
+        finally:
+            for proc in (first, second):
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+
+    def test_writer_lock_is_outside_read_only_config_directory(self):
+        lock_path = config_store._runtime_lock_path(self.path)
+        self.assertNotEqual(os.path.dirname(lock_path), os.path.dirname(self.path))
+        self.assertTrue(os.path.isdir(os.path.dirname(lock_path)))
 
 
 if __name__ == "__main__":

@@ -83,12 +83,17 @@ class TestNormProxyline(unittest.TestCase):
 
 
 class TestNormProxyWing(unittest.TestCase):
-    def test_contract(self):
+    def test_datacenter_or_isp_contract(self):
         order = _ctx.fixture("proxywing_proxies.json")["orders"][0]
         n = norm_proxywing(order["proxies"][0], order, "isp")
+        self.assertEqual(n["provider"], "proxywing")
         self.assertEqual(n["ext_id"], "isp|ord_test123|prx_test456")
+        self.assertEqual(n["host"], "203.0.113.20")
         self.assertEqual((n["port_http"], n["port_socks5"]), (46780, 46781))
-        self.assertEqual((n["country"], n["ip_version"], n["kind"]), ("fr", 4, "dedicated"))
+        self.assertEqual(n["country"], "fr")
+        self.assertEqual(n["ip_version"], 4)
+        self.assertEqual(n["kind"], "dedicated")
+        self.assertEqual(n["date_end"], "2026-09-22T04:11:04+00:00")
 
 
 if __name__ == "__main__":

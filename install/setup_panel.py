@@ -28,7 +28,9 @@ VAR = "/var/lib/vpn-panel"
 
 # update.py — ПЕРВЫМ: agent.py его импортирует, и на живом узле между копиями
 # файлов есть окно, где тик крона (pool-refresh/heartbeat) поймал бы ImportError.
-AGENT_FILES = ["update.py", "config_store.py", "agent.py", "pool.py", "probe.py", "apply.py", "money.py",
+AGENT_FILES = ["update.py", "config_store.py", "config_schema.py", "health.py", "learning.py",
+               "metrics.py", "replay.py",
+               "agent.py", "pool.py", "probe.py", "apply.py", "money.py",
                "states.py", "alerts.py", "country.py",
                "providers/__init__.py", "providers/base.py",
                "providers/proxyline.py", "providers/proxy6.py", "providers/proxywing.py"]
@@ -78,6 +80,11 @@ DEFAULTS = {
         "strategy": "speed",
     },
     "auto_prolong": {"enabled": True, "days_before": 3, "period_days": 30},
+    "learning": {"mode": "shadow", "shadow_min_days": 30,
+                 "owner_approved": False, "canary_servers": [],
+                 "exploration_enabled": False, "exploration_rate": 0.05,
+                 "exploration_max_per_day": 1,
+                 "exploration_purchase_budget_per_day": 0.0},
     # Самообновление с GitHub (vpn/UPDATE-PLAN.md): auto переключается в панели,
     # окно/частота/repo — по SSH (repo подменяют только для обкатки на форке, Р9).
     "update": {"auto": True, "window": "04:00-06:00", "repo": "Enjoyment005/redut"},
@@ -173,7 +180,7 @@ def write_config(name, net, port, subnet, wg_port, dnsmasq):
         try:
             with open(path, encoding="utf-8") as f:
                 old = json.load(f)
-            for k in ("money", "countries", "auto_prolong", "update", "stability"):
+            for k in ("money", "countries", "auto_prolong", "update", "stability", "learning"):
                 if isinstance(old.get(k), dict) and old[k]:
                     cfg[k] = old[k]
                     print("  config.json: сохранён настроенный блок '%s'" % k)

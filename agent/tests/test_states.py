@@ -29,7 +29,8 @@ class TestRankCandidates(unittest.TestCase):
 
     def _row(self, host, country, exit_cc=None, probe_ok=0, score=None, role="auto"):
         return {"uid": "proxy6:%s" % host, "host": host, "country": country,
-                "exit_cc": exit_cc, "probe_ok": probe_ok, "score": score, "role": role}
+                "exit_cc": exit_cc, "probe_ok": probe_ok, "score": score, "role": role,
+                "last_probe_at": datetime.datetime.now().isoformat() if probe_ok else None}
 
     def test_blacklist_dropped(self):
         rows = [self._row("r", "ru"), self._row("u", "ua"), self._row("b", "by"),

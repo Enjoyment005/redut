@@ -65,7 +65,9 @@ sys.path.insert(0, PANEL_DIR)
 import alerts as alerts_mod        # noqa: E402
 import apply as apply_mod          # noqa: E402
 import config_store                # noqa: E402
+import config_schema               # noqa: E402
 import country as country_mod      # noqa: E402
+import metrics as metrics_mod      # noqa: E402
 import money as money_mod          # noqa: E402
 import pool as pool_mod            # noqa: E402
 import probe as probe_mod          # noqa: E402
@@ -83,7 +85,7 @@ ETC_SECRETS = "/etc/vpn-panel/secrets.json"
 CERT = "/etc/vpn-panel/panel.crt"
 KEY = "/etc/vpn-panel/panel.key"
 
-_DB_LOCK = threading.Lock()        # sqlite из потоков http-сервера — сериализуем доступ
+_DB_LOCK = threading.RLock()       # sqlite из потоков http-сервера — сериализуем доступ
 _SECRETS_LOCK = threading.Lock()   # secrets.json правят и мастер, и экран ключей — по одному
 _CONFIG_LOCK = threading.Lock()    # config.json: панель правит из него ровно одну настройку
 
@@ -123,19 +125,46 @@ def load_config():
     env = os.environ.get("VPN_PANEL_CONFIG")
     for cand in ([env] if env else []) + [ETC_CONFIG, os.path.join(PANEL_DIR, "config.local.json")]:
         if os.path.isfile(cand):
-            with open(cand, encoding="utf-8") as f:
-                cfg = json.load(f)
             server_paths = cand == ETC_CONFIG
-            cfg.setdefault("db", "/var/lib/vpn-panel/state.db"
-                           if server_paths else os.path.join(PANEL_DIR, "state.db"))
-            cfg.setdefault("ring", "/var/lib/vpn-panel/cfg"
-                           if server_paths else os.path.join(PANEL_DIR, "cfg"))
-            cfg.setdefault("singbox_config", "/etc/sing-box/config.json")
-            cfg.setdefault("boot_script", "/usr/local/bin/vpn-boot-setup.sh")
-            cfg.setdefault("singbox_bin", "sing-box")
-            cfg.setdefault("lock", "/run/vpn-agent.lock")
-            cfg.setdefault("panel_port", 8443)
-            cfg["_source"] = cand
+            defaults = {
+                "db": "/var/lib/vpn-panel/state.db" if server_paths else os.path.join(PANEL_DIR, "state.db"),
+                "ring": "/var/lib/vpn-panel/cfg" if server_paths else os.path.join(PANEL_DIR, "cfg"),
+                "singbox_config": "/etc/sing-box/config.json",
+                "boot_script": "/usr/local/bin/vpn-boot-setup.sh",
+                "singbox_bin": "sing-box", "lock": "/run/vpn-agent.lock",
+                "panel_port": 8443, "money": dict(money_mod.DEFAULT_LIMITS),
+                "countries": {"strategy": "speed", "blacklist": []},
+                "health": {
+                    "fresh_seconds": 7200, "stale_seconds": 86400,
+                    "switch_margin": 15, "min_hold_time": 1800,
+                    "max_latency_regression": 500,
+                    "quorum_window_seconds": 60, "quorum_min_targets": 2,
+                },
+                "learning": {"mode": "shadow", "shadow_min_days": 30,
+                             "owner_approved": False, "canary_servers": [],
+                             "exploration_enabled": False, "exploration_rate": 0.05,
+                             "exploration_max_per_day": 1,
+                             "exploration_purchase_budget_per_day": 0.0},
+                "auto_prolong": {"enabled": True, "days_before": 3, "period_days": 30},
+                "update": {"auto": True, "window": "04:00-06:00",
+                           "repo": "Enjoyment005/redut"},
+            }
+            try:
+                migration_error = ""
+                try:
+                    config_schema.migrate_file(cand)
+                except (OSError, ValueError, RecursionError, MemoryError,
+                        config_schema.ConfigMigrationError) as e:
+                    migration_error = type(e).__name__
+                with open(cand, encoding="utf-8") as f:
+                    raw = json.load(f)
+            except (OSError, ValueError, RecursionError, MemoryError):
+                raw = None
+            cfg = config_schema.normalize(raw, defaults=defaults, source=cand)
+            if migration_error:
+                cfg["_config_meta"]["issues"].append(
+                    {"path": "config_schema_version", "reason": migration_error,
+                     "action": "migration-deferred"})
             return cfg
     raise SystemExit("Нет config.json (%s)" % ETC_CONFIG)
 
@@ -343,12 +372,38 @@ def _make_mask(secrets):
     return mask
 
 
+class _LockedPoolView:
+    """Saga-view общего Pool: каждый DB-вызов соблюдает HTTP `_DB_LOCK`."""
+    def __init__(self, pool):
+        self._pool = pool
+
+    def __getattr__(self, name):
+        value = getattr(self._pool, name)
+        if not callable(value):
+            return value
+
+        def locked(*args, **kwargs):
+            with _DB_LOCK:
+                return value(*args, **kwargs)
+        return locked
+
+
 class App:
     """Разделяемое состояние: конфиг, соединение с БД, пул, провайдеры, admin."""
 
     def __init__(self):
         self.cfg = load_config()
         self.pool = pool_mod.Pool(self.cfg["db"], server=self.cfg.get("server") or "panel")
+        if os.name == "posix" and self.pool.unfinished_operations():
+            try:
+                apply_mod.recover_unfinished_operations(
+                    self.cfg, self.pool, log=lambda m: None,
+                    finalize_apply=lambda op, verify: states_mod.recover_apply_post_state(
+                        self.cfg, self.pool, op, verify, log=lambda m: None))
+            except apply_mod.ApplyError as e:
+                self.pool.log_event("operation-recovery", actor="auto",
+                                    result="deferred", detail=str(e))
+        self.saga_pool = _LockedPoolView(self.pool)
         self.store = auth.AuthStore(self.pool.conn)
         # мастер первого входа (чистая установка): пока нет admin — режим онбординга.
         self.setup = {}                       # незаписанные шаги мастера (в памяти)
@@ -360,6 +415,12 @@ class App:
         self.admin = self.secrets.get("admin")
         self.provisioned = bool(self.admin)   # admin есть -> панель настроена
         self.providers = make_providers(self.secrets)
+        self.pool.observe_provider_errors(self.providers, actor="panel")
+        try:
+            money_mod.reconcile_pending_spend(self.pool, self.providers, actor="recovery")
+        except money_mod.SpendDenied as error:
+            self.pool.log_event("spend-recovery", actor="auto",
+                                result="deferred", detail=str(error))
         self.alerter = alerts_mod.make_alerter(self.secrets, self.cfg,
                                                log=lambda m: None, mask=_make_mask(self.secrets))
 
@@ -392,7 +453,7 @@ class App:
                 data = dict(self.secrets or {})
             self.write_secrets(merge_key(data, name, key))
 
-    def save_strategy(self, name):
+    def save_strategy(self, name, _locked=False):
         """Записать стратегию стран в config.json и применить без рестарта.
 
         Правим ТОЧЕЧНО файл, из которого читали, а не выгружаем cfg целиком: load_config
@@ -401,7 +462,32 @@ class App:
         Лимиты трат остаются недосягаемы из браузера (§6.2) — здесь только одна строка."""
         if name not in country_mod.STRATEGIES:
             raise ValueError("неизвестная стратегия %r" % name)
-        config_store.save_country_strategy(self.cfg, name)
+        config_store.save_country_strategy(self.cfg, name, _locked=_locked)
+
+    def request_strategy(self, name, actor="user", reason="strategy"):
+        """Durable intent снача, config.json потом, с восстановимым хвостом."""
+        if name not in country_mod.STRATEGIES:
+            raise ValueError("неизвестная стратегия %r" % name)
+        with _CONFIG_LOCK, config_store.writer(self.cfg):
+            self.refresh_strategy()
+            was = country_mod.strategy(self.cfg)
+            with _DB_LOCK:
+                was_mode = states_mod.selection_state(self.pool, self.cfg)["mode"]
+                revision = states_mod.request_strategy_selection(
+                    self.pool, self.cfg, strategy=name, actor=actor, reason=reason,
+                    pending_config=True)
+            persist_error = ""
+            try:
+                self.save_strategy(name, _locked=True)
+            except Exception as e:
+                # Intent уже долговечен: worker повторит запись из override.
+                self.cfg.setdefault("countries", {})["strategy"] = name
+                persist_error = "%s: %s" % (type(e).__name__, e)
+            else:
+                with _DB_LOCK:
+                    self.pool.clear_strategy_override(revision, name)
+            return {"revision": revision, "was": was, "was_mode": was_mode,
+                    "persist_error": persist_error}
 
     def refresh_strategy(self):
         """Подхватить MANUAL->AUTO(speed), записанный отдельным процессом агента."""
@@ -479,7 +565,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def _json(self, code, obj, extra=None):
-        self._send(code, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8", extra)
+        self._send(code, json.dumps(obj, ensure_ascii=False, allow_nan=False),
+                   "application/json; charset=utf-8", extra)
 
     def _redirect(self, to, extra=None):
         self._headers(303, extra=(extra or []) + [("Location", to)])
@@ -552,6 +639,8 @@ class Handler(BaseHTTPRequestHandler):
     def _api_get(self, path, qs):
         if path == "/api/status":
             return self._json(200, self._status())
+        if path == "/api/config/diagnostics":
+            return self._json(200, config_schema.diagnostics(APP.cfg))
         if path == "/api/pool":
             with _DB_LOCK:
                 rows = APP.pool.list(include_gone=True)
@@ -563,11 +652,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/events":
             limit = events_limit(qs)
             with _DB_LOCK:
-                evs = APP.pool.conn.execute(
-                    "SELECT ts,actor,action,result,detail FROM event ORDER BY id DESC LIMIT ?",
-                    (limit,)).fetchall()
-            return self._json(200, {"events": [dict(zip(("ts", "actor", "action", "result", "detail"), e))
-                                               for e in evs]})
+                evs = APP.pool.events(limit)
+            public_fields = ("ts", "actor", "action", "result", "detail", "decision")
+            return self._json(200, {"events": [
+                {key: event.get(key) for key in public_fields} for event in evs]})
+        if path == "/api/metrics":
+            days = (qs.get("days") or [metrics_mod.DEFAULT_WINDOW_DAYS])[0]
+            with _DB_LOCK:
+                report = metrics_mod.local_report(APP.pool, cfg=APP.cfg, window_days=days)
+            return self._json(200, report)
         if path == "/api/market":
             return self._json(200, self._market(qs))
         if path == "/api/money":
@@ -716,7 +809,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"egress": v["egress_ip"], "egress_cc": v["exit_cc"],
                                     "tg_code": v["tg_code"], "ok": v["ok"], "why": v.get("why", "")})
         if path == "/api/rollback":
-            r = apply_mod.rollback_from_ring(APP.cfg)
+            r = apply_mod.rollback_from_ring(APP.cfg, pool=APP.saga_pool,
+                                             requested_by="user",
+                                             selection_source="manual")
             with _DB_LOCK:
                 row = next((x for x in APP.pool.list(include_gone=True)
                             if x["host"] == r["good_ip"]), None) if r.get("ok") else None
@@ -729,6 +824,7 @@ class Handler(BaseHTTPRequestHandler):
                                    detail=json.dumps({"bad": r["bad_ip"], "good": r["good_ip"]}, ensure_ascii=False),
                                    src_ip=self._client_ip())
                 APP.pool.set_egress(r.get("verify"))
+                apply_mod.commit_operation(APP.saga_pool, r)
             return self._json(200, {"ok": r["ok"], "bad_ip": r["bad_ip"], "good_ip": r["good_ip"],
                                     "egress": r["verify"]["egress_ip"]})
         if path == "/api/rotate":
@@ -913,6 +1009,7 @@ class Handler(BaseHTTPRequestHandler):
         with _DB_LOCK:
             rows = APP.pool.rotation_candidates()
             selection = states_mod.selection_state(APP.pool, APP.cfg, cur_host)
+            revision = states_mod.selection_revision_state(APP.pool, APP.cfg)
         rows = [r for r in rows if r["provider"] in APP.providers]   # только активные (П7)
         pool_cc = []
         for r in rows:
@@ -949,7 +1046,7 @@ class Handler(BaseHTTPRequestHandler):
                 "fallback_strategy": states_mod.MANUAL_FALLBACK_STRATEGY,
                 "strategies": out,
                 "blacklist": sorted(country_mod.blacklist(APP.cfg)),
-                "pool_size": len(rows)}
+                "pool_size": len(rows), "revision": revision}
 
     @staticmethod
     def _brief(row):
@@ -965,16 +1062,14 @@ class Handler(BaseHTTPRequestHandler):
         name = str(body.get("strategy") or "").strip().lower()
         if name not in country_mod.STRATEGIES:
             return self._json(400, {"error": "неизвестная стратегия"})
-        APP.refresh_strategy()
-        was = country_mod.strategy(APP.cfg)
-        with _DB_LOCK:
-            was_mode = states_mod.selection_state(APP.pool, APP.cfg)["mode"]
         # Пишем и при повторном выборе: у старого/мигрированного config.json ключа
         # может не быть, а явный выбор пользователя должен стать устойчивым.
-        APP.save_strategy(name)
+        requested = APP.request_strategy(
+            name, actor="user", reason="стратегия выбрана в панели")
+        revision = requested["revision"]
+        was = requested["was"]
+        was_mode = requested["was_mode"]
         with _DB_LOCK:
-            states_mod.set_auto_selection(APP.pool, APP.cfg, strategy=name, actor="user",
-                                          reason="стратегия выбрана в панели")
             if name != was:
                 APP.pool.log_event("strategy", actor="user", result=name,
                                    detail="было: %s" % was, src_ip=self._client_ip())
@@ -984,19 +1079,21 @@ class Handler(BaseHTTPRequestHandler):
         # Повторный выбор активной стратегии тоже должен исправить дрейф:
         # пул мог обновиться уже после её сохранения, и лучшим стал другой канал.
         switch_needed = bool(pick and not pick.get("is_current"))
-        switch_started, switch_error = False, ""
-        if switch_needed:
-            switch_started, switch_error = _strategy_switch_kick(pick["uid"])
-            with _DB_LOCK:
-                APP.pool.log_event("strategy-apply", actor="user",
-                                   result="started" if switch_started else "fail",
-                                   detail="%s -> %s%s" % (name, pick["uid"],
-                                          (": " + switch_error) if switch_error else ""),
-                                   src_ip=self._client_ip())
+        # Preview не доказывает convergence: боевой config мог смениться
+        # до пометки applied. Всегда отдаём revision worker-у под agent flock.
+        switch_started, switch_error = _strategy_switch_kick(pick["uid"] if pick else None)
+        with _DB_LOCK:
+            APP.pool.log_event("strategy-apply", actor="user",
+                               result="started" if switch_started else "fail",
+                               detail="%s -> %s%s" % (name,
+                                      pick["uid"] if pick else "reconcile",
+                                      (": " + switch_error) if switch_error else ""),
+                               src_ip=self._client_ip())
         state.update({"ok": True, "was": was, "was_mode": was_mode,
                       "changed": name != was, "mode_changed": was_mode != states_mod.SELECTION_AUTO,
                       "switch_needed": switch_needed, "switch_started": switch_started,
-                      "switch_error": switch_error, "target": pick})
+                      "switch_error": switch_error, "target": pick,
+                      "persist_error": requested["persist_error"]})
         return self._json(200, state)
 
     # ------------------------------------------------ обновления (UPDATE-PLAN)
@@ -1362,7 +1459,9 @@ class Handler(BaseHTTPRequestHandler):
                                    detail="disqualified: %s" % (res["disqualified"] or "проба"),
                                    src_ip=self._client_ip())
             return self._json(409, {"error": "кандидат дисквалифицирован: %s" % (res["disqualified"] or "проба не прошла")})
-        r = apply_mod.apply_candidate(APP.cfg, row, res, log=lambda m: None)
+        r = apply_mod.apply_candidate(APP.cfg, row, res, log=lambda m: None,
+                                      pool=APP.saga_pool, requested_by="user",
+                                      selection_source="manual")
         with _DB_LOCK:
             APP.pool.mark_used(row["uid"])
             # П9: ручное «В бой» для off разрешено, но успешный apply переводит off->auto —
@@ -1380,6 +1479,7 @@ class Handler(BaseHTTPRequestHandler):
                                                   "verify": r["verify"], "source": "manual"},
                                                  ensure_ascii=False),
                                src_ip=self._client_ip())
+            apply_mod.commit_operation(APP.saga_pool, r)
         return self._json(200, {"ok": True, "old_ip": r["old_ip"], "new_ip": r["new_ip"],
                                 "egress": r["verify"]["egress_ip"],
                                 "egress_cc": r["verify"]["exit_cc"],
@@ -1777,8 +1877,26 @@ def _pulse_monitor():
         try:
             with _DB_LOCK:
                 states_mod.heartbeat_check(APP.pool, APP.alerter)
+                revision = states_mod.selection_revision_state(APP.pool, APP.cfg)
+            if revision["pending"] and revision["kind"] == "strategy":
+                _strategy_switch_kick(None)
         except Exception as e:
             print("pulse-monitor: %s" % e, file=sys.stderr)
+
+
+def _reconcile_selection_on_startup():
+    """Reboot после POST не теряет выбор: pending revision снова запускает worker."""
+    with _DB_LOCK:
+        revision = states_mod.selection_revision_state(APP.pool, APP.cfg)
+    if revision["pending"] and revision["kind"] == "strategy":
+        started, error = _strategy_switch_kick(None)
+        with _DB_LOCK:
+            APP.pool.log_event("selection-reconcile", actor="auto",
+                               result="started" if started else "deferred",
+                               detail="startup revision=%s%s" % (
+                                   revision["desired"], ("; " + error) if error else ""))
+        return started
+    return False
 
 
 def requires_tls(cfg):
@@ -1825,6 +1943,7 @@ class PanelHTTPSServer(ThreadingHTTPServer):
 def main():
     global APP
     APP = App()
+    _reconcile_selection_on_startup()
     port = int(APP.cfg.get("panel_port") or 8443)
     if not APP.provisioned:
         print("⚠️ Панель НЕ настроена — открой https://<host>:%d/setup (мастер первого входа: "

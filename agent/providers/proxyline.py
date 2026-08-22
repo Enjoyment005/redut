@@ -9,7 +9,8 @@ ProxyLine через API нельзя (caps buy/delete=False) — только �
 import re
 
 from . import base
-from .base import Provider, ProviderError, http_get_json, http_post_form, build_query
+from .base import (Provider, ProviderError, Capability, capabilities,
+                   http_get_json, http_post_form, build_query)
 
 API_BASE = "https://panel.proxyline.net/api"
 HOST_LABEL = "panel.proxyline.net"
@@ -40,16 +41,18 @@ def norm_proxyline(p):
 
 class ProxyLine(Provider):
     name = "proxyline"
-    caps = {"buy": False, "delete": False, "prolong": True, "check": False}
+    caps = capabilities(Capability.PROLONG)
     min_interval = 1.3  # 50 req/мин
 
     def _api(self, path, params=None):
-        self._throttle()
-        url = API_BASE + path
-        qs = build_query(params)
-        if qs:
-            url += "?" + qs
-        return http_get_json(url, headers={"API-KEY": self.api_key}, host_label=HOST_LABEL)
+        def request():
+            url = API_BASE + path
+            qs = build_query(params)
+            if qs:
+                url += "?" + qs
+            return http_get_json(url, headers={"API-KEY": self.api_key},
+                                 host_label=HOST_LABEL)
+        return self._guarded(path, request)
 
     def list(self):
         out = []
@@ -81,10 +84,12 @@ class ProxyLine(Provider):
             raise ProviderError("ProxyLine.prolong: period=%r не целое" % (period,)) from None
         if not (1 <= period <= 365):
             raise ProviderError("ProxyLine.prolong: period=%d вне 1..365 дней" % period)
-        self._throttle()
-        r = http_post_form(API_BASE + "/renew/", {"proxies": proxies, "period": period},
-                           headers={"API-KEY": self.api_key}, host_label=HOST_LABEL,
-                           mutating=True) or {}     # деньги: повтор другим транспортом — только если запрос не ушёл
+        def renew():
+            return http_post_form(
+                API_BASE + "/renew/", {"proxies": proxies, "period": period},
+                headers={"API-KEY": self.api_key}, host_label=HOST_LABEL,
+                mutating=True)
+        r = self._guarded("prolong", renew) or {}
         return {"proxies": proxies, "period": period,
                 "price": r.get("price") or r.get("amount") or r.get("cost"),
                 "balance": r.get("balance"),

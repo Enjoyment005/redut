@@ -24,12 +24,17 @@ _locked=True (второй flock в том же процессе конфлик�
 чистые решения (decide/cooldown_seconds) тестируются без сервера.
 """
 import datetime
+import json
+import math
 import os
+import re
 import time
+import urllib.parse
 
 import apply as apply_mod
 import config_store
 import country as country_mod
+import health as health_mod
 import money as money_mod
 import probe as probe_mod
 from providers import ProviderError
@@ -155,18 +160,60 @@ def selection_state(pool, cfg=None, current_host=None):
     }
 
 
+def selection_revision_state(pool, cfg=None):
+    """Снимок устойчивого намерения выбора и отставания reconciler."""
+    def number(key):
+        try:
+            return max(0, int(pool.get_setting(key) or 0))
+        except (TypeError, ValueError):
+            return 0
+    desired = number("desired_selection_revision")
+    applied = number("applied_selection_revision")
+    kind = pool.get_setting("desired_selection_kind")
+    raw = pool.get_setting("desired_selection_payload")
+    try:
+        payload = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        payload = {}
+    if kind not in ("strategy", "manual"):
+        current = selection_state(pool, cfg)
+        kind = "manual" if current["mode"] == SELECTION_MANUAL else "strategy"
+        payload = ({"uid": current.get("manual_uid"), "host": current.get("manual_host")}
+                   if kind == "manual" else {"strategy": country_mod.strategy(cfg)})
+    return {"desired": desired, "applied": applied, "pending": desired > applied,
+            "kind": kind, "payload": payload}
+
+
+def request_strategy_selection(pool, cfg, strategy, actor="user", reason="strategy",
+                               pending_config=False):
+    """Новое AUTO(strategy) намерение; applied догонит только после convergence."""
+    if strategy not in country_mod.STRATEGIES:
+        raise ValueError("неизвестная стратегия %r" % strategy)
+    revision = pool.request_selection_intent(
+        "strategy", {"strategy": strategy},
+        {"selection_mode": SELECTION_AUTO, "manual_uid": None,
+         "manual_host": None, "manual_since": None,
+         "selection_strategy_override": strategy if pending_config else None},
+        actor=actor, applied=False, detail=reason)
+    return revision
+
+
+def mark_selection_applied(pool, revision, actor="auto", detail=""):
+    return pool.mark_selection_applied(revision, actor=actor, detail=detail)
+
+
 def set_manual_selection(pool, uid, host, actor="user", reason="manual-apply"):
     """Атомарно закрепить успешно применённый человеком канал."""
     if not host:
         raise ValueError("ручной канал нельзя закрепить без host")
     was = selection_state(pool)
-    pool.set_settings({
-        "selection_mode": SELECTION_MANUAL,
-        "manual_uid": uid or ("live:%s" % host),
-        "manual_host": host,
-        "manual_since": _now_iso(),
-        "selection_strategy_override": None,
-    })
+    manual_uid = uid or ("live:%s" % host)
+    pool.request_selection_intent(
+        "manual", {"uid": manual_uid, "host": host},
+        {"selection_mode": SELECTION_MANUAL, "manual_uid": manual_uid,
+         "manual_host": host, "manual_since": _now_iso(),
+         "selection_strategy_override": None},
+        actor=actor, applied=True, detail=reason)
     pool.log_event("selection-mode", actor=actor, to_uid=uid,
                    result=SELECTION_MANUAL,
                    detail="%s; закреплён %s (было %s)" % (reason, host, was["mode"]))
@@ -183,7 +230,6 @@ def set_auto_selection(pool, cfg=None, strategy=None, actor="user", reason="stra
         "manual_uid": None,
         "manual_host": None,
         "manual_since": None,
-        "selection_strategy_override": None,
     })
     if was["mode"] != SELECTION_AUTO or log_unchanged:
         pool.log_event("selection-mode", actor=actor, result=SELECTION_AUTO,
@@ -191,39 +237,60 @@ def set_auto_selection(pool, cfg=None, strategy=None, actor="user", reason="stra
     return selection_state(pool, cfg)
 
 
-def _persist_auto_strategy(cfg, pool, name, actor, reason, log):
+def _persist_auto_strategy(cfg, pool, name, actor, reason, log, expected_manual=None):
     """Перейти в AUTO(name), не оставляя ручной канал без восстановления.
 
     Ошибка диска не блокирует аварийный failover: текущий процесс всё равно
     ранжирует по name, а override в БД заставит следующий цикл повторить запись.
     """
-    cfg.setdefault("countries", {})["strategy"] = name
-    error = ""
-    try:
-        config_store.save_country_strategy(cfg, name)
-    except Exception as e:  # отказ config.json не должен превращаться в чёрную дыру
-        error = "%s: %s" % (type(e).__name__, e)
-        pool.set_setting("selection_strategy_override", name)
-        log("  стратегия %s действует в памяти, запись config.json не удалась: %s" % (name, error))
-    set_auto_selection(pool, cfg, strategy=name, actor=actor, reason=reason)
-    if error:
-        # set_auto_selection очищает override штатного перехода — вернуть pending.
-        pool.set_setting("selection_strategy_override", name)
-    return {"strategy": name, "persist_error": error}
+    with config_store.writer(cfg):
+        if expected_manual is not None:
+            current = selection_state(pool, cfg)
+            current_revision = selection_revision_state(pool, cfg)["desired"]
+            if (current["mode"] != SELECTION_MANUAL
+                    or current.get("manual_uid") != expected_manual.get("manual_uid")
+                    or current.get("manual_host") != expected_manual.get("manual_host")
+                    or current_revision != expected_manual.get("revision")):
+                return {"strategy": country_mod.strategy(cfg), "persist_error": "",
+                        "superseded": True}
+        revision = request_strategy_selection(
+            pool, cfg, strategy=name, actor=actor, reason=reason, pending_config=True)
+        cfg.setdefault("countries", {})["strategy"] = name
+        error = ""
+        try:
+            config_store.save_country_strategy(cfg, name, _locked=True)
+        except Exception as e:  # отказ config.json не должен превращаться в чёрную дыру
+            error = "%s: %s" % (type(e).__name__, e)
+            log("  стратегия %s действует в памяти, запись config.json не удалась: %s" %
+                (name, error))
+        else:
+            pool.clear_strategy_override(revision, name)
+    return {"strategy": name, "persist_error": error, "revision": revision,
+            "superseded": False}
 
 
 def reconcile_strategy_override(cfg, pool, log=print):
     """Дописать на диск стратегию failover, если прежняя попытка не удалась."""
-    name = pool.get_setting("selection_strategy_override")
-    if name not in country_mod.STRATEGIES:
-        return False
-    cfg.setdefault("countries", {})["strategy"] = name
-    try:
-        config_store.save_country_strategy(cfg, name)
-    except Exception as e:
-        log("  повтор записи стратегии %s отложен: %s" % (name, e))
-        return False
-    pool.set_setting("selection_strategy_override", None)
+    with config_store.writer(cfg):
+        name = pool.get_setting("selection_strategy_override")
+        if name not in country_mod.STRATEGIES:
+            return False
+        revision = selection_revision_state(pool, cfg)
+        desired_name = ((revision.get("payload") or {}).get("strategy")
+                        if revision.get("kind") == "strategy" else None)
+        if revision["desired"] and desired_name != name:
+            return False
+        cfg.setdefault("countries", {})["strategy"] = name
+        try:
+            config_store.save_country_strategy(cfg, name, _locked=True)
+        except Exception as e:
+            log("  повтор записи стратегии %s отложен: %s" % (name, e))
+            return False
+        if revision["desired"]:
+            if not pool.clear_strategy_override(revision["desired"], name):
+                return False
+        else:
+            pool.set_setting("selection_strategy_override", None)
     pool.log_event("selection-mode", actor="auto", result="config-repaired",
                    detail="в config.json восстановлена стратегия %s" % name)
     return True
@@ -235,9 +302,19 @@ def release_manual_on_fault(cfg, pool, actor="auto", reason="confirmed-proxy-fau
     st = selection_state(pool, cfg)
     if st["mode"] != SELECTION_MANUAL:
         return {"released": False, "strategy": country_mod.strategy(cfg)}
+    revision = selection_revision_state(pool, cfg)["desired"]
     detail = ("%s; ручной %s (%s) отказал — включаю Скорость и отклик"
               % (reason, st.get("manual_uid") or "?", st.get("manual_host") or "?"))
-    r = _persist_auto_strategy(cfg, pool, MANUAL_FALLBACK_STRATEGY, actor, detail, log)
+    expected = {"manual_uid": st.get("manual_uid"), "manual_host": st.get("manual_host"),
+                "revision": revision}
+    r = _persist_auto_strategy(cfg, pool, MANUAL_FALLBACK_STRATEGY, actor, detail, log,
+                               expected_manual=expected)
+    if r.get("superseded"):
+        pool.log_event("manual-failover", actor=actor, from_uid=st.get("manual_uid"),
+                       result="superseded",
+                       detail=detail + "; более новое намерение владельца сохранено")
+        r["released"] = False
+        return r
     pool.log_event("manual-failover", actor=actor, from_uid=st.get("manual_uid"),
                    result=MANUAL_FALLBACK_STRATEGY,
                    detail=detail + (("; config error: " + r["persist_error"])
@@ -268,20 +345,64 @@ def finish_explicit_apply(cfg, pool, uid, host, verify=None, source="manual",
     return set_auto_selection(pool, cfg, actor=actor, reason="apply source=%s" % source)
 
 
+def recover_apply_post_state(cfg, pool, operation, verify=None, log=print):
+    """Довести DB-state после kill между verify и caller commit."""
+    desired = operation.get("desired_state") or {}
+    uid = desired.get("uid") or operation.get("to_uid")
+    host = desired.get("to_host")
+    source = desired.get("selection_source") or "recovery"
+    row = pool.get(uid) if uid else None
+    if row is not None:
+        pool.mark_used(uid)
+        pool.clear_cooldown(uid)
+        if desired.get("promote_role") and row.get("role") == "off":
+            pool.set_role(uid, "auto")
+            pool.log_event("role", actor="auto", to_uid=uid, result="auto",
+                           detail="saga recovery: успешный apply переводит off->auto")
+    if source in ("manual", "strategy", "setup", "recovery"):
+        finish_explicit_apply(cfg, pool, uid or ("live:%s" % host), host, verify,
+                              source=source, actor=operation.get("requested_by") or "auto",
+                              log=log)
+    elif verify:
+        pool.set_egress(verify)
+    pool.log_event("operation-recovery", actor="auto", to_uid=uid, result="post-state",
+                   detail="operation=%s source=%s" % (operation.get("id"), source))
+
+
 # ------------------------------------------------------------- проверки сервера
-def net_alive(cfg, log):
+def net_alive(cfg, log, with_evidence=False):
     """Шаг 1 (§8): жива ли сеть сервера — прямой curl МИМО прокси. Любой ответ
     (HTTP-код != 000) от любого таргета -> сеть жива. Мёртвая сеть -> FROZEN_NET."""
     if os.name != "posix":
-        return True, "dev"          # локально считаем сеть живой (rotate тут no-op)
+        result = (True, "dev", [health_mod.evidence(
+            "server_network", True, target="dev", via_proxy=False)])
+        return result if with_evidence else result[:2]
+    evidence = []
     for url in (cfg.get("net_check_urls") or NET_CHECK_URLS):
         rc, out = apply_mod.run_cmd(
             ["curl", "-sk", "--max-time", "6", "-o", os.devnull, "-w", "%{http_code}", url],
             timeout=12)
         code = (out or "").strip()[-3:]
+        host = urllib.parse.urlparse(url).hostname or ""
+        hostname_target = bool(host and not re.fullmatch(r"[0-9a-fA-F:.]+", host))
+        if hostname_target and rc == 6:
+            evidence.append(health_mod.evidence(
+                "dns", False, target=host, error_kind="resolve-failed",
+                via_proxy=False))
+        elif hostname_target and rc == 0:
+            evidence.append(health_mod.evidence(
+                "dns", True, target=host, via_proxy=False))
         if rc == 0 and code and code != "000":
-            return True, url
-    return False, None
+            evidence.append(health_mod.evidence(
+                "server_network", True, target=url, via_proxy=False))
+            result = (True, url, evidence)
+            return result if with_evidence else result[:2]
+        if rc != 6:
+            evidence.append(health_mod.evidence(
+                "server_network", False, target=url, via_proxy=False,
+                error_kind="transport-error", detail="curl_rc=%s code=%s" % (rc, code)))
+    result = (False, None, evidence)
+    return result if with_evidence else result[:2]
 
 
 def singbox_health(cfg):
@@ -352,6 +473,98 @@ def _cc_of(row):
 # «пока не проверили — считаем средним»: измеренный хороший его обгонит, измеренный
 # плохой отстанет, а сам он попадёт в перебор раньше заведомо слабых.
 UNPROBED_SCORE = 100.0
+FAILED_SCORE = 0.0
+DEFAULT_SWITCH_POLICY = {
+    "switch_margin": 15.0,
+    "min_hold_time": 1800.0,
+    "max_latency_regression": 500.0,
+}
+
+
+def switch_policy_cfg(cfg=None):
+    """Fail-safe числовая политика проактивной смены канала."""
+    raw = (cfg or {}).get("health") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    limits = {
+        "switch_margin": (0.0, 1000.0),
+        "min_hold_time": (0.0, 604800.0),
+        "max_latency_regression": (0.0, 60000.0),
+    }
+    result = {}
+    for key, (minimum, maximum) in limits.items():
+        try:
+            value = raw.get(key, DEFAULT_SWITCH_POLICY[key])
+            if isinstance(value, bool):
+                raise ValueError
+            value = float(value)
+            if not math.isfinite(value) or value < minimum or value > maximum:
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            value = DEFAULT_SWITCH_POLICY[key]
+        result[key] = value
+    return result
+
+
+def switch_decision(current_score, candidate_score, current_latency=None,
+                    candidate_latency=None, last_used_at=None, current_healthy=True,
+                    cfg=None, now=None):
+    """Pure hysteresis gate для проактивной смены стратегии.
+
+    Критический отказ текущего канала обходит hold-time и остальные
+    ограничители. Аварийная rotate-ветка эту функцию не вызывает.
+    """
+    policy = switch_policy_cfg(cfg)
+    if not current_healthy:
+        return {"allow": True, "reason": "critical-failure", "bypass": True,
+                "margin": None, "threshold": policy["switch_margin"],
+                "hold_remaining": 0.0, "latency_regression": None}
+    try:
+        if isinstance(current_score, bool) or isinstance(candidate_score, bool):
+            raise ValueError
+        current_score = float(current_score)
+        candidate_score = float(candidate_score)
+        if not math.isfinite(current_score) or not math.isfinite(candidate_score):
+            raise ValueError
+    except (TypeError, ValueError, OverflowError):
+        return {"allow": False, "reason": "score-unavailable", "bypass": False,
+                "margin": None, "threshold": policy["switch_margin"],
+                "hold_remaining": 0.0, "latency_regression": None}
+
+    margin = candidate_score - current_score
+    used_age = age_seconds(last_used_at, now=now)
+    if used_age is not None:
+        used_age = max(0.0, used_age)
+    hold_remaining = (max(0.0, policy["min_hold_time"] - used_age)
+                      if used_age is not None else 0.0)
+    latency_regression = None
+    try:
+        if isinstance(current_latency, bool) or isinstance(candidate_latency, bool):
+            raise ValueError
+        if current_latency is not None and candidate_latency is not None:
+            current_latency = float(current_latency)
+            candidate_latency = float(candidate_latency)
+            if not math.isfinite(current_latency) or not math.isfinite(candidate_latency):
+                raise ValueError
+            latency_regression = candidate_latency - current_latency
+    except (TypeError, ValueError, OverflowError):
+        latency_regression = None
+
+    blockers = []
+    if margin < policy["switch_margin"]:
+        blockers.append("margin")
+    if hold_remaining > 0:
+        blockers.append("min-hold")
+    if (latency_regression is not None
+            and latency_regression > policy["max_latency_regression"]):
+        blockers.append("latency-regression")
+    return {"allow": not blockers,
+            "reason": "+".join(blockers) if blockers else "better",
+            "bypass": False, "margin": round(margin, 1),
+            "threshold": policy["switch_margin"],
+            "hold_remaining": round(hold_remaining, 1),
+            "latency_regression": (round(latency_regression, 1)
+                                   if latency_regression is not None else None)}
 
 
 def rank_candidates(rows, cfg=None, current_host=None):
@@ -402,18 +615,55 @@ def rank_candidates(rows, cfg=None, current_host=None):
         # текущего host, поэтому аварийный failover бонусом не затрагивается.
         full, base = probe_mod.score_from_row(
             r, cfg, is_current=bool(current_host and probe_mod._rget(r, "host") == current_host))
+        if full is None and probe_mod._rget(r, "last_probe_at"):
+            weight = probe_mod.freshness_weight(r, cfg)
+            unknown_base = FAILED_SCORE * weight + UNPROBED_SCORE * (1.0 - weight)
+            country_unknown_base = unknown_base
+        else:
+            unknown_base = UNPROBED_SCORE
+            country_unknown_base = 0.0
         # при равных очках — кто быстрее по последнему замеру (приёмка №7: под
         # «скорость и отклик» лестница оценки квантует близкие задержки в один балл,
         # и 826 мс стояли в таблице ПОСЛЕ 925 мс просто по порядку вставки)
         lat = probe_mod._rget(r, "latency_ms")
         lat = float(lat) if lat is not None else float("inf")
         if country_first:
-            key = (-(cr), -(base if base is not None else 0.0), lat)
+            key = (-(cr), -(base if base is not None else country_unknown_base), lat)
         else:
-            key = (-(full if full is not None else cr + UNPROBED_SCORE), lat)
+            key = (-(full if full is not None else cr + unknown_base), lat)
         ranked.append((key, r))
     ranked.sort(key=lambda t: t[0])     # только по ключу: равные сохраняют входной порядок
     return [r for _, r in ranked]
+
+
+def decision_payload(cfg, mode, reason, rows=(), current_host=None, policy=None,
+                     exclusions=()):
+    """Без секретов: объяснимый снимок score/freshness/margin для audit/UI."""
+    breakdown = []
+    freshness = {}
+    for row in rows or ():
+        uid = str(probe_mod._rget(row, "uid") or "")
+        if not uid:
+            continue
+        full, base = probe_mod.score_from_row(
+            row, cfg, is_current=False)
+        weight = probe_mod.freshness_weight(row, cfg)
+        freshness[uid] = round(float(weight), 6)
+        breakdown.append({
+            "uid": uid, "total": full, "probe_component": base,
+            "country_component": (round(full - base, 6)
+                                  if full is not None and base is not None else None),
+            "latency_ms": probe_mod._rget(row, "latency_ms"),
+            "probe_ok": (None if probe_mod._rget(row, "probe_ok") is None
+                         else bool(probe_mod._rget(row, "probe_ok"))),
+        })
+    policy = dict(policy or {})
+    return {"strategy": country_mod.strategy(cfg), "mode": str(mode or ""),
+            "score_breakdown": breakdown, "freshness": freshness,
+            "margin": policy.get("margin"),
+            "threshold": policy.get("threshold"),
+            "exclusions": [dict(item) for item in (exclusions or ())],
+            "reason": str(reason or "")}
 
 
 def selectable_candidates(pool, cfg, current_host, providers=None):
@@ -455,11 +705,12 @@ def _check_cb(providers, row):
     return None
 
 
-def _probe(pool, providers, row, current_host, cfg=None):
+def _probe(pool, providers, row, current_host, cfg=None, persist=True):
+    pool.observe_provider_errors(providers, actor="auto")
     res = probe_mod.probe(row, provider_check=_check_cb(providers, row))
     is_cur = (row.get("host") == current_host)
     res["score"] = probe_mod.score(row, res, is_current=is_cur, cfg=cfg)
-    if pool.get(row["uid"]):
+    if persist and pool.get(row["uid"]):
         pool.record_probe(row["uid"], res, is_current=is_cur,
                           strategy=country_mod.strategy(cfg))
     return res
@@ -472,12 +723,16 @@ def _cooldown_after_fail(pool, uid, log):
     log("  cooldown %s: %d мин (провал #%d)" % (uid, secs // 60, fc))
 
 
-def _strategy_ranked_rows(cfg, providers, pool, current_host):
+def _strategy_ranked_rows(cfg, providers, pool, current_host, extra_rows=None,
+                          include_stickiness=True):
     """Живой снимок пула для явного применения стратегии, включая боевой канал."""
     rows = pool.rotation_candidates()
     if providers is not None:
         rows = [r for r in rows if r["provider"] in providers]
-    return rank_candidates(rows, cfg, current_host=current_host)
+    known_hosts = {r["host"] for r in rows}
+    rows.extend(r for r in (extra_rows or []) if r.get("host") not in known_hosts)
+    return rank_candidates(rows, cfg,
+                           current_host=current_host if include_stickiness else None)
 
 
 def _converge_strategy_locked(cfg, providers, pool, log=print, actor="user"):
@@ -488,11 +743,30 @@ def _converge_strategy_locked(cfg, providers, pool, log=print, actor="user"):
     MANUAL имеет приоритет, а кандидат после живой пробы ещё раз сравнивается с
     текущим (+15 stickiness). Провайдер в ключе сортировки не участвует.
     """
+    reconcile_strategy_override(cfg, pool, log)
     try:
         config_store.refresh_country_strategy(cfg)
     except (OSError, ValueError) as e:
         log("  strategy-converge: не перечитал config.json, использую снимок: %s" % e)
-    desired = country_mod.strategy(cfg)
+    revision = selection_revision_state(pool, cfg)
+    intent_revision = (revision["desired"]
+                       if revision["pending"] and revision["kind"] == "strategy" else None)
+    intent_strategy = (revision.get("payload") or {}).get("strategy")
+    desired = (intent_strategy if intent_revision and intent_strategy in country_mod.STRATEGIES
+               else country_mod.strategy(cfg))
+    if intent_revision:
+        cfg.setdefault("countries", {})["strategy"] = desired
+
+    def revision_done(detail):
+        if intent_revision is None:
+            return True
+        override = pool.get_setting("selection_strategy_override")
+        if override in country_mod.STRATEGIES:
+            pool.log_event("selection-reconcile", actor=actor, result="config-pending",
+                           detail="revision %s: config.json ещё не закрепил %s" %
+                                  (intent_revision, override))
+            return False
+        return mark_selection_applied(pool, intent_revision, actor=actor, detail=detail)
     try:
         sb = apply_mod.load_json(cfg["singbox_config"])
     except (OSError, ValueError, KeyError) as e:
@@ -500,24 +774,75 @@ def _converge_strategy_locked(cfg, providers, pool, log=print, actor="user"):
                 "strategy": desired, "tried": []}
     current_host = apply_mod.current_upstream(sb)
     selection = selection_state(pool, cfg, current_host)
+    exclusions = []
+
+    def emit_strategy(result, detail, rows=(), to_uid=None, policy=None):
+        """Persist the decision inputs, never the proxy credentials."""
+        mode = selection_state(pool, cfg, current_host)["mode"]
+        pool.log_event(
+            "strategy-apply", actor=actor, to_uid=to_uid, result=result, detail=detail,
+            payload=decision_payload(cfg, mode, detail, rows=list(rows or ())[:10],
+                                     current_host=current_host, policy=policy,
+                                     exclusions=exclusions[-20:]))
+
     if selection["mode"] == SELECTION_MANUAL:
         detail = "ручной канал появился позже задания — стратегию не применяю"
-        pool.log_event("strategy-apply", actor=actor, result="manual-superseded", detail=detail)
+        emit_strategy("manual-superseded", detail)
         return {"ok": True, "action": "manual-superseded", "detail": detail,
                 "strategy": desired, "tried": []}
 
     tried = []
+    # До любого проактивного сравнения измеряем stale боевой канал напрямую через
+    # его proxy credentials — без переключения и разрыва текущих соединений.
+    current_row = next((row for row in pool.list(include_gone=True)
+                        if current_host and row["host"] == current_host), None)
+    synthetic_current = current_row is None and bool(current_host)
+    if synthetic_current:
+        current_row = _row_from_sb(sb, current_host)
+    current_extra = None
+    if current_row is not None and (synthetic_current
+                                    or probe_mod.freshness_weight(current_row, cfg) < 1.0):
+        tried.append(current_row["uid"])
+        current_res = _probe(pool, providers, current_row, current_host, cfg)
+        if current_res.get("disqualified") or not current_res.get("ok"):
+            exclusions.append({"uid": current_row["uid"],
+                               "reason": current_res.get("disqualified") or "probe-failed"})
+            _cooldown_after_fail(pool, current_row["uid"], log)
+        elif synthetic_current:
+            current_extra = dict(current_row)
+            current_extra.update({
+                "probe_ok": 1, "last_probe_at": _now_iso(),
+                "latency_ms": current_res.get("latency_ms"),
+                "tg_ok": current_res.get("tg_ok"),
+                "socks_ok": current_res.get("socks_ok"),
+                "http_ok": current_res.get("http_ok"),
+                "exit_cc": current_res.get("exit_cc"),
+                "geo_agree": current_res.get("geo_agree", True),
+            })
     for _ in range(MAX_CANDIDATES_PER_CYCLE):
-        ranked = _strategy_ranked_rows(cfg, providers, pool, current_host)
+        ranked = _strategy_ranked_rows(
+            cfg, providers, pool, current_host,
+            extra_rows=[current_extra] if current_extra else None,
+            include_stickiness=False)
         if not ranked:
             detail = "в активном пуле нет кандидатов для стратегии %s" % desired
-            pool.log_event("strategy-apply", actor=actor, result="empty", detail=detail)
+            emit_strategy("empty", detail)
             return {"ok": False, "action": "empty", "detail": detail,
                     "strategy": desired, "tried": tried}
         top = ranked[0]
         if current_host and top["host"] == current_host:
+            if (probe_mod.freshness_weight(top, cfg) < 1.0
+                    or not bool(probe_mod._rget(top, "probe_ok"))):
+                tried.append(top["uid"])
+                res = _probe(pool, providers, top, current_host, cfg)
+                if res.get("disqualified") or not res.get("ok"):
+                    exclusions.append({"uid": top["uid"],
+                                       "reason": res.get("disqualified") or "probe-failed"})
+                    _cooldown_after_fail(pool, top["uid"], log)
+                continue
             detail = "текущий %s уже лучший по %s" % (current_host, desired)
-            pool.log_event("strategy-apply", actor=actor, result="stable", detail=detail)
+            emit_strategy("stable", detail, ranked)
+            revision_done(detail)
             return {"ok": True, "action": "stable", "detail": detail,
                     "strategy": desired, "uid": top["uid"], "tried": tried}
 
@@ -525,6 +850,8 @@ def _converge_strategy_locked(cfg, providers, pool, log=print, actor="user"):
         tried.append(row["uid"])
         res = _probe(pool, providers, row, current_host, cfg)
         if res.get("disqualified") or not res.get("ok"):
+            exclusions.append({"uid": row["uid"],
+                               "reason": res.get("disqualified") or "probe-failed"})
             _cooldown_after_fail(pool, row["uid"], log)
             continue
 
@@ -534,48 +861,98 @@ def _converge_strategy_locked(cfg, providers, pool, log=print, actor="user"):
             config_store.refresh_country_strategy(cfg)
         except (OSError, ValueError):
             pass
-        latest = country_mod.strategy(cfg)
-        if latest != desired:
-            detail = "задание устарело: %s -> %s; следующий worker применит новое" % (desired, latest)
-            pool.log_event("strategy-apply", actor=actor, result="stale", detail=detail)
+        latest_revision = selection_revision_state(pool, cfg)
+        latest = ((latest_revision.get("payload") or {}).get("strategy")
+                  if latest_revision["kind"] == "strategy" else country_mod.strategy(cfg))
+        stale_revision = (intent_revision is not None
+                          and (latest_revision["desired"] != intent_revision
+                               or latest_revision["kind"] != "strategy"))
+        if stale_revision or latest != desired:
+            detail = "задание устарело: %s/%s -> %s/%s; следующий worker применит новое" % (
+                intent_revision, desired, latest_revision["desired"], latest)
+            emit_strategy("stale", detail, ranked)
             return {"ok": True, "action": "stale", "detail": detail,
                     "strategy": latest, "tried": tried}
         if selection_state(pool, cfg, current_host)["mode"] == SELECTION_MANUAL:
             detail = "во время пробы включён ручной режим — переключение отменено"
-            pool.log_event("strategy-apply", actor=actor, result="manual-superseded", detail=detail)
+            emit_strategy("manual-superseded", detail, ranked)
             return {"ok": True, "action": "manual-superseded", "detail": detail,
                     "strategy": latest, "tried": tried}
-        reranked = _strategy_ranked_rows(cfg, providers, pool, current_host)
+        reranked = _strategy_ranked_rows(
+            cfg, providers, pool, current_host,
+            extra_rows=[current_extra] if current_extra else None,
+            include_stickiness=False)
         if not reranked or (current_host and reranked[0]["host"] == current_host):
             detail = "после свежей пробы текущий канал сохранил преимущество"
-            pool.log_event("strategy-apply", actor=actor, result="stable-after-probe", detail=detail)
+            emit_strategy("stable-after-probe", detail, reranked or ranked)
+            revision_done(detail)
             return {"ok": True, "action": "stable-after-probe", "detail": detail,
                     "strategy": latest, "tried": tried}
         if reranked[0]["uid"] != row["uid"]:
             # За время сетевой пробы изменился пул; на следующей итерации берём
             # новый фактический top, а не применяем устаревший uid.
+            exclusions.append({"uid": row["uid"], "reason": "reranked"})
             continue
+        decision = None
+        current_live = next((item for item in reranked
+                             if current_host and item["host"] == current_host), None)
+        if current_live is not None:
+            current_score = probe_mod.score_from_row(current_live, cfg, is_current=False)[0]
+            candidate_score = probe_mod.score_from_row(reranked[0], cfg,
+                                                       is_current=False)[0]
+            decision = switch_decision(
+                current_score, candidate_score,
+                current_latency=probe_mod._rget(current_live, "latency_ms"),
+                candidate_latency=probe_mod._rget(reranked[0], "latency_ms"),
+                last_used_at=probe_mod._rget(current_live, "last_used_at"),
+                current_healthy=bool(probe_mod._rget(current_live, "probe_ok")),
+                cfg=cfg)
+            if not decision["allow"]:
+                detail = (
+                    "кандидат %s лучше на %.1f, порог %.1f; "
+                    "hold %.0f с; регрессия latency %s мс; %s" % (
+                        row["uid"], decision["margin"], decision["threshold"],
+                        decision["hold_remaining"],
+                        ("%.1f" % decision["latency_regression"]
+                         if decision["latency_regression"] is not None else "n/a"),
+                        decision["reason"]))
+                emit_strategy("held", detail, reranked, to_uid=row["uid"], policy=decision)
+                return {"ok": True, "action": "held", "detail": detail,
+                        "strategy": latest, "uid": current_live["uid"],
+                        "candidate_uid": row["uid"], "decision": decision,
+                        "tried": tried}
         try:
-            applied = apply_mod.apply_candidate(cfg, row, res, log=log, _locked=True)
+            applied = apply_mod.apply_candidate(cfg, row, res, log=log, _locked=True,
+                                                pool=pool, requested_by=actor,
+                                                selection_source="strategy")
         except apply_mod.ApplyError as e:
             pool.bump_fail(row["uid"])
             _cooldown_after_fail(pool, row["uid"], log)
-            pool.log_event("strategy-apply", actor=actor, to_uid=row["uid"],
-                           result="fail", detail=str(e))
+            exclusions.append({"uid": row["uid"], "reason": "apply-failed"})
+            emit_strategy("fail", str(e), reranked, to_uid=row["uid"], policy=decision)
             continue
         pool.mark_used(row["uid"])
         pool.clear_cooldown(row["uid"])
         finish_explicit_apply(cfg, pool, row["uid"], row["host"], applied.get("verify"),
                               source="strategy", actor=actor, log=log)
         detail = "%s: %s -> %s (%s)" % (desired, current_host, row["host"], row["uid"])
-        pool.log_event("strategy-apply", actor=actor, to_uid=row["uid"],
-                       result="ok", detail=detail)
+        if decision is not None:
+            if decision["bypass"]:
+                detail += "; critical-failure bypass, порог %.1f" % decision["threshold"]
+            else:
+                detail += "; кандидат лучше на %.1f, порог %.1f; регрессия latency %s мс" % (
+                    decision["margin"], decision["threshold"],
+                    ("%.1f" % decision["latency_regression"]
+                     if decision["latency_regression"] is not None else "n/a"))
+        emit_strategy("ok", detail, reranked, to_uid=row["uid"], policy=decision)
+        revision_done(detail)
+        apply_mod.commit_operation(pool, applied)
         return {"ok": True, "action": "applied", "detail": detail,
                 "strategy": desired, "uid": row["uid"], "new_ip": row["host"],
-                "verify": applied.get("verify"), "tried": tried}
+                "verify": applied.get("verify"), "decision": decision, "tried": tried}
 
     detail = "не удалось применить кандидатов стратегии %s: %s" % (desired, ", ".join(tried))
-    pool.log_event("strategy-apply", actor=actor, result="exhausted", detail=detail)
+    emit_strategy("exhausted", detail)
     return {"ok": False, "action": "exhausted", "detail": detail,
             "strategy": desired, "tried": tried}
 
@@ -600,6 +977,33 @@ def converge_strategy(cfg, providers, pool, log=print, actor="user", wait_second
             time.sleep(min(2.0, max(0.1, deadline - time.monotonic())))
 
 
+def reconcile_desired_selection(cfg, providers, pool, log=print, actor="auto",
+                                wait_seconds=0):
+    """Heartbeat/pool-refresh reconciler: applied revision догоняет desired."""
+    revision = selection_revision_state(pool, cfg)
+    if not revision["pending"]:
+        return {"ok": True, "action": "up-to-date", "revision": revision}
+    if revision["kind"] == "manual":
+        desired_host = (revision.get("payload") or {}).get("host")
+        try:
+            live_host = apply_mod.current_upstream(apply_mod.load_json(cfg["singbox_config"]))
+        except (OSError, ValueError, KeyError):
+            live_host = None
+        if desired_host and desired_host == live_host:
+            mark_selection_applied(pool, revision["desired"], actor=actor,
+                                   detail="ручной desired host уже live")
+            return {"ok": True, "action": "manual-already-live",
+                    "revision": selection_revision_state(pool, cfg)}
+        # Никогда не применяем MANUAL без новой успешной явной probe/apply.
+        return {"ok": False, "action": "manual-pending", "revision": revision}
+    if os.name != "posix":
+        return {"ok": False, "action": "platform-pending", "revision": revision}
+    result = converge_strategy(cfg, providers, pool, log=log, actor=actor,
+                               wait_seconds=wait_seconds)
+    result["revision"] = selection_revision_state(pool, cfg)
+    return result
+
+
 # ============================================================ ОРКЕСТРАЦИЯ
 def rotate(cfg, providers, pool, alerter, reason="manual", actor="auto",
            log=print, force=False):
@@ -607,6 +1011,7 @@ def rotate(cfg, providers, pool, alerter, reason="manual", actor="auto",
 
     Один flock на весь цикл; при занятом locke — мягкий выход (кто-то уже правит).
     """
+    pool.observe_provider_errors(providers, actor=actor)
     pool.heartbeat()                                   # §6.3: цикл агента прошёл
     result = {"state": None, "action": None, "detail": "", "ok": False}
 
@@ -677,7 +1082,10 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
                          int(pool.get_setting("emergency_retry_n") or 0) + 1)
 
     # --- ШАГ 1: сеть сервера жива? ---
-    alive, via = net_alive(cfg, log)
+    net_result = net_alive(cfg, log, with_evidence=True)
+    alive, via = net_result[:2]
+    net_evidence = (net_result[2] if len(net_result) > 2 else [health_mod.evidence(
+        "server_network", alive, target=via or "direct", via_proxy=False)])
     egress = apply_mod.verify_egress()
     pool.set_egress(egress)          # дашборд показывает эту метку, сам пробу не гоняет
     sb_h = singbox_health(cfg)
@@ -734,19 +1142,33 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
         log("  self-heal не помог — вероятно, виноват прокси, иду дальше")
 
     # --- ШАГ 3: RETUNE (текущий прокси жив по другому протоколу) ---
-    rt = try_retune(cfg, providers, pool, alerter, log, actor)
+    initial_evidence = list(egress.get("evidence") or []) + list(net_evidence)
+    rt = try_retune(cfg, providers, pool, alerter, log, actor,
+                    prior_evidence=initial_evidence)
     if rt.get("ok"):
         _reset_streaks(pool)
         if in_direct:
             _leave_direct(cfg, pool, alerter, rt.get("verify") or apply_mod.verify_egress(),
                           log, actor, state_before)
         return _state(pool, result, OK, "retune", rt.get("detail", "RETUNE ок"))
+    if rt.get("external_outage"):
+        decision = rt.get("health_decision") or {}
+        detail = ("proxy fault не подтверждён: %s; failed_targets=%s, "
+                  "success=%s, threshold=%s" % (
+                      decision.get("reason"), len(decision.get("failed_targets") or []),
+                      decision.get("successful_signals"), decision.get("threshold")))
+        pool.log_event("health-quorum", actor=actor, result="held", detail=detail)
+        if in_direct:
+            _leave_direct(cfg, pool, alerter, egress, log, actor, state_before)
+        return _state(pool, result, DEGRADED, "quorum-held",
+                      detail + " — IP не меняю")
 
     # F1/F2: перед деструктивными шагами отказ должен быть ПОДТВЕРЖДЁН.
     # В EMERGENCY/ROTATING он подтверждён самим состоянием; исход «прокси жив,
     # egress мёртв даже после рестарта» (calm_failed) считается подтверждением
     # после CALM_MAX_STREAK подряд (предохранитель F2 — иначе вечное «успокойся»).
-    confirmed = state_before in (EMERGENCY, ROTATING)
+    confirmed = (state_before in (EMERGENCY, ROTATING)
+                 or bool(rt.get("proxy_fault_confirmed")))
     if rt.get("calm_failed"):
         streak = int(pool.get_setting("calm_fail_streak") or 0) + 1
         pool.set_setting("calm_fail_streak", streak)
@@ -787,6 +1209,9 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
     # До этой точки дошёл только ПОДТВЕРЖДЁННЫЙ отказ самого канала: сеть сервера
     # жива, self-heal/RETUNE не помогли, повтор verify провалился. Только здесь
     # разрешено снять ручную фиксацию; единичный чих её не отменяет.
+    if state_before not in (ROTATING, EMERGENCY):
+        pool.log_event("proxy-fault", actor=actor, result="confirmed",
+                       detail="health quorum and repeat verification confirmed proxy fault")
     manual_release = release_manual_on_fault(
         cfg, pool, actor=actor, reason="подтверждённый отказ перед ROTATING", log=log)
     if manual_release.get("released"):
@@ -910,7 +1335,7 @@ def _tg_degraded(cfg, providers, pool, alerter, result, egress, log, actor, stat
 
 
 # ------------------------------------------------------------------- RETUNE §7.3
-def try_retune(cfg, providers, pool, alerter, log, actor):
+def try_retune(cfg, providers, pool, alerter, log, actor, prior_evidence=None):
     sb = apply_mod.load_json(cfg["singbox_config"])
     host = apply_mod.current_upstream(sb)
     if not host:
@@ -918,9 +1343,28 @@ def try_retune(cfg, providers, pool, alerter, log, actor):
     cur_socks = _outbound_of(sb, "socks-out")
     cur_tg = _outbound_of(sb, "http-tg")
     row = _pool_row_by_host(pool, host) or _row_from_sb(sb, host)
-    res = _probe(pool, providers, row, host, cfg)
+    res = _probe(pool, providers, row, host, cfg, persist=False)
     if res.get("disqualified") or not res.get("ok"):
+        if res.get("disqualified") in ("no-combo", "provider-check-dead+no-combo"):
+            evidence = list(prior_evidence or []) + list(res.get("evidence") or [])
+            decision = health_mod.proxy_fault_decision(evidence, cfg=cfg)
+            if decision["proxy_fault"]:
+                if pool.get(row["uid"]):
+                    pool.record_probe(row["uid"], res, is_current=True,
+                                      strategy=country_mod.strategy(cfg))
+                return {"ok": False, "proxy_fault_confirmed": True,
+                        "health_decision": decision,
+                        "why": "кворум подтвердил отказ прокси: %s" % decision["reason"]}
+            return {"ok": False, "external_outage": True,
+                    "health_decision": decision,
+                    "why": "кворум не подтвердил отказ прокси: %s" % decision["reason"]}
+        if pool.get(row["uid"]):
+            pool.record_probe(row["uid"], res, is_current=True,
+                              strategy=country_mod.strategy(cfg))
         return {"ok": False, "why": "текущий прокси не проксирует ни по одному протоколу"}
+    if pool.get(row["uid"]):
+        pool.record_probe(row["uid"], res, is_current=True,
+                          strategy=country_mod.strategy(cfg))
     try:
         socks_out, http_tg, _ = apply_mod.choose_outbounds(
             host, row.get("user") or "", row.get("password") or "",
@@ -950,13 +1394,16 @@ def try_retune(cfg, providers, pool, alerter, log, actor):
     log("  RETUNE: %s  %s -> %s (IP не меняется)"
         % (host, _mode(cur_socks), _mode((socks_out["type"], socks_out["server_port"]))))
     try:
-        r = apply_mod.apply_candidate(cfg, row, res, log=log, _locked=True)
+        r = apply_mod.apply_candidate(cfg, row, res, log=log, _locked=True,
+                                     pool=pool, requested_by=actor,
+                                     selection_source="retune")
     except apply_mod.ApplyError as e:
         pool.log_event("retune", actor=actor, to_uid=row["uid"], result="fail", detail=str(e))
         return {"ok": False, "why": "RETUNE не применился: %s" % e}
     pool.log_event("retune", actor=actor, to_uid=row["uid"], result="ok",
                    detail="%s -> %s (IP=%s без смены)"
                    % (_mode(cur_socks), _mode((socks_out["type"], socks_out["server_port"])), host))
+    apply_mod.commit_operation(pool, r)
     alerter.retuned(host=host, old_mode=_mode(cur_socks),
                     new_mode=_mode((socks_out["type"], socks_out["server_port"])), uid=row["uid"])
     return {"ok": True, "verify": r["verify"],
@@ -971,29 +1418,69 @@ def try_rotating(cfg, providers, pool, alerter, log, actor):
     # Кандидаты уже упорядочены по стране+score (rank_candidates): сначала пробуем
     # надёжные страны (Латвия перед Нигерией), чёрный список выброшен (§6.1, снос №5).
     cands = selectable_candidates(pool, cfg, host, providers)
+    candidate_uids = {row["uid"] for row in cands}
+    exclusions = []
+    now = _now_iso()
+    for item in pool.list(include_gone=True):
+        if item["uid"] in candidate_uids:
+            continue
+        if host and item.get("host") == host:
+            why = "current"
+        elif item.get("gone"):
+            why = "gone"
+        elif item.get("role") == "off":
+            why = "disabled"
+        elif item.get("cooldown_until") and str(item["cooldown_until"]) > now:
+            why = "cooldown"
+        elif providers is not None and item.get("provider") not in providers:
+            why = "provider-unavailable"
+        elif country_mod.rating(_cc_of(item),
+                                True if item.get("geo_agree") is None
+                                else bool(item.get("geo_agree")), cfg) is None:
+            why = "country-blocked"
+        else:
+            why = "not-selectable"
+        exclusions.append({"uid": item["uid"], "reason": why})
+
+    def emit_rotate(result, detail, row=None):
+        pool.log_event(
+            "rotate", actor=actor, to_uid=row["uid"] if row is not None else None,
+            result=result, detail=detail,
+            payload=decision_payload(
+                cfg, selection_state(pool, cfg, host)["mode"], detail,
+                rows=cands[:10], current_host=host, exclusions=exclusions[-20:]))
+
     if not cands:
-        log("  ROTATING: пригодных кандидатов нет (все off/gone/на cooldown/в чёрном списке)")
+        detail = "пригодных кандидатов нет (все off/gone/на cooldown/в чёрном списке)"
+        log("  ROTATING: " + detail)
+        emit_rotate("empty", detail)
         return {"ok": False, "exhausted": True}
     tried = 0
     for row in cands:
         if tried >= MAX_CANDIDATES_PER_CYCLE:
             # Остановились по лимиту, но в пуле ещё есть НЕпробованные кандидаты. Это НЕ
             # повод покупать (решение владельца, снос №5): доберём их следующим тиком.
-            log("  ROTATING: лимит ≤%d кандидатов/цикл — остальные попробую в следующем цикле"
-                % MAX_CANDIDATES_PER_CYCLE)
+            detail = "лимит ≤%d кандидатов/цикл — остальные в следующем цикле" % MAX_CANDIDATES_PER_CYCLE
+            log("  ROTATING: " + detail)
+            emit_rotate("capped", detail)
             return {"ok": False, "exhausted": False, "capped": True,
                     "tried": tried, "total": len(cands)}
         tried += 1
         res = _probe(pool, providers, row, host, cfg)
         if res.get("disqualified") or not res.get("ok"):
+            exclusions.append({"uid": row["uid"],
+                               "reason": res.get("disqualified") or "probe-failed"})
             _cooldown_after_fail(pool, row["uid"], log)
             continue
         try:
-            r = apply_mod.apply_candidate(cfg, row, res, log=log, _locked=True)
+            r = apply_mod.apply_candidate(cfg, row, res, log=log, _locked=True,
+                                         pool=pool, requested_by=actor,
+                                         selection_source="rotate")
         except apply_mod.ApplyError as e:
             pool.bump_fail(row["uid"])
             _cooldown_after_fail(pool, row["uid"], log)
-            pool.log_event("rotate", actor=actor, to_uid=row["uid"], result="fail", detail=str(e))
+            exclusions.append({"uid": row["uid"], "reason": "apply-failed"})
+            emit_rotate("fail", str(e), row=row)
             continue
         pool.mark_used(row["uid"])
         pool.clear_cooldown(row["uid"])
@@ -1001,10 +1488,17 @@ def try_rotating(cfg, providers, pool, alerter, log, actor):
         # запускается только по мёртвому каналу (ручной apply сюда не попадает)
         old_row = _pool_row_by_host(pool, host)
         if old_row is not None:
-            pool.stability_bump_drop(old_row["provider"], old_row.get("country"))
-        pool.log_event("rotate", actor=actor, from_uid=None, to_uid=row["uid"], result="ok",
-                       detail="%s -> %s egress=%s cc=%s (перебрано %d)"
-                       % (host, r["new_ip"], r["verify"]["egress_ip"], r["verify"]["exit_cc"], tried))
+            pool.learning_record_drop(old_row)
+        detail = "%s -> %s egress=%s cc=%s (перебрано %d)" % (
+            host, r["new_ip"], r["verify"]["egress_ip"], r["verify"]["exit_cc"], tried)
+        emit_rotate("ok", detail, row=row)
+        pending_revision = selection_revision_state(pool, cfg)
+        if (pending_revision["pending"] and pending_revision["kind"] == "strategy"
+                and (pending_revision.get("payload") or {}).get("strategy")
+                == country_mod.strategy(cfg)):
+            mark_selection_applied(pool, pending_revision["desired"], actor=actor,
+                                   detail="успешная fault rotation применила desired strategy")
+        apply_mod.commit_operation(pool, r)
         alerter.rotated(old_ip=host, new_ip=r["new_ip"], uid=row["uid"],
                         egress=r["verify"]["egress_ip"], cc=r["verify"]["exit_cc"],
                         tg_code=r["verify"]["tg_code"], score=res.get("score"), candidates_tried=tried)
@@ -1012,6 +1506,7 @@ def try_rotating(cfg, providers, pool, alerter, log, actor):
                 "detail": "ротация %s -> %s (%s)" % (host, r["new_ip"], row["uid"])}
     # перебрали всех пригодных, никто не прошёл живую пробу (провалившиеся ушли на cooldown) —
     # пул честно исчерпан, только теперь допустима докупка (REPLENISH)
+    emit_rotate("exhausted", "все пригодные кандидаты провалили живую пробу")
     return {"ok": False, "exhausted": True, "tried": tried}
 
 
@@ -1096,7 +1591,9 @@ def _switch_locked(cfg, providers, pool, alerter, from_provider,
             _cooldown_after_fail(pool, row["uid"], log)
             continue
         try:
-            r = apply_mod.apply_candidate(cfg, row, pres, log=log, _locked=True)
+            r = apply_mod.apply_candidate(cfg, row, pres, log=log, _locked=True,
+                                         pool=pool, requested_by=actor,
+                                         selection_source="provider-switch")
         except apply_mod.ApplyError as e:
             pool.bump_fail(row["uid"])
             _cooldown_after_fail(pool, row["uid"], log)
@@ -1112,6 +1609,7 @@ def _switch_locked(cfg, providers, pool, alerter, from_provider,
                        detail="ключ %s удалён: %s -> %s egress=%s cc=%s; строк удалено %d"
                               % (from_provider, host, r["new_ip"], r["verify"]["egress_ip"],
                                  r["verify"]["exit_cc"], purged["deleted"]))
+        apply_mod.commit_operation(pool, r)
         alerter.provider_switched(provider=from_provider, old_ip=host, new_ip=r["new_ip"],
                                   uid=row["uid"], egress=r["verify"]["egress_ip"],
                                   cc=r["verify"]["exit_cc"])
@@ -1212,7 +1710,9 @@ def try_replenish(cfg, providers, pool, alerter, log, actor):
             continue
         row = pool.get(uid) or dict(uid=uid)
         try:
-            ar = apply_mod.apply_candidate(cfg, row, res, log=log, _locked=True)
+            ar = apply_mod.apply_candidate(cfg, row, res, log=log, _locked=True,
+                                          pool=pool, requested_by=actor,
+                                          selection_source="replenish")
         except apply_mod.ApplyError as e:
             log("  куплен %s, но apply не прошёл: %s" % (uid, e))
             continue
@@ -1220,11 +1720,12 @@ def try_replenish(cfg, providers, pool, alerter, log, actor):
         # F8: докупка = уходящий канал пары тоже оборвался в бою
         old_row = _pool_row_by_host(pool, dead_host)
         if old_row is not None:
-            pool.stability_bump_drop(old_row["provider"], old_row.get("country"))
+            pool.learning_record_drop(old_row)
         pool.log_event("replenish", actor=actor, to_uid=uid, result="ok",
                        detail="куплен %s (%s %s, %s), egress=%s cc=%s"
                        % (uid, r["price"], r["currency"], pick, ar["verify"]["egress_ip"],
                           ar["verify"]["exit_cc"]))
+        apply_mod.commit_operation(pool, ar)
         alerter.bought(uid=uid, price=r["price"], currency=r["currency"],
                        balance_after=r["balance_after"], country=r["country"], period=r["period"],
                        egress=ar["verify"]["egress_ip"], cc=ar["verify"]["exit_cc"],
@@ -1292,6 +1793,7 @@ def auto_prolong(cfg, providers, pool, alerter, log=print, actor="auto"):
     продлевать бессмысленно, его заменит ротация.
     Деньги идут через те же гейты §6.2 (тумблер, потолок цены, суточный лимит, остаток).
     """
+    pool.observe_provider_errors(providers, actor=actor)
     ap = auto_prolong_cfg(cfg)
     if not ap.get("enabled"):
         return {"ok": True, "skipped": "автопродление выключено тумблером"}
@@ -1361,6 +1863,7 @@ def ensure_reserve(cfg, providers, pool, alerter, log, actor, min_reserve=1):
     считали только ПРОБОВАННЫЕ резервы и докупали сразу после первой же ротации, хотя пул был
     полон). Покупаем только когда выбирать реально не из чего.
     Best-effort: ошибки/гейты глушим (докупка резерва не должна ронять цикл)."""
+    pool.observe_provider_errors(providers, actor=actor)
     try:
         selection = selection_state(pool, cfg)
         if selection["mode"] == SELECTION_MANUAL:

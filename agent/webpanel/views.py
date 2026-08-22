@@ -510,7 +510,7 @@ _DASH_HTML = """
 
   <div class="card fold folded" id="card_clients">
     <h2 onclick="foldClick(event,'clients')">Кто подключён<span class="sub" id="sum_clients"></span><span class="r">
-      <input id="cname" style="width:180px" placeholder="имя, например phone-mine" autocomplete="off">
+      <input id="cname" style="width:180px" placeholder="имя, например phone-node2" autocomplete="off">
       <button class="btn g" onclick="addClient()">Выдать доступ</button><span class="arr" id="fa_clients">▸</span></span></h2>
     <div class="fold-body">
     <div class="ex">Каждому устройству — свой профиль. Нажми «Выдать доступ» → появится строка → <b>«Скачать»</b>
@@ -519,7 +519,7 @@ _DASH_HTML = """
       или «Импорт из файла».</div>
     <div id="crec" class="sub" style="display:none;margin:0 0 10px;font:400 12.5px/1.6 var(--ui);color:#adc0e0"></div>
     <div id="qstart" class="steps" style="display:none">
-      <div class="step"><b>шаг 1</b>Придумай имя устройства (латиницей, например <span class="mono">phone-mine</span>) и нажми «Выдать доступ».</div>
+      <div class="step"><b>шаг 1</b>Придумай имя устройства (латиницей, например <span class="mono">phone-node2</span>) и нажми «Выдать доступ».</div>
       <div class="step"><b>шаг 2</b>Установи на устройство приложение WireGuard из магазина приложений.</div>
       <div class="step"><b>шаг 3</b>Телефон — нажми «QR» и отсканируй. Компьютер — «Скачать» и открой файл в WireGuard.</div>
     </div>
@@ -598,6 +598,16 @@ _DASH_HTML = """
       Строка <span class="mono">actor=agent</span> — действовала автоматика, <span class="mono">actor=web</span> — человек из панели.</div>
     <div class="scroll"><table id="events"><thead><tr>
       <th>время</th><th>кто</th><th>действие</th><th>итог</th><th>подробности</th></tr></thead><tbody></tbody></table></div>
+    </div>
+  </div>
+
+  <div class="card fold folded" id="card_metrics">
+    <h2 onclick="foldClick(event,'metrics')">Надёжность за 30 дней<span class="sub" id="sum_metrics"></span><span class="r"><span class="arr" id="fa_metrics">▸</span></span></h2>
+    <div class="fold-body">
+    <div class="ex">Локальный SLO-отчёт из журналов этого узла. Доступность считается
+      только по пробам боевого канала; false-switch — консервативно, как смена с откатом на другой IP за 15 минут.</div>
+    <div class="grid" id="metrics"></div>
+    <div id="metrics_detail" class="sub" style="margin-top:9px"></div>
     </div>
   </div>
 
@@ -690,8 +700,9 @@ const FOLDS={
   strategy:{def:1,load:()=>loadStrategy()},
   keys:{def:1,load:()=>loadKeys()},
   upd:{def:1,load:()=>loadUpd()},
-  events:{def:1,load:()=>loadEvents()}};
-const FOLD_ORDER=['status','money','pool','clients','strategy','keys','upd','events'];
+  events:{def:1,load:()=>loadEvents()},
+  metrics:{def:1,load:()=>loadMetrics()}};
+const FOLD_ORDER=['status','money','pool','clients','strategy','keys','upd','events','metrics'];
 const FOLD_MEM={}; /* фолбэк на сессию, когда localStorage запрещён — иначе разделы не развернуть вовсе */
 function isFolded(id){try{const v=localStorage.getItem('vpnpanel-fold-'+id);
   if(v==='0')return false;if(v==='1')return true}catch(e){}
@@ -1056,7 +1067,9 @@ function hygieneLines(s){const h=s&&s.hygiene;if(!h)return '';
       +(w.updated_at?(' · обновлён '+relDay(w.updated_at)):''))
     :OFF+' — весь трафик уходит через прокси')+'</div>';
   if(c)out+='<div'+LN+'>Очистка следов: '+(c.on
-    ?(ON+(c.freed_24h!=null?(' · за сутки удалено '+fmtBytes(c.freed_24h)):'')
+    ?(ON+(c.freed_24h!=null?(' · '+(c.complete_24h===false?'за 24 ч учтено минимум ':'за последние 24 ч освобождено ')+fmtBytes(c.freed_24h)):'')
+      +(c.complete_24h===false?(' · точных замеров: '+fmtInt(c.measured_runs_24h)+' из '+fmtInt(c.runs_24h))
+        :(c.runs_24h!=null?(' · очисток: '+fmtInt(c.runs_24h)):''))
       +(c.last_at?(' · последняя '+relDay(c.last_at)):''))
     :OFF)+'</div>';
   return out}
@@ -1225,10 +1238,35 @@ async function loadPool(){const rows=(await api('/api/pool')).proxies;const tb=d
 
 async function loadEvents(){const evs=(await api('/api/events?limit=40')).events;const tb=document.querySelector('#events tbody');tb.innerHTML='';
   for(const e of evs){const tr=document.createElement('tr');
+    const why=(e.decision&&e.decision.reason)||e.detail||'';
+    const diag=e.decision?('<details><summary>'+esc(why.slice(0,80))+'</summary><pre class="mono" style="white-space:pre-wrap">'+
+      esc(JSON.stringify(e.decision,null,2))+'</pre></details>'):esc(why.slice(0,80));
     tr.innerHTML='<td class="mut">'+esc(e.ts)+'</td><td>'+esc(e.actor)+'</td><td>'+esc(e.action)+'</td>'+
       '<td class="'+(/ok/.test(e.result)?'ok':(/fail/.test(e.result)?'bad':''))+'">'+esc(e.result)+'</td>'+
-      '<td class="mut" title="'+esc(e.detail)+'">'+esc((e.detail||'').slice(0,80))+'</td>';tb.appendChild(tr)}
+      '<td class="mut" title="'+esc(e.detail)+'">'+diag+'</td>';tb.appendChild(tr)}
   if(!evs.length)tb.innerHTML='<tr><td colspan="5" class="mut">событий пока нет</td></tr>'}
+
+function metricPct(x){return x==null?'—':(100*x).toFixed(2)+'%'}
+function metricNum(x,d=1){return x==null?'—':Number(x).toFixed(d)}
+async function loadMetrics(){const m=await api('/api/metrics?days=30'),a=m.availability||{},f=m.fault_recovery||{},
+    s=m.switches||{},u=m.manual||{},p=m.provider_api||{},sp=m.spend||{},l=m.learning||{},st=m.stale_score||{};
+  const mttr=f.p95_seconds==null?'—':metricNum(f.p95_seconds/60,1)+' мин';
+  const spend=(sp.by_currency||[]).map(x=>esc(x.currency)+' '+metricNum(x.amount,2)).join(' · ')||'—';
+  document.getElementById('metrics').innerHTML=[
+    tile('egress',metricPct((a.egress||{}).ratio),'Availability по пробам текущего боевого proxy.'),
+    tile('Telegram',metricPct((a.telegram||{}).ratio),'Доля успешных Telegram-проб боевого канала.'),
+    tile('MTTR p95',mttr,'Цель: не более 3 минут от подтверждённого отказа до успешной замены.'),
+    tile('успех смен',metricPct(s.success_rate),(s.successful||0)+' из '+(s.attempts||0)+' завершённых попыток.'),
+    tile('автосмены / день',metricNum(s.automatic_per_day,2),'IP-смены actor=auto, усреднённые по окну.'),
+    tile('false-switch',(s.false_switches||0)+' · '+metricPct(s.false_switch_rate),s.false_switch_definition||''),
+    tile('MANUAL',metricNum((u.seconds||0)/3600,1)+' ч',(u.exits||0)+' выходов из ручной фиксации.'),
+    tile('provider API',(p.errors||0)+' ошибок · '+(p.rate_limits||0)+' rate-limit','Типизированные ошибки на transport-boundary; ключи/текст ответа не хранятся.'),
+    tile('расходы',spend,(sp.denied||0)+' запрещённых политикой трат.'),
+    tile('learning',Math.round(100*(l.maturity||0))+'% · '+(l.coverage_days||0)+' дн','drift 7/90: '+metricNum(l.drift_7_vs_90,4)+'; shadow '+(l.shadow_days||0)+'/'+(l.shadow_min_days||30)+' дн.'),
+    tile('stale score',st.with_stale_inputs||0,(st.total_decisions||0)+' решений; '+(st.superseded_decisions||0)+' устаревших intent.')].join('');
+  const q=m.quality||{};document.getElementById('metrics_detail').innerHTML='<details><summary>Качество данных и пороги</summary><pre class="mono" style="white-space:pre-wrap">'+
+    esc(JSON.stringify({fault_recovery:f,learning:l,quality:q},null,2))+'</pre></details>';
+  sum('metrics','egress '+metricPct((a.egress||{}).ratio)+' · MTTR p95 '+mttr)}
 
 async function loadMoney(){try{const m=await api('/api/money');const L=m.limits||{},t=m.today||{};
   /* F8: чему узел научился — надёжность пар (провайдер, страна) по своему опыту */
@@ -1708,12 +1746,14 @@ _SETUP_HTML = """
       сама купить и подставить новый, ей нужен ключ доступа к твоему кабинету у провайдера.<br>
       <b>Где взять:</b> зайди в личный кабинет провайдера → раздел «API» → скопируй ключ.<br>
       <b>PROXY6 — основной</b>: у него панель умеет покупать, продлевать и удалять, цены в рублях.
+      ProxyLine и ProxyWing можно добавить как резерв. У ProxyWing Редут использует уже купленные
+      datacenter/ISP-каналы; покупки и продления через API пока не делает.
       Учти: <b>удаление денег не возвращает</b> (проверено живым экспериментом), поэтому оплаченный
       прокси выгоднее додержать до конца срока. Ключ проверяется сразу — панель покажет твой баланс.<br>
       <b>Нужен хотя бы один рабочий ключ</b> — без него мастер не завершится. Если сервис недоступен с сервера
       напрямую (у российских хостеров так бывает с PROXY6), ключ сохранится без проверки рядом с рабочим:
       узел будет ходить к такому сервису через собственный канал.</div>
-    <label>PROXY6 · API-ключ (рекомендуется)</label><input id="proxy6" autocomplete="off" placeholder="например 0000000000-…">
+    <label>PROXY6 · API-ключ (рекомендуется)</label><input id="proxy6" autocomplete="off" placeholder="например 77b5edfa90-…">
     <label>ProxyLine · API-ключ (необязательно)</label><input id="proxyline" autocomplete="off">
     <label>ProxyWing · API-ключ (необязательно)</label><input id="proxywing" autocomplete="off" placeholder="pk_live_…">
     <button class="btn g" style="margin-top:9px" onclick="saveProv()">Проверить и сохранить</button>

@@ -16,7 +16,7 @@ import server  # noqa: E402
 
 class TestRequiresTLS(unittest.TestCase):
     def test_external_ip_requires_tls(self):
-        self.assertTrue(server.requires_tls({"server_ip": "198.51.100.10"}))
+        self.assertTrue(server.requires_tls({"server_ip": "203.0.113.11"}))
 
     def test_loopback_is_dev(self):
         self.assertFalse(server.requires_tls({"server_ip": "127.0.0.1"}))

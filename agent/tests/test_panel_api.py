@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webpanel"))
@@ -164,6 +165,24 @@ class _FakeHandler:
     _smtp_fields = server.Handler._smtp_fields
     CODE_TTL_S = server.Handler.CODE_TTL_S
     CODE_TRIES = server.Handler.CODE_TRIES
+
+
+class TestMetricsEndpoint(_AppHarness):
+    def call_metrics(self, days="30"):
+        handler = _FakeHandler()
+        server.Handler._api_get(handler, "/api/metrics", {"days": [days]})
+        return handler.resp
+
+    def test_returns_secret_free_strict_report_and_clamps_bad_days(self):
+        self.app.pool.log_event("provider-api", result="rate-limit",
+                                detail='{"provider":"proxy6"}')
+        code, report = self.call_metrics("not-a-number")
+        self.assertEqual(code, 200)
+        self.assertEqual(report["window_days"], 30)
+        self.assertEqual(report["provider_api"]["rate_limits"], 1)
+        encoded = json.dumps(report, allow_nan=False)
+        self.assertNotIn("aaaa0bcde1", encoded)
+        self.assertNotIn("src_ip", encoded)
 
 
 
@@ -439,7 +458,7 @@ class TestStrategyPreview(_AppHarness):
         self.assertGreaterEqual(s["buy_total"], len(s["buy"]))
 
     def test_change_immediately_applies_new_best_channel(self):
-        self.app.current_host = lambda: "10.0.0.2"
+        self.app.current_host = lambda: "10.0.0.2"       # reputation держит медленный DE
         with mock.patch.object(server, "_strategy_switch_kick", return_value=(True, "")) as kick:
             r = _StrategyHandler()._do_strategy({"strategy": "speed"})
         self.assertEqual(r["current"], "speed")
@@ -450,13 +469,15 @@ class TestStrategyPreview(_AppHarness):
         with open(self.app.cfg["_source"], encoding="utf-8") as f:
             self.assertEqual(json.load(f)["countries"]["strategy"], "speed")
 
-    def test_no_restart_when_current_is_already_best(self):
+    def test_current_preview_still_requires_locked_reconciliation(self):
         self.app.current_host = lambda: "10.0.0.1"
-        with mock.patch.object(server, "_strategy_switch_kick") as kick:
+        with mock.patch.object(server, "_strategy_switch_kick", return_value=(True, "")) as kick:
             r = _StrategyHandler()._do_strategy({"strategy": "speed"})
         self.assertFalse(r["switch_needed"])
-        self.assertFalse(r["switch_started"])
-        kick.assert_not_called()
+        self.assertTrue(r["switch_started"])
+        kick.assert_called_once_with("proxy6:f")
+        self.assertTrue(r["revision"]["pending"],
+                        "UI preview не вправе помечать revision applied")
 
     def test_reselect_active_strategy_repairs_channel_drift(self):
         self.app.cfg["countries"]["strategy"] = "speed"
@@ -467,6 +488,74 @@ class TestStrategyPreview(_AppHarness):
         self.assertTrue(r["switch_needed"])
         self.assertTrue(r["switch_started"])
         kick.assert_called_once_with("proxy6:f")
+
+    def test_config_failure_keeps_durable_intent_for_repair(self):
+        with mock.patch.object(self.app, "save_strategy", side_effect=OSError("disk full")):
+            requested = self.app.request_strategy("speed", reason="test")
+        revision = server.states_mod.selection_revision_state(self.app.pool, self.app.cfg)
+        self.assertEqual(requested["revision"], revision["desired"])
+        self.assertTrue(revision["pending"])
+        self.assertEqual(revision["payload"], {"strategy": "speed"})
+        self.assertEqual(self.app.pool.get_setting("selection_strategy_override"), "speed")
+        self.assertIn("disk full", requested["persist_error"])
+
+        self.assertTrue(server.states_mod.reconcile_strategy_override(
+            self.app.cfg, self.app.pool, log=lambda *_: None))
+        with open(self.app.cfg["_source"], encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["countries"]["strategy"], "speed")
+        self.assertIsNone(self.app.pool.get_setting("selection_strategy_override"))
+
+    def test_intent_failure_does_not_modify_config(self):
+        with open(self.app.cfg["_source"], encoding="utf-8") as f:
+            before = json.load(f)
+        with mock.patch.object(server.states_mod, "request_strategy_selection",
+                               side_effect=RuntimeError("db unavailable")):
+            with self.assertRaisesRegex(RuntimeError, "db unavailable"):
+                self.app.request_strategy("speed", reason="test")
+        with open(self.app.cfg["_source"], encoding="utf-8") as f:
+            self.assertEqual(json.load(f), before)
+
+    def test_concurrent_posts_serialize_intent_and_config(self):
+        entered = threading.Event()
+        release = threading.Event()
+        second_done = threading.Event()
+        errors = []
+        original = self.app.save_strategy
+
+        def slow_save(name, **kwargs):
+            if name == "speed":
+                entered.set()
+                release.wait(2)
+            return original(name, **kwargs)
+
+        def request(name, done=None):
+            try:
+                self.app.request_strategy(name, reason="concurrent-test")
+            except Exception as e:
+                errors.append(e)
+            finally:
+                if done:
+                    done.set()
+
+        with mock.patch.object(self.app, "save_strategy", side_effect=slow_save):
+            first = threading.Thread(target=request, args=("speed",))
+            first.start()
+            self.assertTrue(entered.wait(1))
+            second = threading.Thread(target=request, args=("reputation", second_done))
+            second.start()
+            self.assertFalse(second_done.wait(0.05),
+                             "второй POST не должен обгонять запись первого")
+            release.set()
+            first.join(2)
+            second.join(2)
+
+        self.assertFalse(errors)
+        self.assertFalse(first.is_alive() or second.is_alive())
+        revision = server.states_mod.selection_revision_state(self.app.pool, self.app.cfg)
+        self.assertEqual(revision["payload"], {"strategy": "reputation"})
+        self.assertEqual(self.app.pool.get_setting("selection_strategy_override"), None)
+        with open(self.app.cfg["_source"], encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["countries"]["strategy"], "reputation")
 
     def test_current_stickiness_prevents_pointless_strategy_churn(self):
         # Один и тот же tier: запасной быстрее на 100 мс (=10 баллов), но текущий

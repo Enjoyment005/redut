@@ -7,8 +7,10 @@
 """
 import os
 import tempfile
+import subprocess
 import unittest
 import urllib.error
+from unittest import mock
 
 import _ctx  # noqa: F401
 from providers import base
@@ -154,6 +156,23 @@ class TestUrlopenClassification(unittest.TestCase):
         self.assertFalse(e.network)
         self.assertIn("API-ключ не принят", str(e))
 
+    def test_success_with_bad_json_is_typed_protocol_error(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b"not-json"
+
+        import urllib.request
+        with mock.patch.object(urllib.request, "urlopen", return_value=Response()):
+            with self.assertRaises(ProviderError) as caught:
+                base._urlopen_json(urllib.request.Request("https://x/"), "api", 5)
+        self.assertEqual(caught.exception.kind, base.ProviderErrorKind.PROTOCOL)
+
 
 class TestCurlParsing(unittest.TestCase):
     """_curl_json: разбор http_code, коды curl -> unsent."""
@@ -180,6 +199,35 @@ class TestCurlParsing(unittest.TestCase):
             base._curl_json("https://x/", None, None, "x", 5)
         self.assertEqual(e.exception.code, 403)
 
+    def test_http_500_is_typed_and_not_retried_as_network(self):
+        self._fake(0, '{}\n__HTTP__500')
+        with self.assertRaises(ProviderError) as caught:
+            base._curl_json("https://x/", None, None, "x", 5)
+        self.assertEqual(caught.exception.code, 500)
+        self.assertEqual(caught.exception.kind, base.ProviderErrorKind.UNKNOWN)
+        self.assertFalse(caught.exception.network)
+
+    def test_bad_json_is_protocol_error(self):
+        self._fake(0, 'not-json\n__HTTP__200')
+        with self.assertRaises(ProviderError) as caught:
+            base._curl_json("https://x/", None, None, "x", 5)
+        self.assertEqual(caught.exception.kind, base.ProviderErrorKind.PROTOCOL)
+
+    def test_http_429_reads_retry_after_header(self):
+        self._fake(0, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 23\r\n\r\n"
+                      "{}\n__HTTP__429")
+        with self.assertRaises(ProviderError) as e:
+            base._curl_json("https://x/", None, None, "x", 5)
+        self.assertEqual(e.exception.kind, base.ProviderErrorKind.RATE_LIMIT)
+        self.assertEqual(e.exception.retry_after, 23.0)
+
+    def test_http2_lowercase_retry_after_header(self):
+        self._fake(0, "HTTP/2 429\r\nretry-after: 29\r\ncontent-type: application/json\r\n\r\n"
+                      "{}\n__HTTP__429")
+        with self.assertRaises(ProviderError) as e:
+            base._curl_json("https://x/", None, None, "x", 5)
+        self.assertEqual(e.exception.retry_after, 29.0)
+
     def test_curl_connect_fail_unsent(self):
         self._fake(7, "")
         with self.assertRaises(ProviderError) as e:
@@ -191,6 +239,14 @@ class TestCurlParsing(unittest.TestCase):
         with self.assertRaises(ProviderError) as e:
             base._curl_json("https://x/", None, None, "x", 5)
         self.assertTrue(e.exception.network and not e.exception.unsent)
+
+    def test_spawned_curl_timeout_is_ambiguous_for_mutations(self):
+        base.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired("curl", 5))
+        with self.assertRaises(ProviderError) as e:
+            base._curl_json("https://x/", None, {"buy": 1}, "x", 5)
+        self.assertTrue(e.exception.network)
+        self.assertFalse(e.exception.unsent)
 
 
 if __name__ == "__main__":

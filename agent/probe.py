@@ -9,6 +9,8 @@ Telegram-проба (CONNECT по домену), латентность = мед
 Для PROXY6 перед матрицей — дешёвый check?ids= (отсеивает труп одним запросом).
 """
 import json
+import datetime
+import math
 import re
 import socket
 import statistics
@@ -16,6 +18,7 @@ import subprocess
 import urllib.request
 
 import country
+import health as health_mod
 
 # ЧЁРНЫЙ СПИСОК СТРАН (§6.1) — предохранитель в коде, из панели/настроек НЕ редактируется.
 # Никогда не покупать и не использовать выходы в этих странах. С 2026-08-15 (решение
@@ -31,6 +34,58 @@ CURL_TIMEOUT = 12
 GEO_TIMEOUT = 8
 
 _RE_IPV4 = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+DEFAULT_FRESHNESS = {"fresh_seconds": 7200, "stale_seconds": 86400}
+
+
+def freshness_cfg(cfg=None):
+    raw = (cfg or {}).get("health") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    def seconds(key):
+        try:
+            if isinstance(raw.get(key, DEFAULT_FRESHNESS[key]), bool):
+                raise ValueError
+            value = float(raw.get(key, DEFAULT_FRESHNESS[key]))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError
+            return value
+        except (TypeError, ValueError, OverflowError):
+            return float(DEFAULT_FRESHNESS[key])
+    fresh = seconds("fresh_seconds")
+    return {"fresh_seconds": fresh,
+            "stale_seconds": max(fresh + 1.0, seconds("stale_seconds"))}
+
+
+def probe_age_seconds(row, now=None):
+    value = _rget(row, "last_probe_at")
+    if not value:
+        return None
+    try:
+        stamp = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00")
+                                                .replace(" ", "T"))
+        current = now or datetime.datetime.now(stamp.tzinfo)
+        if current.tzinfo is None and stamp.tzinfo is not None:
+            current = current.replace(tzinfo=stamp.tzinfo)
+        delta = (current - stamp).total_seconds()
+        if delta < -300:  # небольшой clock skew допустим, далёкое будущее — corrupt
+            return None
+        return max(0.0, delta)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def freshness_weight(row, cfg=None, now=None):
+    age = probe_age_seconds(row, now)
+    if age is None:
+        return 0.0
+    limits = freshness_cfg(cfg)
+    if age <= limits["fresh_seconds"]:
+        return 1.0
+    if age >= limits["stale_seconds"]:
+        return 0.0
+    span = limits["stale_seconds"] - limits["fresh_seconds"]
+    return max(0.0, min(1.0, (limits["stale_seconds"] - age) / span))
 
 
 def is_ipv4(s):
@@ -74,6 +129,20 @@ def http_code_via(proto, host, port, user, password, url, timeout=CURL_TIMEOUT):
                         + ["-o", "/dev/null" if _posix() else "NUL", "-w", "%{http_code}", url],
                         timeout)
     return out if rc == 0 and out else "000"
+
+
+def http_evidence_via(proto, host, port, user, password, url, signal=None,
+                      timeout=CURL_TIMEOUT):
+    """Один timestamped HTTP-сигнал; curl rc=7 сохраняет быстрый TCP-refusal path."""
+    rc, out = _run_curl(_proxy_args(proto, host, port, user, password)
+                        + ["-o", "/dev/null" if _posix() else "NUL",
+                           "-w", "%{http_code}", url], timeout)
+    code = out if rc == 0 and out else "000"
+    ok = bool(code.isdigit() and 200 <= int(code) <= 499)
+    error_kind = "" if ok else ("tcp-refused" if rc == 7 else "transport-error")
+    return health_mod.evidence(signal or proto, ok, target=url,
+                               error_kind=error_kind, via_proxy=True,
+                               detail="curl_rc=%s code=%s" % (rc, code))
 
 
 def time_total_via(proto, host, port, user, password, url, timeout=CURL_TIMEOUT):
@@ -377,7 +446,7 @@ def geo_country_consensus(ip):
     """Страна exit-IP по ДВУМ независимым базам сразу -> {cc, alt, agree}.
 
     Зачем спрашивать обе: у перепроданных диапазонов базы расходятся. Реальный
-    случай 2026-08-15 — `203.0.113.77`: ip-api видит Нигерию, ipinfo Нью-Йорк.
+    случай 2026-08-15 — `45.86.21.249`: ip-api видит Нигерию, ipinfo Нью-Йорк.
     Сайты пользуются разными базами, поэтому для них «страна скачет» — типовая
     реакция антифрода: капчи и отказы оплаты. Расхождение (agree=False) не
     дисквалифицирует прокси, но снижает его оценку (см. country.rating).
@@ -418,8 +487,10 @@ def probe(proxy, provider_check=None, latency_runs=3):
         "ok": False, "disqualified": None, "matrix": {},
         "socks_ok": False, "http_ok": False,
         "socks_port": None, "http_port": None,
-        "exit_ip": None, "exit_cc": None, "tg_ok": False, "latency_ms": None,
+        "exit_ip": None, "exit_cc": None, "asn": None,
+        "tg_ok": False, "latency_ms": None,
         "provider_check": None,
+        "evidence": [], "health_decision": None,
     }
 
     # 0. (PROXY6) check?ids= — ПОДСКАЗКА, не приговор (F4, 1.3.0): API провайдера
@@ -431,9 +502,14 @@ def probe(proxy, provider_check=None, latency_runs=3):
         try:
             alive = bool(provider_check())
             res["provider_check"] = alive
+            res["evidence"].append(health_mod.evidence(
+                "provider_api", alive, target=proxy.get("provider") or "provider"))
             provider_dead = not alive
         except Exception as e:
             res["provider_check"] = "error: %s" % e  # ошибка API не блокирует пробу
+            res["evidence"].append(health_mod.evidence(
+                "provider_api", False, target=proxy.get("provider") or "provider",
+                error_kind="api-error", detail=str(e)))
 
     ports = [p for p in dict.fromkeys([proxy.get("port_socks5"), proxy.get("port_http")]) if p]
     if not host or not ports:
@@ -443,6 +519,11 @@ def probe(proxy, provider_check=None, latency_runs=3):
     # 1. матрица порт×протокол
     matrix = probe_matrix(host, ports, user, password)
     res["matrix"] = {"%s/%s" % (port, proto): ip for (port, proto), ip in matrix.items()}
+    for (port, proto), ip in matrix.items():
+        res["evidence"].append(health_mod.evidence(
+            proto, bool(ip), target=IPIFY_URL, via_proxy=True,
+            error_kind="" if ip else "external-or-transport",
+            detail="port=%s" % port))
     socks_ports = [port for (port, proto), ip in matrix.items() if proto == "socks" and ip]
     http_ports = [port for (port, proto), ip in matrix.items() if proto == "http" and ip]
     res["socks_ok"], res["http_ok"] = bool(socks_ports), bool(http_ports)
@@ -453,6 +534,16 @@ def probe(proxy, provider_check=None, latency_runs=3):
     res["http_port"] = ph if ph in http_ports else (http_ports[0] if http_ports else None)
 
     if not socks_ports and not http_ports:
+        # ipify — один внешний target, поэтому его отказ через оба протокола ещё
+        # не доказывает смерть прокси. Только в этой редкой ветке спрашиваем два
+        # независимых HTTP endpoint и строим quorum без лишней цены нормальной пробы.
+        for port in ports:
+            for proto in ("socks", "http"):
+                res["evidence"].append(http_evidence_via(
+                    proto, host, port, user, password, LAT_URL, signal=proto))
+                res["evidence"].append(http_evidence_via(
+                    proto, host, port, user, password, TG_URL, signal="telegram"))
+        res["health_decision"] = health_mod.proxy_fault_decision(res["evidence"])
         # не работает ни одна комбинация — дисквалификация (+пометка, если и
         # провайдер считает его трупом: п.2 гейта удаления §6.4 останется честным)
         res["disqualified"] = "provider-check-dead+no-combo" if provider_dead else "no-combo"
@@ -466,6 +557,11 @@ def probe(proxy, provider_check=None, latency_runs=3):
     #    Спрашиваем две базы: расхождение само по себе портит репутацию IP (§оценка).
     geo = geo_country_consensus(res["exit_ip"])
     res["exit_cc"], res["exit_cc_alt"], res["geo_agree"] = geo["cc"], geo["alt"], geo["agree"]
+    intel = ip_intel(res["exit_ip"])
+    res["asn"] = (intel or {}).get("asn")
+    res["evidence"].append(health_mod.evidence(
+        "geo", bool(geo["cc"] or geo["alt"]), target="geo-consensus",
+        detail="agree=%s" % geo["agree"]))
     if res["exit_cc"] in HARD_BLOCK_CC or (res["exit_cc_alt"] or "") in HARD_BLOCK_CC:
         res["disqualified"] = "blocked-cc:%s" % (res["exit_cc"] or res["exit_cc_alt"])
         return res
@@ -475,6 +571,10 @@ def probe(proxy, provider_check=None, latency_runs=3):
     code = http_code_via(tg[0], host, tg[1], user, password, TG_URL)
     res["tg_code"] = code
     res["tg_ok"] = code != "000" and code.isdigit() and 200 <= int(code) <= 499
+    res["evidence"].append(health_mod.evidence(
+        "telegram", res["tg_ok"], target=TG_URL, via_proxy=True,
+        error_kind="" if res["tg_ok"] else "external-or-transport",
+        detail="code=%s" % code))
 
     # 4. латентность — медиана 3 запросов через основную комбинацию
     times = []
@@ -489,7 +589,7 @@ def probe(proxy, provider_check=None, latency_runs=3):
     return res
 
 
-def _score_core(vals, cfg=None, is_current=False):
+def _score_core(vals, cfg=None, is_current=False, freshness=1.0):
     """Единая математика скоринга §7.4 — ОДИН источник истины (П3).
 
     vals: ok, latency_ms, fail_count, tg_ok, socks_ok, http_ok, kind, ip_version,
@@ -501,13 +601,14 @@ def _score_core(vals, cfg=None, is_current=False):
     if not vals.get("ok"):
         return None, None
     s = 100.0
+    freshness = max(0.0, min(1.0, float(freshness)))
     if vals.get("latency_ms") is not None:
-        s -= min(vals["latency_ms"] / 10.0, 40.0)
+        s -= min(vals["latency_ms"] / 10.0, 40.0) * freshness
     s -= int(vals.get("fail_count") or 0) * 15  # история провалов до этой пробы
     if vals.get("tg_ok"):
-        s += 20
+        s += 20 * freshness
     if vals.get("socks_ok") and vals.get("http_ok"):
-        s += 15  # есть куда откатиться без смены IP (RETUNE)
+        s += 15 * freshness  # есть куда откатиться без смены IP (RETUNE)
     if vals.get("kind") == "dedicated" and int(vals.get("ip_version") or 4) == 4:
         s += 10
     elif vals.get("kind") == "shared":
@@ -555,7 +656,7 @@ def _rget(row, key):
         return None
 
 
-def score_from_row(row, cfg=None, is_current=False):
+def score_from_row(row, cfg=None, is_current=False, now=None):
     """П3: оценка «на лету» из сохранённой строки пула под ТЕКУЩУЮ стратегию.
 
     Смена стратегии ничего не пересчитывает в БД — потребители (таблица пула,
@@ -579,7 +680,7 @@ def score_from_row(row, cfg=None, is_current=False):
         "exit_cc": _rget(row, "exit_cc"), "country": _rget(row, "country"),
         "geo_agree": True if geo is None else bool(geo),
     }
-    return _score_core(vals, cfg, is_current)
+    return _score_core(vals, cfg, is_current, freshness_weight(row, cfg, now))
 
 
 def days_left(date_end):

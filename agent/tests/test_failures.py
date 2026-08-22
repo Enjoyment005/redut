@@ -112,7 +112,8 @@ class TestProviderCheckIsHint(unittest.TestCase):
                 "user": "u", "password": "p"}
 
     def run_probe(self, matrix_alive, check_alive):
-        orig_run, orig_geo = probe._run_curl, probe.geo_country_consensus
+        orig_run, orig_geo, orig_intel = (
+            probe._run_curl, probe.geo_country_consensus, probe.ip_intel)
         try:
             def fake_curl(args, timeout=probe.CURL_TIMEOUT):
                 if probe.IPIFY_URL in args:
@@ -122,9 +123,11 @@ class TestProviderCheckIsHint(unittest.TestCase):
                 return (0, "0.1")
             probe._run_curl = fake_curl
             probe.geo_country_consensus = lambda ip: {"cc": "fi", "alt": "fi", "agree": True}
+            probe.ip_intel = lambda ip: {"asn": "AS64500"}
             return probe.probe(self.px(), provider_check=lambda: check_alive)
         finally:
-            probe._run_curl, probe.geo_country_consensus = orig_run, orig_geo
+            probe._run_curl, probe.geo_country_consensus, probe.ip_intel = (
+                orig_run, orig_geo, orig_intel)
 
     def test_dead_check_alive_matrix_passes(self):
         res = self.run_probe(matrix_alive=True, check_alive=False)

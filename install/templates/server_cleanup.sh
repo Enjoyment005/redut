@@ -30,7 +30,11 @@ TMPB=$(_du /tmp/*.py /tmp/*.zip /tmp/*.gz /tmp/*.tar /opt/telegram_ws_relay.py)
 # РАЗМЕРУ, включая только что закрытый (по времени он моложе секунды и --vacuum-time
 # его бы пропустил — из-за этого прежняя метрика показывала «0 Б»).
 journalctl --rotate 2>/dev/null
-journalctl --vacuum-size=1M 2>/dev/null
+# Важно считать вывод самого vacuum, а не разницу общего disk-usage. После rotate
+# journald может сразу создать/предвыделить новый active-файл (обычно 8 MiB): старый
+# файл реально удалён, но общий объём «до/после» остаётся тем же и прежняя метрика
+# записывала ложный ноль. LC_ALL=C даёт стабильное "freed N" для парсера ниже.
+VACOUT=$(LC_ALL=C journalctl --vacuum-size=1M 2>&1)
 
 # ── login history ─────────────────────────────────────────────────────────────
 > /var/log/wtmp.db 2>/dev/null
@@ -74,11 +78,12 @@ systemctl reset-failed 2>/dev/null
 JAFT=$(journalctl --disk-usage 2>/dev/null)
 
 # ── статистика для панели (накопление за сутки) ───────────────────────────────
-# freed = (журнал до − после) + логи + tmp. Журнальные строки disk-usage парсит
-# python (надёжнее bash+numfmt, не зависит от локали): "…занимают 96.0M…" → байты.
+# freed = освобождённое самим journalctl vacuum + размеры обнулённых/удалённых
+# обычных файлов и tmp. JBEF/JAFT оставлены как fallback для старых journalctl,
+# которые не печатают итоговое "freed N".
 STAT=/var/lib/vpn-panel/cleanup-stat.json
 if command -v python3 >/dev/null 2>&1; then
-    python3 - "$STAT" "$LOGS" "$TMPB" "$JBEF" "$JAFT" 2>/dev/null <<'PY'
+    python3 - "$STAT" "$LOGS" "$TMPB" "$JBEF" "$JAFT" "$VACOUT" 2>/dev/null <<'PY'
 import json, os, re, sys, time
 
 def iec(s):
@@ -92,15 +97,27 @@ def iec(s):
 path = sys.argv[1]
 logs = int(sys.argv[2] or 0)
 tmpb = int(sys.argv[3] or 0)
-freed = max(0, iec(sys.argv[4]) - iec(sys.argv[5])) + logs + tmpb
+vacuum = sys.argv[6] if len(sys.argv) > 6 else ''
+# systemd пишет по одной строке на каждый runtime/persistent journal directory:
+# "Vacuuming done, freed 8.0M of archived journals from ...". Складываем их.
+matches = re.findall(r'\bfreed\s+([0-9]+(?:\.[0-9]+)?\s*[KMGTP]?B?)\b', vacuum, re.I)
+journal = sum(iec(v.upper()) for v in matches) if matches else max(0, iec(sys.argv[4]) - iec(sys.argv[5]))
+freed = journal + logs + tmpb
 now = time.time()
 try:
     d = json.load(open(path))
-    runs = [r for r in d.get("runs", []) if isinstance(r, list) and len(r) == 2 and now - r[0] < 86400]
+    runs = []
+    for r in d.get("runs", []):
+        # Старые [timestamp, total] не теряем при обновлении формата.
+        if isinstance(r, list) and len(r) == 2:
+            r = {"at": r[0], "freed": r[1]}
+        if isinstance(r, dict) and isinstance(r.get("at"), (int, float)) and now - r["at"] < 86400:
+            runs.append(r)
 except Exception:
     runs = []
-runs.append([now, freed])
-out = {"last_at": now, "freed_24h": sum(int(r[1]) for r in runs), "runs_24h": len(runs), "runs": runs}
+runs.append({"at": now, "freed": freed, "journal": journal, "files": logs, "tmp": tmpb})
+out = {"last_at": now, "freed_24h": sum(int(r.get("freed", 0)) for r in runs),
+       "runs_24h": len(runs), "runs": runs}
 os.makedirs(os.path.dirname(path), exist_ok=True)
 tmp = path + ".tmp"
 json.dump(out, open(tmp, "w"))

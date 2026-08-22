@@ -100,6 +100,17 @@ MONEY_CONFIG = {
         # возвращается ручной канал после подтверждённого отказа.
         "strategy": "speed",
     },
+    "health": {
+        "fresh_seconds": 7200, "stale_seconds": 86400,
+        "switch_margin": 15, "min_hold_time": 1800,
+        "max_latency_regression": 500,
+        "quorum_window_seconds": 60, "quorum_min_targets": 2,
+    },
+    "learning": {"mode": "shadow", "shadow_min_days": 30,
+                 "owner_approved": False, "canary_servers": [],
+                 "exploration_enabled": False, "exploration_rate": 0.05,
+                 "exploration_max_per_day": 1,
+                 "exploration_purchase_budget_per_day": 0.0},
     # Автопродление «якоря» (решение владельца 15.08). Продление и покупка стоят
     # одинаково (4 ₽/сутки), но новый IP — холодный: перелогины, капчи, проверки
     # оплаты. Поэтому здоровый боевой адрес держим, а ротация — аварийная мера.
@@ -120,7 +131,9 @@ MONEY_CONFIG = {
 OPT = "/opt/vpn-panel"
 # update.py — ПЕРВЫМ: agent.py его импортирует, и на живом узле между заливкой
 # файлов есть окно, где тик крона (pool-refresh/heartbeat) поймал бы ImportError.
-AGENT_FILES = ["update.py", "config_store.py", "agent.py", "pool.py", "probe.py", "apply.py", "money.py",
+AGENT_FILES = ["update.py", "config_store.py", "config_schema.py", "health.py", "learning.py",
+               "metrics.py", "replay.py",
+               "agent.py", "pool.py", "probe.py", "apply.py", "money.py",
                "states.py", "alerts.py", "country.py",
                "providers/__init__.py", "providers/base.py",
                "providers/proxyline.py", "providers/proxy6.py", "providers/proxywing.py"]
@@ -250,7 +263,7 @@ def main(argv=None):
             except ValueError:
                 existing = {}
         final_cfg = {**cfg, "panel_port": a.panel_port}
-        for k in ("money", "countries", "auto_prolong", "update", "stability"):
+        for k in ("money", "countries", "auto_prolong", "update", "stability", "learning"):
             if isinstance(existing.get(k), dict) and existing[k]:
                 final_cfg[k] = existing[k]
                 print("  config.json: сохранён настроенный владельцем блок '%s' (§6.2)" % k)

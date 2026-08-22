@@ -14,6 +14,16 @@ from _ctx import PANEL_DIR  # noqa: F401 — панель в sys.path
 from webpanel import views
 
 
+class TestMetricsMarkup(unittest.TestCase):
+    def test_metrics_card_endpoint_and_escaped_diagnostics_are_wired(self):
+        html = views._DASH_HTML
+        self.assertIn('id="card_metrics"', html)
+        self.assertIn("/api/metrics?days=30", html)
+        self.assertIn("function loadMetrics", html)
+        self.assertIn("esc(JSON.stringify({fault_recovery:f,learning:l,quality:q}", html)
+        self.assertIn("metrics:{def:1,load:()=>loadMetrics()}", html)
+
+
 class TestHelpDetailsVisibleWithoutEx(unittest.TestCase):
     def test_css_exception_present_and_after_hider(self):
         css = views._BASE_CSS
@@ -40,6 +50,17 @@ class TestMapIntelMarkup(unittest.TestCase):
         # оверлей стоит слева внизу, в пустом океане (просьба владельца 20.08:
         # справа сверху он закрывал Азию); bottom — чтобы не лечь на строку .hud
         self.assertIn(".geo .intel{position:absolute;left:9px;bottom:", views._BASE_CSS)
+
+
+class TestCleanupMarkup(unittest.TestCase):
+    def test_true_rolling_window_and_run_count_are_visible(self):
+        html = views._DASH_HTML
+        self.assertIn("за последние 24 ч освобождено", html)
+        self.assertIn("за 24 ч учтено минимум", html)
+        self.assertIn("точных замеров: ", html)
+        self.assertIn("c.complete_24h===false", html)
+        self.assertIn("очисток: ", html)
+        self.assertIn("c.runs_24h", html)
 
 
 class TestVitalsMarkup(unittest.TestCase):

@@ -18,7 +18,8 @@ SOCKS5 в Chrome-расширении) — в коде стоит предохр
 import re
 import urllib.parse
 
-from .base import (Provider, ProviderError, http_get_json, build_query,
+from .base import (Provider, ProviderError, ProviderErrorKind, Capability,
+                   capabilities, http_get_json, build_query,
                    HARD_BLOCK_CC, DEFAULT_WHITELIST_CC)
 
 P6_HOSTS = ("proxy6.net", "px6.link")
@@ -145,7 +146,8 @@ def _validate_descr(descr):
 
 class Proxy6(Provider):
     name = "proxy6"
-    caps = {"buy": True, "delete": True, "prolong": True, "check": True}
+    caps = capabilities(Capability.BUY, Capability.DELETE,
+                        Capability.PROLONG, Capability.CHECK)
     min_interval = 0.35  # 3 запроса/сек -> 429
 
     def __init__(self, api_key):
@@ -168,7 +170,10 @@ class Proxy6(Provider):
             # Предохранитель: ipauth ЗАМЕНЯЕТ список привязанных IP и сломает
             # SOCKS5 в Chrome-расширении владельца. Только руками, полным списком.
             raise RuntimeError("ipauth запрещён агенту навсегда (§2.2)")
-        self._throttle()
+        return self._guarded(
+            method, lambda: self._api_request(method, params, mutating))
+
+    def _api_request(self, method, params=None, mutating=False):
         qs = build_query(params)
         suffix = "/api/%s/%s/" % (urllib.parse.quote(self.api_key, safe=""), method)
         if qs:
@@ -185,16 +190,28 @@ class Proxy6(Provider):
                     last = e
                     if mutating:
                         # Не перебираем домены на мутации — см. docstring.
-                        raise ProviderError(self._mask(str(e)), code=e.code, network=True) from None
+                        raise ProviderError(self._mask(str(e)), code=e.code, network=True,
+                                            unsent=e.unsent, kind=e.kind,
+                                            retry_after=e.retry_after) from None
                     continue  # чтение: домен недоступен — пробуем следующий
-                raise ProviderError(self._mask(str(e)), code=e.code) from None
+                raise ProviderError(self._mask(str(e)), code=e.code, unsent=e.unsent,
+                                    kind=e.kind,
+                                    retry_after=e.retry_after) from None
             if isinstance(data, dict) and data.get("status") == "no":
-                raise ProviderError(self._mask(p6_error_text(data)), code=data.get("error_id"))
+                code = data.get("error_id")
+                kind = (ProviderErrorKind.AUTH if code in (100, 105)
+                        else ProviderErrorKind.NOT_FOUND if code == 404
+                        else ProviderErrorKind.UNKNOWN)
+                raise ProviderError(self._mask(p6_error_text(data)), code=code, kind=kind)
             self._good_host = host
             return data or {}
         raise ProviderError(
             "PROXY6: домены %s недоступны — возможно, заблокированы в вашей сети (%s)"
-            % (", ".join(P6_HOSTS), self._mask(str(last))), network=True)
+            % (", ".join(P6_HOSTS), self._mask(str(last))),
+            code=getattr(last, "code", None), network=True,
+            unsent=bool(last and last.unsent),
+            kind=getattr(last, "kind", ProviderErrorKind.NETWORK),
+            retry_after=getattr(last, "retry_after", None))
 
     def list(self):
         out = []

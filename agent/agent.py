@@ -28,6 +28,9 @@ sys.path.insert(0, PANEL_DIR)
 import apply as apply_mod           # noqa: E402
 import country as country_mod       # noqa: E402
 import money as money_mod           # noqa: E402
+import config_schema                # noqa: E402
+import learning as learning_mod     # noqa: E402
+import replay as replay_mod         # noqa: E402
 import pool as pool_mod             # noqa: E402
 import probe as probe_mod           # noqa: E402
 import states as states_mod         # noqa: E402
@@ -57,18 +60,48 @@ SERVER_DEFAULTS = {
 
 
 def load_config(path=None):
-    cfg = dict(DEV_DEFAULTS)
+    defaults = dict(DEV_DEFAULTS)
+    defaults["panel_port"] = 8443
+    defaults["money"] = dict(money_mod.DEFAULT_LIMITS)
+    defaults["countries"] = {"strategy": "speed", "blacklist": []}
+    defaults["health"] = {
+        "fresh_seconds": 7200, "stale_seconds": 86400,
+        "switch_margin": 15, "min_hold_time": 1800,
+        "max_latency_regression": 500,
+        "quorum_window_seconds": 60, "quorum_min_targets": 2,
+    }
+    defaults["learning"] = {"mode": "shadow", "shadow_min_days": 30,
+                            "owner_approved": False, "canary_servers": [],
+                            "exploration_enabled": False, "exploration_rate": 0.05,
+                            "exploration_max_per_day": 1,
+                            "exploration_purchase_budget_per_day": 0.0}
+    defaults["auto_prolong"] = {"enabled": True, "days_before": 3, "period_days": 30}
+    defaults["update"] = {"auto": True, "window": "04:00-06:00",
+                          "repo": "Enjoyment005/redut"}
     src = "dev-дефолты"
+    loaded = {}
     for candidate in ([path] if path else [ETC_CONFIG, os.path.join(PANEL_DIR, "config.local.json")]):
         if candidate and os.path.isfile(candidate):
-            with open(candidate, encoding="utf-8") as f:
-                loaded = json.load(f)
+            migration_error = ""
+            try:
+                config_schema.migrate_file(candidate)
+            except (OSError, ValueError, RecursionError, MemoryError,
+                    config_schema.ConfigMigrationError) as e:
+                migration_error = type(e).__name__
+            try:
+                with open(candidate, encoding="utf-8") as f:
+                    loaded = json.load(f)
+            except (OSError, ValueError, RecursionError, MemoryError):
+                loaded = None
             if candidate == ETC_CONFIG:
-                cfg.update(SERVER_DEFAULTS)   # серверные пути §13/§14
-            cfg.update(loaded)
+                defaults.update(SERVER_DEFAULTS)   # серверные пути §13/§14
             src = candidate
             break
-    cfg["_source"] = src
+    cfg = config_schema.normalize(loaded, defaults=defaults, source=src)
+    if 'migration_error' in locals() and migration_error:
+        cfg["_config_meta"]["issues"].append(
+            {"path": "config_schema_version", "reason": migration_error,
+             "action": "migration-deferred"})
     return cfg
 
 
@@ -80,8 +113,37 @@ def load_secrets():
     return {}, None
 
 
+def replay_config(path=None):
+    """Только путь БД для offline replay; config не мигрирует и не переписывает."""
+    candidates = ([path] if path else
+                  [ETC_CONFIG, os.path.join(PANEL_DIR, "config.local.json")])
+    for candidate in candidates:
+        if not candidate or not os.path.isfile(candidate):
+            continue
+        default_db = (SERVER_DEFAULTS["db"] if candidate == ETC_CONFIG
+                      else DEV_DEFAULTS["db"])
+        try:
+            with open(candidate, encoding="utf-8") as handle:
+                raw = json.load(handle)
+            db_path = raw.get("db") if isinstance(raw, dict) else None
+        except (OSError, ValueError, RecursionError, MemoryError):
+            db_path = None
+        return {"db": db_path if isinstance(db_path, str) and os.path.isabs(db_path)
+                else default_db}
+    return {"db": DEV_DEFAULTS["db"]}
+
+
 def open_pool(cfg):
-    return pool_mod.Pool(cfg["db"], server=cfg.get("server") or "dev")
+    p = pool_mod.Pool(cfg["db"], server=cfg.get("server") or "dev")
+    if os.name == "posix" and p.unfinished_operations():
+        try:
+            apply_mod.recover_unfinished_operations(
+                cfg, p, log=print,
+                finalize_apply=lambda op, verify: states_mod.recover_apply_post_state(
+                    cfg, p, op, verify, log=print))
+        except apply_mod.ApplyError as e:
+            p.log_event("operation-recovery", actor="auto", result="deferred", detail=str(e))
+    return p
 
 
 def read_singbox(cfg):
@@ -248,6 +310,13 @@ def cmd_pool_refresh(cfg, args):
             res = _probe_one(p, cfg, providers, row, current_host, background=True)
             ok += 1 if res["ok"] else 0
         print("проба кандидатов: %d/%d ok" % (ok, len(rows)))
+        shadow_rows = states_mod.rank_candidates(p.rotation_candidates(), cfg)
+        shadow = learning_mod.record_shadow_decision(
+            p, shadow_rows, cfg, current_host=current_host,
+            strategy=country_mod.strategy(cfg), context="pool-refresh --probe")
+        print("learning v2 shadow: %s (%d кандидатов)"
+              % (shadow.get("recommended_uid") or "нет рекомендации",
+                 shadow.get("candidate_count") or 0))
         alerter = _make_alerter(cfg, secrets)
         rr = states_mod.ensure_reserve(cfg, providers, p, alerter, print, "auto")
         if rr.get("bought"):
@@ -257,6 +326,10 @@ def cmd_pool_refresh(cfg, args):
         pr = p.prune()          # retention E1: probe_log 90 дн / event 180 дн, раз в сутки
         if pr:
             print("retention: probe_log −%d, event −%d" % (pr["probe_log"], pr["event"]))
+    revision = states_mod.reconcile_desired_selection(
+        cfg, providers, p, log=print, actor="auto", wait_seconds=0)
+    if revision.get("action") != "up-to-date":
+        print("selection-reconcile: %s" % revision.get("action"))
     p.close()
     return 1 if summary["errors"] and not summary["providers"] else 0
 
@@ -295,7 +368,7 @@ def cmd_egress_mark(cfg, args):
         row = next((r for r in p.list(include_gone=True) if r["host"] == host), None) if host else None
         delta = states_mod.age_seconds(p.get_setting("battle_mark_at"))
         if row is not None and delta is not None:
-            p.stability_bump_battle(row["provider"], row.get("country"), min(int(delta), 600))
+            p.learning_record_battle(row, min(int(delta), 600))
         p.set_setting("battle_mark_at", pool_mod.now_iso())
     print("egress-mark: ip=%s cc=%s -> %s"
           % (v["egress_ip"] or "—", v["exit_cc"] or "??", "ok" if v["ok"] else v["why"]))
@@ -308,6 +381,7 @@ def _probe_one(p, cfg, providers, row, current_host, background=False):
 
     background=True — фоновый крон-прогон (F5): одиночный провал не инкрементит
     fail_count, см. pool.record_probe."""
+    p.observe_provider_errors(providers, actor="auto" if background else "user")
     check_cb = None
     prov = providers.get(row["provider"])
     if prov is not None and prov.caps.get("check"):
@@ -443,8 +517,10 @@ def cmd_apply(cfg, args):
         print("Живой apply возможен только на сервере (Linux)")
         p.close()
         return 1
+    source = getattr(args, "source", "manual")
     try:
-        r = apply_mod.apply_candidate(cfg, row, res)
+        r = apply_mod.apply_candidate(cfg, row, res, pool=p, requested_by="user",
+                                      selection_source=source)
     except apply_mod.ApplyError as e:
         p.log_event("apply", actor="user", to_uid=row["uid"], result="fail", detail=str(e))
         print("❌ %s" % e)
@@ -457,12 +533,12 @@ def cmd_apply(cfg, args):
         p.set_role(row["uid"], "auto")
         p.log_event("role", actor="auto", to_uid=row["uid"], result="auto",
                     detail="успешный apply переводит off->auto (П9)")
-    source = getattr(args, "source", "manual")
     states_mod.finish_explicit_apply(cfg, p, row["uid"], row["host"], r.get("verify"),
                                      source=source, actor="user", log=print)
     p.log_event("apply", actor="user", from_uid=None, to_uid=row["uid"], result="ok",
                 detail=json.dumps({"old_ip": r["old_ip"], "new_ip": r["new_ip"],
                                    "verify": r["verify"], "source": source}, ensure_ascii=False))
+    apply_mod.commit_operation(p, r)
     print("✅ Применён %s: %s -> %s, egress=%s (%s), tg=%s · режим=%s"
           % (row["uid"], r["old_ip"], r["new_ip"], r["verify"]["egress_ip"],
              r["verify"]["exit_cc"], r["verify"]["tg_code"],
@@ -477,7 +553,9 @@ def cmd_rollback(cfg, args):
         return 1
     p = open_pool(cfg)
     try:
-        r = apply_mod.rollback_from_ring(cfg, backup_path=args.backup)
+        r = apply_mod.rollback_from_ring(cfg, backup_path=args.backup,
+                                         pool=p, requested_by="user",
+                                         selection_source="manual")
     except apply_mod.ApplyError as e:
         p.log_event("rollback", actor="user", result="fail", detail=str(e))
         print("❌ %s" % e)
@@ -491,6 +569,7 @@ def cmd_rollback(cfg, args):
         states_mod.finish_explicit_apply(
             cfg, p, (row or {}).get("uid") or ("live:%s" % r["good_ip"]), r["good_ip"],
             r.get("verify"), source="manual", actor="user", log=print)
+    apply_mod.commit_operation(p, r)
     print(("✅" if r["ok"] else "⚠️") + " Откат: %s -> %s (бэкап %s), verify %s"
           % (r["bad_ip"], r["good_ip"], os.path.basename(r["backup"]),
              "OK" if r["ok"] else "НЕ ПРОШЁЛ: " + r["verify"]["why"]))
@@ -524,7 +603,14 @@ def cmd_strategy_apply(cfg, args):
 # ------------------------------------------------------------- деньги (§6, фаза 2)
 def _providers_and_pool(cfg):
     secrets, _ = load_secrets()
-    return make_providers(secrets), open_pool(cfg)
+    pool = open_pool(cfg)
+    providers = make_providers(secrets)
+    pool.observe_provider_errors(providers, actor="user")
+    try:
+        money_mod.reconcile_pending_spend(pool, providers, actor="recovery")
+    except money_mod.SpendDenied as error:
+        pool.log_event("spend-recovery", actor="auto", result="deferred", detail=str(error))
+    return providers, pool
 
 
 def _balance_num(prov):
@@ -886,6 +972,7 @@ def cmd_self_update(cfg, args):
 
 def cmd_heartbeat_check(cfg, args):
     secrets, _ = load_secrets()
+    providers = make_providers(secrets)
     p = open_pool(cfg)
     alerter = _make_alerter(cfg, secrets)
     r = states_mod.heartbeat_check(p, alerter)
@@ -894,7 +981,20 @@ def cmd_heartbeat_check(cfg, args):
               % (r["age_h"], " — письмо отправлено" if r.get("alerted") else " (уже уведомляли)"))
     else:
         print("Пульс агента свеж%s" % ("" if r["age_h"] is None else " (%.1f ч назад)" % r["age_h"]))
+    revision = states_mod.reconcile_desired_selection(
+        cfg, providers, p, log=print, actor="auto", wait_seconds=0)
+    if revision.get("action") != "up-to-date":
+        print("selection-reconcile: %s" % revision.get("action"))
     p.close()
+    return 0
+
+
+def cmd_learning_replay(cfg, args):
+    """Read-only replay: не открывает Pool и не запускает recovery/migration."""
+    snapshot = replay_mod.load_sqlite(cfg["db"], days=args.days)
+    report = replay_mod.run(snapshot)
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True,
+                     allow_nan=False))
     return 0
 
 
@@ -952,6 +1052,10 @@ def main(argv=None):
                     help="провайдер, с которого уходим (proxy6|proxyline)")
     sp.add_argument("--reason", help="источник вызова (панель пишет key-removed)")
     sub.add_parser("heartbeat-check", help="проверить пульс агента (§6.3); письмо, если нет цикла >24ч")
+    sp = sub.add_parser("learning-replay",
+                        help="read-only offline replay learning v2 по локальным журналам")
+    sp.add_argument("--days", type=int, default=90,
+                    help="окно истории 1..3650 дней (по умолчанию 90)")
     sub.add_parser("auto-prolong", help="⚠️ продлить боевой прокси до истечения (§6.3, деньги; крон раз в сутки)")
     sp = sub.add_parser("self-update", help="обновления с GitHub (UPDATE-PLAN): проверить маяк / применить")
     sp.add_argument("--check", action="store_true", help="только сверить версии (поведение по умолчанию)")
@@ -966,6 +1070,8 @@ def main(argv=None):
                     help="режим планировщика: jitter -> check -> apply при авто+окне (крон 04:41)")
     args = ap.parse_args(argv)
 
+    if args.cmd == "learning-replay":
+        return cmd_learning_replay(replay_config(args.config), args)
     cfg = load_config(args.config)
     handlers = {"status": cmd_status, "list": cmd_list, "pool-refresh": cmd_pool_refresh,
                 "probe": cmd_probe, "apply": cmd_apply, "strategy-apply": cmd_strategy_apply,
@@ -973,7 +1079,8 @@ def main(argv=None):
                 "buy": cmd_buy, "prolong": cmd_prolong, "drop": cmd_drop,
                 "rotate": cmd_rotate, "emergency": cmd_emergency,
                 "switch-provider": cmd_switch_provider,
-                "heartbeat-check": cmd_heartbeat_check, "auto-prolong": cmd_auto_prolong,
+                "heartbeat-check": cmd_heartbeat_check, "learning-replay": cmd_learning_replay,
+                "auto-prolong": cmd_auto_prolong,
                 "self-update": cmd_self_update, "egress-mark": cmd_egress_mark}
     try:
         return handlers[args.cmd](cfg, args)

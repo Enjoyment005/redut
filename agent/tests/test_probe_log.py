@@ -11,6 +11,7 @@ import inspect
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import _ctx      # noqa: F401
 import pool as pool_mod
@@ -121,23 +122,74 @@ class TestProbeStrategyIndependence(unittest.TestCase):
     def test_probe_result_identical_with_mocked_network(self):
         # сеть замокана: гоняем пробу дважды, между прогонами «меняем стратегию»
         # (конфиг, который probe в принципе не видит) — результаты идентичны
-        orig_run, orig_geo = probe._run_curl, probe.geo_country_consensus
+        orig_run, orig_geo, orig_intel = (
+            probe._run_curl, probe.geo_country_consensus, probe.ip_intel)
         try:
             probe._run_curl = lambda args, timeout=probe.CURL_TIMEOUT: (
                 (0, "5.5.5.5") if probe.IPIFY_URL in args
                 else (0, "204") if "%{http_code}" in args
                 else (0, "0.1"))
             probe.geo_country_consensus = lambda ip: {"cc": "fi", "alt": "fi", "agree": True}
+            probe.ip_intel = lambda ip: {"asn": "AS64500"}
             px = {"host": "1.1.1.1", "port_socks5": 1080, "port_http": 8080,
                   "user": "u", "password": "p"}
             fake_cfg = {"countries": {"strategy": "reputation"}}
             res1 = probe.probe(dict(px))
             fake_cfg["countries"]["strategy"] = "speed"     # noqa: F841 — probe его не видит
             res2 = probe.probe(dict(px))
+            # observed_at — фактическое время независимых health-сигналов, оно
+            # обязано различаться между двумя вызовами и не относится к стратегии.
+            for result in (res1, res2):
+                for item in result.get("evidence") or []:
+                    item.pop("observed_at", None)
             self.assertEqual(res1, res2)
             self.assertTrue(res1["ok"])
         finally:
-            probe._run_curl, probe.geo_country_consensus = orig_run, orig_geo
+            probe._run_curl, probe.geo_country_consensus, probe.ip_intel = (
+                orig_run, orig_geo, orig_intel)
+
+
+class TestProbeNetworkChaos(unittest.TestCase):
+    def px(self):
+        return {"host": "1.1.1.1", "port_socks5": 1080, "port_http": 8080,
+                "user": "u", "password": "p"}
+
+    def common(self):
+        return (mock.patch.object(
+                    probe, "geo_country_consensus",
+                    return_value={"cc": "fi", "alt": "fi", "agree": True}),
+                mock.patch.object(probe, "ip_intel", return_value={"asn": "AS64500"}),
+                mock.patch.object(probe, "http_code_via", return_value="204"))
+
+    def test_http_alive_socks_dead_and_reverse_still_select_working_path(self):
+        cases = (
+            ({(1080, "socks"): None, (1080, "http"): "5.5.5.5",
+              (8080, "socks"): None, (8080, "http"): "5.5.5.5"}, False, True),
+            ({(1080, "socks"): "5.5.5.5", (1080, "http"): None,
+              (8080, "socks"): "5.5.5.5", (8080, "http"): None}, True, False),
+        )
+        for matrix, socks_ok, http_ok in cases:
+            with self.subTest(socks=socks_ok, http=http_ok), \
+                    mock.patch.object(probe, "probe_matrix", return_value=matrix), \
+                    self.common()[0], self.common()[1], self.common()[2], \
+                    mock.patch.object(probe, "time_total_via", return_value=0.1):
+                result = probe.probe(self.px(), latency_runs=1)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["socks_ok"], socks_ok)
+            self.assertEqual(result["http_ok"], http_ok)
+            self.assertEqual(result["exit_ip"], "5.5.5.5")
+
+    def test_packet_loss_and_latency_jitter_use_median_of_successful_samples(self):
+        matrix = {(1080, "socks"): "5.5.5.5", (1080, "http"): "5.5.5.5",
+                  (8080, "socks"): "5.5.5.5", (8080, "http"): "5.5.5.5"}
+        with mock.patch.object(probe, "probe_matrix", return_value=matrix), \
+                self.common()[0], self.common()[1], self.common()[2], \
+                mock.patch.object(probe, "time_total_via",
+                                  side_effect=[0.05, None, 1.5, 0.06, None]):
+            result = probe.probe(self.px(), latency_runs=5)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["latency_ms"], 60,
+                         "lost samples are ignored and a 1.5s jitter spike is not the median")
 
 
 class TestStrategyPreviewNoNetwork(unittest.TestCase):

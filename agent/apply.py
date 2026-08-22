@@ -23,14 +23,17 @@
 """
 import contextlib
 import copy
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import time
+import uuid
 
 import probe as probe_mod
+import health as health_mod
 
 try:
     import fcntl
@@ -163,20 +166,64 @@ def load_json(path):
 
 
 def dump_json_replace(obj, path):
-    tmp = path + ".tmp"
+    tmp = "%s.%s.tmp" % (path, uuid.uuid4().hex)
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
         f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def atomic_copy_replace(src, dst):
+    """Скопировать файл через unique temp + fsync + atomic os.replace."""
+    parent = os.path.dirname(os.path.abspath(dst))
+    os.makedirs(parent, exist_ok=True)
+    tmp = os.path.join(parent, ".%s.%s.tmp" % (os.path.basename(dst), uuid.uuid4().hex))
+    try:
+        with open(src, "rb") as source, open(tmp, "xb") as target:
+            shutil.copyfileobj(source, target, length=1024 * 1024)
+            target.flush()
+            os.fsync(target.fileno())
+        try:
+            shutil.copymode(src, tmp)
+        except OSError:
+            pass
+        os.replace(tmp, dst)
+        if hasattr(os, "O_DIRECTORY"):
+            try:
+                fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def file_checksum(path):
+    """SHA-256 файла как фактический идентификатор состояния live/stage/backup."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def backup_ring(cfg_path, ring_dir, keep=10):
     """Кольцо бэкапов из keep штук, не один .bak (§9.2)."""
     os.makedirs(ring_dir, exist_ok=True)
-    name = time.strftime("%Y%m%d-%H%M%S") + ".json"
+    name = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8] + ".json"
     dst = os.path.join(ring_dir, name)
-    shutil.copyfile(cfg_path, dst)
-    ring = sorted(f for f in os.listdir(ring_dir) if re.fullmatch(r"\d{8}-\d{6}\.json", f))
+    atomic_copy_replace(cfg_path, dst)
+    ring = sorted(f for f in os.listdir(ring_dir)
+                  if re.fullmatch(r"\d{8}-\d{6}(?:-[0-9a-f]{8})?\.json", f))
     for old in ring[:-keep]:
         os.unlink(os.path.join(ring_dir, old))
     return dst
@@ -185,8 +232,25 @@ def backup_ring(cfg_path, ring_dir, keep=10):
 def newest_backup(ring_dir):
     if not os.path.isdir(ring_dir):
         return None
-    ring = sorted(f for f in os.listdir(ring_dir) if re.fullmatch(r"\d{8}-\d{6}\.json", f))
+    ring = sorted(f for f in os.listdir(ring_dir)
+                  if re.fullmatch(r"\d{8}-\d{6}(?:-[0-9a-f]{8})?\.json", f))
     return os.path.join(ring_dir, ring[-1]) if ring else None
+
+
+def backup_by_checksum(ring_dir, checksum):
+    """Найти в кольце точный before-config, не полагаясь на имя/время файла."""
+    if not checksum or not os.path.isdir(ring_dir):
+        return None
+    for name in sorted(os.listdir(ring_dir), reverse=True):
+        path = os.path.join(ring_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            if file_checksum(path) == checksum:
+                return path
+        except OSError:
+            continue
+    return None
 
 
 # ------------------------------------------------------------- команды системы
@@ -274,11 +338,17 @@ def verify_egress(expect_host=None):
                       "--interface", "tun0", probe_mod.IPIFY_URL], timeout=VERIFY_TIMEOUT + 10)
     ip = ip.strip()
     out = {"egress_ip": ip if probe_mod.looks_like_ip(ip) else None,
-           "exit_cc": None, "tg_code": None, "ok": False, "why": "", "why_kind": ""}
+           "exit_cc": None, "tg_code": None, "ok": False, "why": "", "why_kind": "",
+           "evidence": [health_mod.evidence(
+               "http", bool(probe_mod.looks_like_ip(ip)), target=probe_mod.IPIFY_URL,
+               via_proxy=True, error_kind="" if probe_mod.looks_like_ip(ip)
+               else "external-or-transport", detail="tun0 curl_rc=%s" % rc)]}
     if not out["egress_ip"]:
         out["why"], out["why_kind"] = "egress через tun0 пуст", "no-ip"
         return out
     out["exit_cc"] = probe_mod.geo_country(out["egress_ip"])
+    out["evidence"].append(health_mod.evidence(
+        "geo", bool(out["exit_cc"]), target="geo-primary"))
     if out["exit_cc"] in probe_mod.HARD_BLOCK_CC:
         # F1: не карать по одиночному вердикту одной базы — повторный запрос ОБЕИХ;
         # блок при подтверждении ЛЮБОЙ из них на повторе (строгость probe сохранена:
@@ -294,7 +364,12 @@ def verify_egress(expect_host=None):
                         "-o", "/dev/null", "-w", "%{http_code}", probe_mod.TG_URL],
                        timeout=VERIFY_TIMEOUT + 10)
     out["tg_code"] = code if rc == 0 else "000"
-    if not (code.isdigit() and 200 <= int(code) <= 499):
+    tg_ok = bool(code.isdigit() and 200 <= int(code) <= 499)
+    out["evidence"].append(health_mod.evidence(
+        "telegram", tg_ok, target=probe_mod.TG_URL, via_proxy=True,
+        error_kind="" if tg_ok else ("tcp-refused" if rc == 7 else "transport-error"),
+        detail="tun0 curl_rc=%s code=%s" % (rc, code or "000")))
+    if not tg_ok:
         out["why"] = "Telegram-проба через tun0 не прошла (код %s)" % (code or "000")
         out["why_kind"] = "tg"
         return out
@@ -326,12 +401,61 @@ def stage_candidate(server_cfg, proxy_row, probe_res):
         probe_res.get("socks_port"), probe_res.get("http_port"))
     live = load_json(server_cfg["singbox_config"])
     new_cfg = patch_config(live, socks_out, http_tg, reject_quic)
-    stage = server_cfg.get("stage_path") or (server_cfg["singbox_config"] + ".stage")
+    stage_base = server_cfg.get("stage_path") or (server_cfg["singbox_config"] + ".stage")
+    stage = "%s.%s" % (stage_base, uuid.uuid4().hex)
     dump_json_replace(new_cfg, stage)
     return stage, new_cfg, socks_out, http_tg, reject_quic
 
 
-def apply_candidate(server_cfg, proxy_row, probe_res, log=print, _locked=False):
+def _operation_key(prefix, supplied=None):
+    return str(supplied or ("%s:%s" % (prefix, uuid.uuid4().hex)))
+
+
+def _default_apply_key(pool, prefix, desired, current_checksum=None):
+    """Стабильный intent key не зависит от уже изменившегося live/from_host."""
+    intent = {k: v for k, v in desired.items() if k != "from_host"}
+    raw = json.dumps(intent,
+                     ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    base = "%s:%s" % (prefix, hashlib.sha256(raw.encode("utf-8")).hexdigest())
+    if pool is None:
+        return _operation_key(prefix)
+    existing = pool.latest_operation_by_key_prefix(base)
+    if existing is None:
+        return base
+    if (existing.get("phase") in ("failed", "rolled_back")
+            or (existing.get("phase") == "committed"
+                and current_checksum is not None
+                and existing.get("after_checksum") != current_checksum)):
+        return "%s:%s" % (base, uuid.uuid4().hex)
+    return existing["idempotency_key"]
+
+
+def commit_operation(pool, result):
+    """Commit только ПОСЛЕ записи caller-state (selection/egress/mark_used/event)."""
+    operation_id = (result or {}).get("operation_id")
+    if pool is None or not operation_id:
+        return result
+    current = pool.get_operation(operation_id=operation_id)
+    if current and current.get("phase") == "verifying":
+        pool.transition_operation(operation_id, "committed")
+    return result
+
+
+def _operation_error(pool, operation_id, error):
+    """Best-effort terminalизация; исходную ошибку никогда не маскирует."""
+    if pool is None or not operation_id:
+        return
+    try:
+        op = pool.get_operation(operation_id=operation_id)
+        if op and op.get("phase") not in ("committed", "rolled_back", "failed"):
+            pool.transition_operation(operation_id, "failed", error=str(error))
+    except Exception:
+        pass
+
+
+def apply_candidate(server_cfg, proxy_row, probe_res, log=print, _locked=False,
+                    pool=None, requested_by="auto", idempotency_key=None,
+                    selection_source="auto"):
     """Живое применение по §9 (без dry-run). Возвращает dict с итогом.
 
     Вызывающий обязан заранее прогнать probe и убедиться, что кандидат не
@@ -346,62 +470,122 @@ def apply_candidate(server_cfg, proxy_row, probe_res, log=print, _locked=False):
     # как «кандидат не прошёл проверку» — и узел уезжает в EMERGENCY (случай 15.08).
     singbox_bin = server_cfg.get("singbox_bin") or "/usr/local/bin/sing-box"
     new_ip = proxy_row.get("host") or proxy_row.get("ip")
+    operation_id = None
+    owns_operation = False
+    mutation_may_have_started = False
 
     with _maybe_lock(server_cfg, _locked):
         live = load_json(cfg_path)
         old_ip = current_upstream(live)
+        try:
+            if pool is not None:
+                desired = {
+                    "kind": "apply", "uid": proxy_row.get("uid"),
+                    "from_host": old_ip, "to_host": new_ip,
+                    "socks_port": probe_res.get("socks_port"),
+                    "http_port": probe_res.get("http_port"),
+                    "selection_source": selection_source,
+                    "promote_role": proxy_row.get("role") == "off",
+                }
+                before_checksum = file_checksum(cfg_path)
+                key = (str(idempotency_key).strip() if idempotency_key else
+                       _default_apply_key(pool, "apply", desired, before_checksum))
+                existing = pool.get_operation(idempotency_key=key)
+                op = existing or pool.begin_operation(
+                    "apply", requested_by, desired, key, from_uid=None,
+                    to_uid=proxy_row.get("uid"), before_checksum=before_checksum)
+                operation_id = op["id"]
+                owns_operation = existing is None and bool(op.get("created"))
+                if existing is not None or not op.get("created"):
+                    recovered = recover_operation(server_cfg, pool, op, log=log, _locked=True)
+                    current = pool.get_operation(operation_id=operation_id)
+                    if current.get("phase") in ("verifying", "committed") and recovered.get("ok"):
+                        verify = recovered.get("verify") or verify_egress()
+                        return {"ok": True, "old_ip": old_ip, "new_ip": new_ip,
+                                "backup": backup_by_checksum(ring_dir, current.get("before_checksum")),
+                                "verify": verify, "operation_id": operation_id,
+                                "recovered": True}
+                    raise ApplyError("повтор operation %s завершён как %s"
+                                     % (operation_id, current.get("phase")))
+                pool.transition_operation(operation_id, "probing")
 
-        stage, new_cfg, socks_out, http_tg, reject_quic = stage_candidate(
-            server_cfg, proxy_row, probe_res)
-        rc, out = singbox_check(singbox_bin, stage)
-        if rc != 0:
-            os.unlink(stage)
-            raise ApplyError("sing-box check забраковал кандидата (live не тронут):\n%s" % out)
-        log("  sing-box check (кандидат): OK")
+            stage, new_cfg, socks_out, http_tg, reject_quic = stage_candidate(
+                server_cfg, proxy_row, probe_res)
+            after_checksum = file_checksum(stage)
+            if pool is not None:
+                pool.transition_operation(operation_id, "staged",
+                                          after_checksum=after_checksum)
+            rc, out = singbox_check(singbox_bin, stage)
+            if rc != 0:
+                os.unlink(stage)
+                raise ApplyError("sing-box check забраковал кандидата (live не тронут):\n%s" % out)
+            log("  sing-box check (кандидат): OK")
 
-        backup = backup_ring(cfg_path, ring_dir)
-        log("  бэкап: %s (кольцо из 10)" % backup)
+            backup = backup_ring(cfg_path, ring_dir)
+            log("  бэкап: %s (кольцо из 10)" % backup)
 
-        os.replace(stage, cfg_path)
-        rc, out = singbox_check(singbox_bin, cfg_path)
-        if rc != 0:  # паранойя: вернуть как было, live рестартов ещё не было
-            shutil.copyfile(backup, cfg_path)
-            raise ApplyError("sing-box check не прошёл после установки — конфиг возвращён:\n%s" % out)
+            mutation_may_have_started = True
+            os.replace(stage, cfg_path)
+            if pool is not None:
+                pool.transition_operation(operation_id, "applied")
+            rc, out = singbox_check(singbox_bin, cfg_path)
+            if rc != 0:  # паранойя: вернуть как было, live рестартов ещё не было
+                atomic_copy_replace(backup, cfg_path)
+                if pool is not None:
+                    pool.transition_operation(operation_id, "rolled_back", error=out)
+                raise ApplyError("sing-box check не прошёл после установки — конфиг возвращён:\n%s" % out)
 
-        log("  " + antiloop_replace(new_ip, old_ip, server_cfg.get("gw"), server_cfg.get("wan")))
-        if patch_boot_script(boot_script, old_ip, new_ip):
-            log("  vpn-boot-setup.sh: %s -> %s" % (old_ip, new_ip))
+            log("  " + antiloop_replace(new_ip, old_ip, server_cfg.get("gw"), server_cfg.get("wan")))
+            if patch_boot_script(boot_script, old_ip, new_ip):
+                log("  vpn-boot-setup.sh: %s -> %s" % (old_ip, new_ip))
 
-        def rollback(why):
-            log("  ОТКАТ: %s" % why)
-            shutil.copyfile(backup, cfg_path)
-            antiloop_replace(old_ip, new_ip, server_cfg.get("gw"), server_cfg.get("wan"))
-            patch_boot_script(boot_script, new_ip, old_ip)
-            ok = restart_singbox()
-            wait_tun0()
+            def rollback(why):
+                log("  ОТКАТ: %s" % why)
+                try:
+                    atomic_copy_replace(backup, cfg_path)
+                    antiloop_replace(old_ip, new_ip, server_cfg.get("gw"), server_cfg.get("wan"))
+                    patch_boot_script(boot_script, new_ip, old_ip)
+                    ok = restart_singbox()
+                    carrier = wait_tun0()
+                    rollback_verify = verify_egress()
+                    if ok and carrier and rollback_verify.get("ok") and pool is not None:
+                        pool.transition_operation(operation_id, "rolled_back", error=why)
+                except Exception as rollback_error:
+                    raise ApplyError("%s; откат не завершён: %s" % (why, rollback_error))
+                if not (ok and carrier and rollback_verify.get("ok")):
+                    raise ApplyError(
+                        "%s; конфиг возвращён, но откат не подтверждён: sing-box=%s carrier=%s verify=%s"
+                        % (why, ok, carrier, rollback_verify.get("why") or "fail"))
+                raise ApplyError("%s\nОткат выполнен: config <- %s, anti-loop <- %s, sing-box %s, egress=%s"
+                                 % (why, os.path.basename(backup), old_ip,
+                                    "active" if ok else "НЕ ПОДНЯЛСЯ",
+                                    rollback_verify.get("egress_ip")))
+
+            if not restart_singbox():
+                rc, jr = run_cmd(["journalctl", "-u", "sing-box", "-n", "15", "--no-pager"])
+                log(jr)
+                rollback("sing-box не поднялся после рестарта")
+            if not wait_tun0():
+                rollback("tun0 не получил carrier за 30 с")
+
+            if pool is not None:
+                pool.transition_operation(operation_id, "verifying")
             v = verify_egress()
-            raise ApplyError("%s\nОткат выполнен: config <- %s, anti-loop <- %s, sing-box %s, egress=%s"
-                             % (why, os.path.basename(backup), old_ip,
-                                "active" if ok else "НЕ ПОДНЯЛСЯ", v.get("egress_ip")))
-
-        if not restart_singbox():
-            rc, jr = run_cmd(["journalctl", "-u", "sing-box", "-n", "15", "--no-pager"])
-            log(jr)
-            rollback("sing-box не поднялся после рестарта")
-        if not wait_tun0():
-            rollback("tun0 не получил carrier за 30 с")
-
-        v = verify_egress()
-        log("  verify: egress=%s cc=%s tg=%s" % (v["egress_ip"], v["exit_cc"], v["tg_code"]))
-        if not v["ok"]:
-            rollback("verify: " + v["why"])
-
-        return {"ok": True, "old_ip": old_ip, "new_ip": new_ip, "backup": backup,
-                "socks_out": socks_out, "http_tg": http_tg, "reject_quic": reject_quic,
-                "verify": v}
+            log("  verify: egress=%s cc=%s tg=%s" % (v["egress_ip"], v["exit_cc"], v["tg_code"]))
+            if not v["ok"]:
+                rollback("verify: " + v["why"])
+            return {"ok": True, "old_ip": old_ip, "new_ip": new_ip, "backup": backup,
+                    "socks_out": socks_out, "http_tg": http_tg, "reject_quic": reject_quic,
+                    "verify": v, "operation_id": operation_id}
+        except Exception as e:
+            if owns_operation and not mutation_may_have_started:
+                _operation_error(pool, operation_id, e)
+            raise
 
 
-def rollback_from_ring(server_cfg, backup_path=None, log=print, _locked=False):
+def rollback_from_ring(server_cfg, backup_path=None, log=print, _locked=False,
+                       pool=None, requested_by="user", idempotency_key=None,
+                       selection_source="manual"):
     """Откат на бэкап из кольца (по умолчанию самый свежий) + маршруты + verify.
     _locked=True: flock уже держит вызывающий (states.rotate) — не брать повторно."""
     cfg_path = server_cfg["singbox_config"]
@@ -413,21 +597,261 @@ def rollback_from_ring(server_cfg, backup_path=None, log=print, _locked=False):
     if not backup or not os.path.isfile(backup):
         raise ApplyError("В кольце %s нет бэкапов — откатывать не из чего" % ring_dir)
 
+    operation_id = None
+    owns_operation = False
+    mutation_may_have_started = False
     with _maybe_lock(server_cfg, _locked):
-        bad_ip = current_upstream(load_json(cfg_path))
-        good_ip = current_upstream(load_json(backup))
-        rc, out = singbox_check(singbox_bin, backup)
-        if rc != 0:
-            raise ApplyError("Бэкап %s не проходит sing-box check:\n%s" % (backup, out))
-        shutil.copyfile(backup, cfg_path)
-        log("  config.json <- %s" % os.path.basename(backup))
-        if probe_mod.is_ipv4(good_ip):
-            log("  " + antiloop_replace(good_ip, bad_ip, server_cfg.get("gw"), server_cfg.get("wan")))
-            if patch_boot_script(boot_script, bad_ip, good_ip):
-                log("  vpn-boot-setup.sh: %s -> %s" % (bad_ip, good_ip))
-        if not restart_singbox():
-            raise ApplyError("sing-box не поднялся после отката — нужен ручной разбор")
-        wait_tun0()
-        v = verify_egress()
-        log("  verify: egress=%s cc=%s tg=%s" % (v["egress_ip"], v["exit_cc"], v["tg_code"]))
-        return {"ok": v["ok"], "backup": backup, "bad_ip": bad_ip, "good_ip": good_ip, "verify": v}
+        try:
+            bad_ip = current_upstream(load_json(cfg_path))
+            good_ip = current_upstream(load_json(backup))
+            if pool is not None:
+                before_checksum = file_checksum(cfg_path)
+                desired = {"kind": "rollback", "from_host": bad_ip,
+                           "to_host": good_ip, "backup": os.path.abspath(backup),
+                           "selection_source": selection_source}
+                key = (str(idempotency_key).strip() if idempotency_key else
+                       _default_apply_key(pool, "rollback", desired, before_checksum))
+                existing = pool.get_operation(idempotency_key=key)
+                op = existing or pool.begin_operation(
+                    "rollback", requested_by, desired, key, before_checksum=before_checksum)
+                operation_id = op["id"]
+                owns_operation = existing is None and bool(op.get("created"))
+                if existing is not None or not op.get("created"):
+                    recovered = recover_operation(server_cfg, pool, op, log=log, _locked=True)
+                    current = pool.get_operation(operation_id=operation_id)
+                    if current.get("phase") in ("verifying", "committed") and recovered.get("ok"):
+                        verify = recovered.get("verify") or verify_egress()
+                        return {"ok": True, "backup": backup, "bad_ip": bad_ip,
+                                "good_ip": good_ip, "verify": verify,
+                                "operation_id": operation_id, "recovered": True}
+                    raise ApplyError("повтор operation %s завершён как %s"
+                                     % (operation_id, current.get("phase")))
+                pool.transition_operation(operation_id, "staged",
+                                          after_checksum=file_checksum(backup))
+            rc, out = singbox_check(singbox_bin, backup)
+            if rc != 0:
+                raise ApplyError("Бэкап %s не проходит sing-box check:\n%s" % (backup, out))
+            # До explicit rollback сохранить исходный live: операция обязана быть
+            # обратимой даже если target backup не поднимет sing-box.
+            before_backup = backup_ring(cfg_path, ring_dir, keep=1000)
+            log("  страховочный бэкап до rollback: %s" % before_backup)
+            mutation_may_have_started = True
+            atomic_copy_replace(backup, cfg_path)
+            if pool is not None:
+                pool.transition_operation(operation_id, "applied")
+            log("  config.json <- %s" % os.path.basename(backup))
+            if probe_mod.is_ipv4(good_ip):
+                log("  " + antiloop_replace(good_ip, bad_ip, server_cfg.get("gw"), server_cfg.get("wan")))
+                if patch_boot_script(boot_script, bad_ip, good_ip):
+                    log("  vpn-boot-setup.sh: %s -> %s" % (bad_ip, good_ip))
+            if not restart_singbox():
+                raise ApplyError("sing-box не поднялся после отката — нужен ручной разбор")
+            if not wait_tun0():
+                raise ApplyError("tun0 не получил carrier после отката")
+            if pool is not None:
+                pool.transition_operation(operation_id, "verifying")
+            v = verify_egress()
+            log("  verify: egress=%s cc=%s tg=%s" % (v["egress_ip"], v["exit_cc"], v["tg_code"]))
+            # caller сначала фиксирует MANUAL/egress/event, затем commit_operation.
+            if not v["ok"]:
+                raise ApplyError("verify после rollback не прошёл: %s" % v.get("why"))
+            return {"ok": v["ok"], "backup": backup, "bad_ip": bad_ip,
+                    "good_ip": good_ip, "verify": v, "operation_id": operation_id}
+        except Exception as e:
+            if owns_operation and not mutation_may_have_started:
+                _operation_error(pool, operation_id, e)
+            raise
+
+
+def _restore_before(server_cfg, pool, operation, live_host, log):
+    """Восстановить точный before-config оборванной apply-saga по checksum."""
+    cfg_path = server_cfg["singbox_config"]
+    desired = operation.get("desired_state") or {}
+    before = backup_by_checksum(server_cfg["ring"], operation.get("before_checksum"))
+    if before is None:
+        pool.transition_operation(
+            operation["id"], "failed",
+            error="recovery: в backup-кольце нет before_checksum")
+        return {"ok": False, "action": "failed", "operation_id": operation["id"]}
+    old_host = desired.get("from_host") or current_upstream(load_json(before))
+    atomic_copy_replace(before, cfg_path)
+    if probe_mod.is_ipv4(old_host):
+        antiloop_replace(old_host, live_host, server_cfg.get("gw"), server_cfg.get("wan"))
+        patch_boot_script(server_cfg.get("boot_script") or
+                          "/usr/local/bin/vpn-boot-setup.sh", live_host, old_host)
+    restarted = restart_singbox()
+    carrier = wait_tun0()
+    verify = verify_egress()
+    detail = "recovery rollback: sing-box=%s; verify=%s" % (restarted, verify.get("why") or "ok")
+    if restarted and carrier and verify.get("ok"):
+        pool.transition_operation(operation["id"], "rolled_back", error=detail)
+    log("  operation %s: %s" % (operation["id"], detail))
+    return {"ok": bool(restarted and carrier and verify.get("ok")),
+            "action": "rolled_back" if restarted and carrier and verify.get("ok") else "deferred",
+            "operation_id": operation["id"], "verify": verify}
+
+
+def _converge_before_side_effects(server_cfg, pool, operation, live_host, log):
+    """Live уже before, но kill мог оставить routes/boot/service в after."""
+    desired = operation.get("desired_state") or {}
+    old_host = desired.get("from_host")
+    target_host = desired.get("to_host") or live_host
+    if probe_mod.is_ipv4(old_host):
+        antiloop_replace(old_host, target_host, server_cfg.get("gw"), server_cfg.get("wan"))
+        patch_boot_script(server_cfg.get("boot_script") or
+                          "/usr/local/bin/vpn-boot-setup.sh", target_host, old_host)
+    restarted = restart_singbox()
+    carrier = wait_tun0()
+    verify = verify_egress()
+    if restarted and carrier and verify.get("ok"):
+        pool.transition_operation(operation["id"], "rolled_back",
+                                  error="recovery: before-config и side effects подтверждены")
+        return {"ok": True, "action": "rolled_back", "operation_id": operation["id"],
+                "verify": verify}
+    log("  operation %s: before восстановлен, side effects ещё не подтверждены" % operation["id"])
+    return {"ok": False, "action": "deferred", "operation_id": operation["id"],
+            "verify": verify}
+
+
+def recover_operation(server_cfg, pool, operation, log=print, _locked=False,
+                      finalize_apply=None):
+    """Свести одну незавершённую apply/rollback saga по фактическому checksum.
+
+    Никаких предположений по timestamp: live сравнивается только с сохранёнными
+    before/after checksum. Неизвестный третий конфиг оставляется нетронутым и
+    фиксируется как failed/superseded — его будет разбирать desired reconciler.
+    """
+    operation_id = operation.get("id")
+    phase = operation.get("phase")
+    if phase in ("committed", "rolled_back", "failed"):
+        return {"ok": True, "action": "terminal", "operation_id": operation_id}
+    if operation.get("desired_state_invalid") or not isinstance(operation.get("desired_state"), dict):
+        pool.transition_operation(operation_id, "failed",
+                                  error="recovery: desired_state повреждён")
+        return {"ok": False, "action": "failed", "operation_id": operation_id}
+    if operation.get("kind") not in ("apply", "rollback"):
+        pool.transition_operation(operation_id, "failed",
+                                  error="recovery: неизвестный kind %s" % operation.get("kind"))
+        return {"ok": False, "action": "failed", "operation_id": operation_id}
+
+    with _maybe_lock(server_cfg, _locked):
+        cfg_path = server_cfg["singbox_config"]
+        try:
+            live_checksum = file_checksum(cfg_path)
+            live_host = current_upstream(load_json(cfg_path))
+        except (OSError, ValueError, KeyError) as e:
+            pool.transition_operation(operation_id, "failed",
+                                      error="recovery: live config недоступен: %s" % e)
+            return {"ok": False, "action": "failed", "operation_id": operation_id}
+        before = operation.get("before_checksum")
+        after = operation.get("after_checksum")
+
+        if phase not in ("planned", "probing", "staged", "applied", "verifying"):
+            pool.transition_operation(operation_id, "failed",
+                                      error="recovery: повреждённая фаза %s" % phase)
+            return {"ok": False, "action": "failed", "operation_id": operation_id}
+        if phase in ("planned", "probing"):
+            if before and live_checksum != before:
+                pool.transition_operation(
+                    operation_id, "failed",
+                    error="recovery: live изменился до staged (superseded)")
+            else:
+                pool.transition_operation(operation_id, "failed",
+                                          error="recovery: оборвано до staged; live не менялся")
+            return {"ok": True, "action": "no-live-change", "operation_id": operation_id}
+
+        if live_checksum == before:
+            if phase not in ("applied", "verifying"):
+                pool.transition_operation(operation_id, "failed",
+                                          error="recovery: live не менялся до apply")
+                return {"ok": True, "action": "failed", "operation_id": operation_id}
+            if operation.get("kind") == "apply":
+                return _converge_before_side_effects(server_cfg, pool, operation,
+                                                     live_host, log)
+            # Для explicit rollback before — исходный конфиг. Повторяем атомарную
+            # установку target backup; operation остаётся recoverable при сбое.
+            target = operation["desired_state"].get("backup")
+            try:
+                if not target or file_checksum(target) != after:
+                    raise OSError("target backup недоступен или checksum изменился")
+                atomic_copy_replace(target, cfg_path)
+                live_checksum = file_checksum(cfg_path)
+                live_host = current_upstream(load_json(cfg_path))
+            except (OSError, ValueError) as e:
+                pool.transition_operation(operation_id, "failed",
+                                          error="recovery rollback target: %s" % e)
+                return {"ok": False, "action": "failed", "operation_id": operation_id}
+        if not after or live_checksum != after:
+            pool.transition_operation(
+                operation_id, "failed",
+                error="recovery: live checksum не совпадает ни с before, ни с after (superseded)")
+            return {"ok": False, "action": "superseded", "operation_id": operation_id}
+
+        # live уже содержит целевой конфиг: kill случился после os.replace. Доводим
+        # маршруты/boot/service и verify, затем commit или точный rollback.
+        if phase == "staged":
+            pool.transition_operation(operation_id, "applied")
+        desired = operation["desired_state"]
+        target_host = desired.get("to_host") or live_host
+        from_host = desired.get("from_host")
+        if probe_mod.is_ipv4(target_host):
+            antiloop_replace(target_host, from_host, server_cfg.get("gw"), server_cfg.get("wan"))
+            patch_boot_script(server_cfg.get("boot_script") or
+                              "/usr/local/bin/vpn-boot-setup.sh", from_host, target_host)
+        if phase == "verifying":
+            # До этой фазы restart+carrier уже подтверждены. При потере ответа
+            # сначала повторяем только verify; успешный retry не дёргает сервис.
+            verify = verify_egress()
+            if verify.get("ok"):
+                if finalize_apply is None:
+                    return {"ok": True, "action": "post-state-pending",
+                            "operation_id": operation_id, "verify": verify}
+                finalize_apply(pool.get_operation(operation_id=operation_id), verify)
+                pool.transition_operation(operation_id, "committed")
+                return {"ok": True, "action": "committed",
+                        "operation_id": operation_id, "verify": verify}
+        restarted = restart_singbox()
+        carrier = wait_tun0()
+        current = pool.get_operation(operation_id=operation_id)
+        if current["phase"] == "applied":
+            pool.transition_operation(operation_id, "verifying")
+        verify = verify_egress()
+        if restarted and carrier and verify.get("ok"):
+            # Любой source имеет caller-state (как минимум event/mark_used).
+            # Внутренний exact retry возвращает verifying; commit выполнит caller.
+            # Startup передаёт finalize_apply и лишь затем получает committed.
+            if finalize_apply is None:
+                return {"ok": True, "action": "post-state-pending",
+                        "operation_id": operation_id, "verify": verify}
+            if finalize_apply is not None:
+                finalize_apply(pool.get_operation(operation_id=operation_id), verify)
+            pool.transition_operation(operation_id, "committed")
+            log("  operation %s восстановлена: committed" % operation_id)
+            return {"ok": True, "action": "committed", "operation_id": operation_id,
+                    "verify": verify}
+        # И apply, и explicit rollback обратимы: для rollback страховочный
+        # before-backup записан до live mutation и находится по checksum.
+        return _restore_before(server_cfg, pool,
+                               pool.get_operation(operation_id=operation_id),
+                               target_host, log)
+
+
+def recover_unfinished_operations(server_cfg, pool, log=print, _locked=False,
+                                  finalize_apply=None):
+    """Startup/heartbeat recovery всех saga, старейшая первой, под общим lock."""
+    pending = pool.unfinished_operations(limit=1000)
+    if not pending:
+        return []
+    results = []
+    with _maybe_lock(server_cfg, _locked):
+        for operation in pending:
+            try:
+                results.append(recover_operation(server_cfg, pool, operation,
+                                                 log=log, _locked=True,
+                                                 finalize_apply=finalize_apply))
+            except Exception as e:
+                # Transient DB/disk/system error после возможной live mutation не
+                # терминализируем: следующий startup/heartbeat обязан повторить.
+                results.append({"ok": False, "action": "deferred",
+                                "operation_id": operation.get("id"), "error": str(e)})
+    return results

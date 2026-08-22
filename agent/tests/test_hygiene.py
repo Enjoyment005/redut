@@ -45,8 +45,47 @@ class TestCleanup(unittest.TestCase):
             p = os.path.join(d, "c.json")
             with open(p, "w", encoding="utf-8") as f:
                 json.dump({"last_at": 1000, "freed_24h": 25165824, "runs_24h": 8, "runs": [[1000, 1]]}, f)
-            self.assertEqual(hygiene.cleanup_stat(p),
-                             {"on": True, "last_at": 1000, "freed_24h": 25165824, "runs_24h": 8})
+            self.assertEqual(hygiene.cleanup_stat(p, now=1500),
+                             {"on": True, "last_at": 1000, "freed_24h": 1, "runs_24h": 1,
+                              "measured_runs_24h": 0, "complete_24h": False})
+
+    def test_recomputes_sliding_24h_from_all_runs(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "c.json")
+            now = 200000
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"last_at": now - 10, "freed_24h": 999999, "runs_24h": 99,
+                           "runs": [
+                               [now - 86401, 100],                 # уже выпал
+                               [now - 86399, 2],                   # старый формат
+                               {"at": now - 3600, "freed": 3, "journal": 3},  # новый формат
+                               {"at": now - 10, "freed": 5, "journal": 5},
+                           ]}, f)
+            self.assertEqual(hygiene.cleanup_stat(p, now=now),
+                             {"on": True, "last_at": now - 10,
+                              "freed_24h": 10, "runs_24h": 3,
+                              "measured_runs_24h": 2, "complete_24h": False})
+
+    def test_complete_when_every_run_has_precise_components(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "c.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"last_at": 2000, "runs": [
+                    {"at": 1000, "freed": 5, "journal": 5, "files": 0, "tmp": 0},
+                    {"at": 2000, "freed": 7, "journal": 6, "files": 1, "tmp": 0},
+                ]}, f)
+            self.assertEqual(hygiene.cleanup_stat(p, now=2000),
+                             {"on": True, "last_at": 2000, "freed_24h": 12,
+                              "runs_24h": 2, "measured_runs_24h": 2,
+                              "complete_24h": True})
+
+    def test_legacy_aggregate_without_runs_is_supported(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "c.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"last_at": 1000, "freed_24h": 25, "runs_24h": 4}, f)
+            self.assertEqual(hygiene.cleanup_stat(p, now=2000),
+                             {"on": True, "last_at": 1000, "freed_24h": 25, "runs_24h": 4})
 
     def test_bad_json_off(self):
         with tempfile.TemporaryDirectory() as d:

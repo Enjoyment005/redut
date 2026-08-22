@@ -485,6 +485,37 @@ class TestApplyOrchestration(unittest.TestCase):
         self.assertIn("уже идёт", r["why"])
         self.assertEqual(self.setup_runs, [])
 
+    def test_agent_lock_busy_after_download_defers_install(self):
+        """A manual apply/rotate owning vpn-agent.lock wins over update mutation."""
+        import apply as apply_mod
+        original = apply_mod.Flock
+        calls = []
+
+        class FirstLockOnly:
+            def __init__(self, path):
+                self.path = path
+
+            def __enter__(self):
+                calls.append(self.path)
+                if len(calls) == 2:
+                    raise apply_mod.ApplyError("vpn-agent.lock занят ручным apply")
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        apply_mod.Flock = FirstLockOnly
+        try:
+            result = update.apply(
+                self.cfg, pool=self.pool, target="1.3.0", manual=True)
+        finally:
+            apply_mod.Flock = original
+        self.assertFalse(result["ok"])
+        self.assertIn("агент занят", result["why"])
+        self.assertEqual(self.setup_runs, [])
+        self.assertEqual(calls, [update.LOCK_PATH, "/run/vpn-agent.lock"])
+        self.assertFalse(os.path.exists(update.REDUT_NEW))
+
     def test_rollback_refused_for_pre_update_tree(self):
         # На узле лежит дерево сборки до 1.2.0 (setup.sh без UPDATE — так на узлах,
         # катанных deploy.py): его прогон в качестве «отката» переустановил бы узел

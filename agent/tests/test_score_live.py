@@ -31,7 +31,7 @@ def make_row(**kw):
            "latency_ms": 200, "fail_count": 0, "kind": "dedicated", "ip_version": 4,
            "date_end": _in(10), "exit_cc": "fi", "exit_cc_alt": "fi", "geo_agree": 1,
            "country": "fi", "role": "auto", "score": None, "gone": 0,
-           "cooldown_until": None}
+           "cooldown_until": None, "last_probe_at": datetime.datetime.now().isoformat()}
     row.update(kw)
     return row
 
@@ -133,10 +133,33 @@ class TestRankConsistency(unittest.TestCase):
         weak = make_row(uid="proxy6:weak", host="3.3.3.3", latency_ms=390, tg_ok=0,
                         socks_ok=1, http_ok=0, kind="shared", exit_cc="kz")
         fresh = make_row(uid="proxy6:new", host="4.4.4.4", probe_ok=0, exit_cc=None,
-                         country=None, latency_ms=None)
+                         country=None, latency_ms=None, last_probe_at=None)
         got = [r["uid"] for r in states.rank_candidates([weak, fresh], cfg_strategy("speed"))]
         self.assertEqual(got, ["proxy6:new", "proxy6:weak"],
                          "свежекупленный должен получить шанс раньше заведомо слабого")
+
+    def test_week_old_excellent_score_loses_to_fresh_stable(self):
+        old = make_row(uid="proxy6:old", host="1.1.1.1", latency_ms=10,
+                       last_probe_at=(datetime.datetime.now()
+                                      - datetime.timedelta(days=7)).isoformat())
+        fresh = make_row(uid="proxy6:fresh", host="2.2.2.2", latency_ms=200)
+        got = [r["uid"] for r in states.rank_candidates([old, fresh], cfg_strategy("speed"))]
+        self.assertEqual(got, ["proxy6:fresh", "proxy6:old"])
+
+    def test_fresh_failure_is_not_treated_as_unprobed(self):
+        failed = make_row(uid="proxy6:failed", host="1.1.1.1", probe_ok=0)
+        unprobed = make_row(uid="proxy6:new", host="2.2.2.2", probe_ok=0,
+                            last_probe_at=None)
+        got = [r["uid"] for r in states.rank_candidates([failed, unprobed],
+                                                         cfg_strategy("speed"))]
+        self.assertEqual(got, ["proxy6:new", "proxy6:failed"])
+
+    def test_future_timestamp_is_stale_and_boolean_ttl_uses_defaults(self):
+        future = make_row(last_probe_at="9999-12-31T23:59:59Z")
+        self.assertEqual(probe.freshness_weight(future), 0.0)
+        self.assertEqual(probe.freshness_cfg(
+            {"health": {"fresh_seconds": False, "stale_seconds": True}}),
+            {"fresh_seconds": 7200.0, "stale_seconds": 86400.0})
 
     def test_blacklist_dropped_everywhere(self):
         bad = make_row(uid="proxy6:ru", host="5.5.5.5", exit_cc="ru", country="ru")

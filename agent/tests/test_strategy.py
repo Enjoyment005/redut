@@ -8,6 +8,7 @@
 дефолт — «Скорость и отклик».
 """
 import unittest
+import datetime
 
 import _ctx      # noqa: F401  (добавляет panel/ в sys.path)
 import country
@@ -33,8 +34,9 @@ def row(host, cc, probe_ok=0, score=None, **meas):
     r = {"uid": "proxy6:%s" % host, "host": host, "country": cc, "exit_cc": cc,
          "probe_ok": probe_ok, "score": score, "role": "auto",
          "latency_ms": None, "tg_ok": 0, "socks_ok": probe_ok, "http_ok": 0,
-         "kind": None, "ip_version": 4, "fail_count": 0, "date_end": None,
-         "geo_agree": 1}
+          "kind": None, "ip_version": 4, "fail_count": 0, "date_end": None,
+          "geo_agree": 1,
+          "last_probe_at": datetime.datetime.now().isoformat() if probe_ok else None}
     r.update(meas)
     return r
 

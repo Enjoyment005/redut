@@ -116,11 +116,11 @@ class TestPatchBootScript(unittest.TestCase):
     вставлял новый IP между каждыми двумя символами — скрипт превращался в кашу.
     """
     OLD_FMT = ("#!/bin/bash\n# VPN boot setup — subnet 10.8.0.0/24, upstream %s (сгенерирован install.sh).\n"
-               "ip route replace %s/32 via 198.51.100.1 dev ens3          # анти-луп: до upstream — напрямую\n"
+               "ip route replace %s/32 via 203.0.113.1 dev ens3          # анти-луп: до upstream — напрямую\n"
                "echo done\n")
     NEW_FMT = ("#!/bin/bash\n# VPN boot setup — subnet 10.8.0.0/24, upstream %s.\n"
                "UP_HOST=\"%s\"\n"
-               "[ -n \"$UP_HOST\" ] && ip route replace \"$UP_HOST/32\" via 198.51.100.1 dev ens3\n"
+               "[ -n \"$UP_HOST\" ] && ip route replace \"$UP_HOST/32\" via 203.0.113.1 dev ens3\n"
                "echo done\n")
 
     def _tmp(self, text):
@@ -147,7 +147,7 @@ class TestPatchBootScript(unittest.TestCase):
         p = self._tmp(self.OLD_FMT % ("", ""))
         self.assertTrue(apply_mod.patch_boot_script(p, "", "5.6.7.8"))
         got = self._read(p)
-        self.assertIn("ip route replace 5.6.7.8/32 via 198.51.100.1 dev ens3", got)
+        self.assertIn("ip route replace 5.6.7.8/32 via 203.0.113.1 dev ens3", got)
         self.assertEqual(got.count("5.6.7.8"), 1, "адрес вписан ровно один раз, а не между символами")
         self.assertTrue(got.startswith("#!/bin/bash\n"), "скрипт остался скриптом")
 
@@ -179,9 +179,9 @@ class TestPatchBootScript(unittest.TestCase):
         "UP_HOST=\"%s\"\n"
         "if [ -n \"$UP_HOST\" ]; then\n"
         "    ip route replace default dev tun0 table middleman\n"
-        "    ip route replace \"$UP_HOST/32\" via 198.51.100.1 dev ens3\n"
+        "    ip route replace \"$UP_HOST/32\" via 203.0.113.1 dev ens3\n"
         "else\n"
-        "    ip route replace default via 198.51.100.1 dev ens3 table middleman\n"
+        "    ip route replace default via 203.0.113.1 dev ens3 table middleman\n"
         "    echo \"$(date '+%%F %%T') boot: канал не выбран — прямой выход\" > /run/vpn-agent-emergency\n"
         "fi\n"
         "echo \"[$(date)] vpn-boot-setup completed (upstream: ${UP_HOST:-не выбран, прямой выход})\"\n")
@@ -192,9 +192,9 @@ class TestPatchBootScript(unittest.TestCase):
         got = self._read(p)
         self.assertIn('UP_HOST="5.6.7.8"\n', got)
         self.assertEqual(got.count("5.6.7.8"), 1, "адрес вписан ровно один раз — в переменную")
-        self.assertIn('ip route replace "$UP_HOST/32" via 198.51.100.1 dev ens3\n', got,
+        self.assertIn('ip route replace "$UP_HOST/32" via 203.0.113.1 dev ens3\n', got,
                       "строка анти-лупа осталась через переменную (шаблон агента её не трогает)")
-        self.assertIn("default via 198.51.100.1 dev ens3 table middleman", got, "ветка прямого выхода цела")
+        self.assertIn("default via 203.0.113.1 dev ens3 table middleman", got, "ветка прямого выхода цела")
         self.assertTrue(got.startswith("#!/bin/bash\n"))
 
     def test_branching_format_replace_existing_ip(self):

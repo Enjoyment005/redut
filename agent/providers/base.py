@@ -12,6 +12,12 @@ import os
 import subprocess
 import time
 import socket
+import datetime
+import email.utils
+import math
+import threading
+from collections.abc import Mapping
+from enum import Enum
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -108,6 +114,123 @@ DEFAULT_COUNTRY_ORDER = ("fi", "ee", "lv", "lt", "se", "de", "nl", "pl", "cz",
 DEFAULT_WHITELIST_CC = DEFAULT_COUNTRY_ORDER   # старое имя — для совместимости импортов
 
 
+class Capability(str, Enum):
+    LIST = "list"
+    BALANCE = "balance"
+    BUY = "buy"
+    DELETE = "delete"
+    PROLONG = "prolong"
+    CHECK = "check"
+
+
+class ProviderCapabilities(Mapping):
+    """Immutable capability contract с совместимыми ``get``/``[]`` bool."""
+    def __init__(self, *enabled):
+        self._enabled = frozenset(Capability(item) for item in enabled)
+
+    def __getitem__(self, key):
+        try:
+            return Capability(key) in self._enabled
+        except ValueError:
+            raise KeyError(key) from None
+
+    def __iter__(self):
+        return (item.value for item in Capability)
+
+    def __len__(self):
+        return len(Capability)
+
+    @property
+    def enabled(self):
+        return self._enabled
+
+
+def capabilities(*enabled):
+    return ProviderCapabilities(Capability.LIST, Capability.BALANCE, *enabled)
+
+
+class ProviderErrorKind(str, Enum):
+    AUTH = "auth"
+    RATE_LIMIT = "rate-limit"
+    NETWORK = "network"
+    NOT_FOUND = "not-found"
+    EXPIRED = "expired"
+    INVALID = "invalid"
+    PROTOCOL = "protocol"
+    UNKNOWN = "unknown"
+
+
+class ProviderCircuitBreaker:
+    """Per-adapter breaker: network after N failures, rate-limit immediately."""
+    def __init__(self, threshold=3, recovery_seconds=60.0, clock=None):
+        self.threshold = max(1, int(threshold))
+        self.recovery_seconds = max(1.0, float(recovery_seconds))
+        self._clock = clock or time.monotonic
+        self._lock = threading.Lock()
+        self._state = "closed"
+        self._failures = 0
+        self._open_until = 0.0
+        self._probe_in_flight = False
+        self._last_kind = ProviderErrorKind.NETWORK
+
+    def before_call(self, operation=""):
+        now = self._clock()
+        with self._lock:
+            if self._state == "open" and now >= self._open_until:
+                self._state = "half-open"
+                self._probe_in_flight = False
+            if self._state == "open":
+                remaining = max(0.0, self._open_until - now)
+                raise ProviderError(
+                    "circuit open%s; повтор через %.1f с" % (
+                        " (%s)" % operation if operation else "", remaining),
+                    code="circuit-open", kind=self._last_kind,
+                    network=self._last_kind == ProviderErrorKind.NETWORK,
+                    unsent=True, retry_after=remaining)
+            if self._state == "half-open":
+                if self._probe_in_flight:
+                    raise ProviderError(
+                        "circuit half-open: проверка уже выполняется",
+                        code="circuit-open", kind=self._last_kind,
+                        network=self._last_kind == ProviderErrorKind.NETWORK,
+                        unsent=True, retry_after=self.recovery_seconds)
+                self._probe_in_flight = True
+
+    def success(self):
+        with self._lock:
+            self._state = "closed"
+            self._failures = 0
+            self._open_until = 0.0
+            self._probe_in_flight = False
+
+    def failure(self, error):
+        with self._lock:
+            self._probe_in_flight = False
+            if not isinstance(error, ProviderError) or not error.retryable:
+                self._failures = 0
+                if self._state == "half-open":
+                    self._state = "closed"
+                return
+            self._last_kind = error.kind
+            self._failures += 1
+            trip = (self._state == "half-open"
+                    or error.kind == ProviderErrorKind.RATE_LIMIT
+                    or self._failures >= self.threshold)
+            if trip:
+                delay = (error.retry_after if error.kind == ProviderErrorKind.RATE_LIMIT
+                         and error.retry_after is not None else self.recovery_seconds)
+                self._state = "open"
+                self._open_until = self._clock() + max(1.0, delay)
+
+    def snapshot(self):
+        now = self._clock()
+        with self._lock:
+            return {"state": self._state, "failures": self._failures,
+                    "retry_after": (max(0.0, self._open_until - now)
+                                    if self._state == "open" else 0.0),
+                    "last_kind": self._last_kind.value}
+
+
 class ProviderError(Exception):
     """Ошибка API провайдера.
 
@@ -117,14 +240,54 @@ class ProviderError(Exception):
               такой вызов безопасно повторить другим транспортом даже для денег.
     """
 
-    def __init__(self, message, code=None, network=False, unsent=False):
+    def __init__(self, message, code=None, network=False, unsent=False,
+                 kind=None, retry_after=None):
         super().__init__(message)
         self.code = code
-        self.network = network
-        self.unsent = unsent
+        try:
+            self.kind = ProviderErrorKind(kind) if kind is not None else (
+                ProviderErrorKind.NETWORK if network else ProviderErrorKind.UNKNOWN)
+        except ValueError:
+            self.kind = ProviderErrorKind.UNKNOWN
+        self.network = bool(network or self.kind == ProviderErrorKind.NETWORK)
+        self.unsent = bool(unsent)
+        try:
+            retry_after = float(retry_after) if retry_after is not None else None
+            self.retry_after = (retry_after if retry_after is None
+                                or (math.isfinite(retry_after) and retry_after >= 0) else None)
+        except (TypeError, ValueError, OverflowError):
+            self.retry_after = None
+
+    @property
+    def retryable(self):
+        return self.kind in (ProviderErrorKind.NETWORK, ProviderErrorKind.RATE_LIMIT)
 
 
-def _http_error(host_label, status, body):
+def _retry_after(headers, now=None):
+    value = None
+    if headers is not None:
+        try:
+            value = next((item for key, item in headers.items()
+                          if str(key).lower() == "retry-after"), None)
+        except AttributeError:
+            value = None
+    if value in (None, ""):
+        return None
+    try:
+        seconds = float(value)
+        return seconds if math.isfinite(seconds) and seconds >= 0 else None
+    except (TypeError, ValueError, OverflowError):
+        try:
+            stamp = email.utils.parsedate_to_datetime(str(value))
+            current = now or datetime.datetime.now(datetime.timezone.utc)
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=datetime.timezone.utc)
+            return max(0.0, (stamp - current).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
+def _http_error(host_label, status, body, headers=None):
     """Единая расшифровка HTTP-ошибки (для urllib и curl-транспорта)."""
     data = None
     try:
@@ -144,7 +307,12 @@ def _http_error(host_label, status, body):
         msg = "API-ключ не принят (%s)" % msg
     if status == 429:
         msg = "Превышен лимит запросов к API — подождите"
-    return ProviderError("%s: %s" % (host_label or "API", msg), code=status)
+    kinds = {401: ProviderErrorKind.AUTH, 403: ProviderErrorKind.AUTH,
+             404: ProviderErrorKind.NOT_FOUND, 410: ProviderErrorKind.EXPIRED,
+             429: ProviderErrorKind.RATE_LIMIT}
+    return ProviderError("%s: %s" % (host_label or "API", msg), code=status,
+                         kind=kinds.get(status, ProviderErrorKind.UNKNOWN),
+                         retry_after=_retry_after(headers) if status == 429 else None)
 
 
 def _urlopen_json(req, host_label, timeout):
@@ -164,7 +332,7 @@ def _urlopen_json(req, host_label, timeout):
             body = e.read().decode("utf-8", "replace")
         except Exception:
             pass
-        raise _http_error(host_label, e.code, body) from None
+        raise _http_error(host_label, e.code, body, e.headers) from None
     except urllib.error.URLError as e:
         why = getattr(e, "reason", None) or e
         raise ProviderError("Нет связи с %s (%s)" % (host_label or "API", why), network=True, unsent=True) from None
@@ -173,7 +341,8 @@ def _urlopen_json(req, host_label, timeout):
     try:
         return json.loads(body) if body else None
     except ValueError:
-        raise ProviderError("%s: ответ не JSON" % (host_label or "API")) from None
+        raise ProviderError("%s: ответ не JSON" % (host_label or "API"),
+                            kind=ProviderErrorKind.PROTOCOL) from None
 
 
 # curl: коды, при которых запрос заведомо не ушёл (DNS / connect / TLS-рукопожатие)
@@ -183,6 +352,7 @@ _CURL_UNSENT = {6, 7, 35}
 def _curl_json(url, headers, form_fields, host_label, timeout):
     """Тот же запрос через СОБСТВЕННЫЙ канал узла: curl --interface tun0 (sing-box -> upstream)."""
     cmd = ["curl", "-sS", "--interface", "tun0", "-m", str(int(timeout)), "-A", USER_AGENT,
+           "-D", "-",
            "-o", "-", "-w", "\n__HTTP__%{http_code}"]
     for k, v in (headers or {}).items():
         cmd += ["-H", "%s: %s" % (k, v)]
@@ -193,26 +363,46 @@ def _curl_json(url, headers, form_fields, host_label, timeout):
     cmd.append(url)
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 10)
-    except (OSError, subprocess.SubprocessError) as e:
+    except OSError as e:
         raise ProviderError("Нет связи с %s через канал узла (%s)" % (host_label or "API", e),
                             network=True, unsent=True) from None
+    except subprocess.SubprocessError as e:
+        # Процесс curl уже стартовал: POST мог уйти, а timeout случиться при
+        # чтении ответа. Для денег повтор другим транспортом небезопасен.
+        raise ProviderError("Нет связи с %s через канал узла (%s)" % (host_label or "API", e),
+                            network=True, unsent=False) from None
     if p.returncode != 0:
         raise ProviderError("Нет связи с %s через канал узла (curl %s)" % (host_label or "API", p.returncode),
                             network=True, unsent=p.returncode in _CURL_UNSENT)
     out = p.stdout or ""
-    body, _, code = out.rpartition("\n__HTTP__")
+    payload, _, code = out.rpartition("\n__HTTP__")
+    response_headers = {}
+    body = payload
+    # -D - пишет HTTP headers перед body. CONNECT/прокси может добавить больше
+    # одного блока; берём последний последовательный HTTP-блок.
+    normalized = payload.replace("\r\n", "\n")
+    while normalized.startswith("HTTP/") and "\n\n" in normalized:
+        block, normalized = normalized.split("\n\n", 1)
+        parsed = {}
+        for line in block.split("\n")[1:]:
+            if ":" in line:
+                key, value = line.split(":", 1)
+                parsed[key.strip().lower()] = value.strip()
+        response_headers = parsed
+        body = normalized
     try:
         status = int(code.strip() or 0)
     except ValueError:
         status = 0
     if status >= 400:
-        raise _http_error(host_label, status, body)
+        raise _http_error(host_label, status, body, response_headers)
     if status == 0:
         raise ProviderError("Нет связи с %s через канал узла (нет ответа)" % (host_label or "API"), network=True)
     try:
         return json.loads(body) if body else None
     except ValueError:
-        raise ProviderError("%s: ответ не JSON" % (host_label or "API")) from None
+        raise ProviderError("%s: ответ не JSON" % (host_label or "API"),
+                            kind=ProviderErrorKind.PROTOCOL) from None
 
 
 def _request_json(url, headers, form_fields, timeout, host_label, mutating):
@@ -289,22 +479,78 @@ class Provider:
     """
 
     name = "base"
-    caps = {"buy": False, "delete": False, "prolong": False, "check": False}
+    caps = capabilities()
     min_interval = 0.0  # секунды между запросами (лимиты API)
+    breaker_threshold = 3
+    breaker_recovery_seconds = 60.0
 
     def __init__(self, api_key):
         if not api_key:
             raise ValueError("%s: пустой API-ключ" % self.name)
         self.api_key = api_key
         self._last_request = 0.0
+        self._throttle_lock = threading.Lock()
+        self._error_observer = None
+        self.breaker = ProviderCircuitBreaker(
+            self.breaker_threshold, self.breaker_recovery_seconds)
+
+    def set_error_observer(self, callback):
+        """Best-effort typed error sink; observer failure never changes API semantics."""
+        self._error_observer = callback if callable(callback) else None
+        return self
+
+    def _guarded(self, operation, callback):
+        # Один lock образует реальную transport-boundary: ожидавшие потоки заново
+        # увидят breaker, который мог открыться на ответе предыдущего запроса.
+        with self._throttle_lock:
+            self.breaker.before_call(operation)
+            if self.min_interval > 0:
+                while True:
+                    wait = self._last_request + self.min_interval - time.monotonic()
+                    if wait <= 0:
+                        break
+                    time.sleep(wait)
+                self._last_request = time.monotonic()
+            try:
+                result = callback()
+            except ProviderError as error:
+                self.breaker.failure(error)
+                try:
+                    if self._error_observer is not None:
+                        self._error_observer(self.name, operation, error)
+                except Exception:
+                    pass
+                raise
+            except BaseException:
+                # Неизвестная локальная ошибка не является доказательством outage API.
+                self.breaker.success()
+                raise
+            self.breaker.success()
+            return result
 
     def _throttle(self):
         if self.min_interval <= 0:
             return
-        wait = self._last_request + self.min_interval - time.monotonic()
-        if wait > 0:
-            time.sleep(wait)
-        self._last_request = time.monotonic()
+        with self._throttle_lock:
+            while True:
+                wait = self._last_request + self.min_interval - time.monotonic()
+                if wait <= 0:
+                    break
+                time.sleep(wait)
+            self._last_request = time.monotonic()
+
+    def _throttled(self, callback):
+        """Выполнить transport под rate lock, привязав интервал к реальному старту."""
+        if self.min_interval <= 0:
+            return callback()
+        with self._throttle_lock:
+            while True:
+                wait = self._last_request + self.min_interval - time.monotonic()
+                if wait <= 0:
+                    break
+                time.sleep(wait)
+            self._last_request = time.monotonic()
+            return callback()
 
     # --- интерфейс ---
     def list(self):
