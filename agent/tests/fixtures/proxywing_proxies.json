@@ -1,0 +1,1 @@
+{"orders":[{"id":"ord_test123","status":"active","location":"FR","expires_at":"2026-09-22T04:11:04+00:00","proxies":[{"id":"prx_test456","ip":"203.0.113.20","http_port":46780,"socks_port":46781,"username":"sample_user","password":"sample_password","location":"FR","expires_at":"2026-09-22T04:11:04+00:00"}]}]}

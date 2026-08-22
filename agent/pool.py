@@ -24,7 +24,7 @@ import sqlite3
 
 ROLES = ("auto", "off")
 
-DEFAULT_ROLE = {"proxyline": "auto", "proxy6": "auto"}
+DEFAULT_ROLE = {"proxyline": "auto", "proxy6": "auto", "proxywing": "auto"}
 
 # Схема §13. money в фазе 1 только создаётся (записи — фаза 2).
 # session — таблица панели (фаза 4), здесь не нужна.

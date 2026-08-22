@@ -123,7 +123,7 @@ OPT = "/opt/vpn-panel"
 AGENT_FILES = ["update.py", "agent.py", "pool.py", "probe.py", "apply.py", "money.py",
                "states.py", "alerts.py", "country.py",
                "providers/__init__.py", "providers/base.py",
-               "providers/proxyline.py", "providers/proxy6.py"]
+               "providers/proxyline.py", "providers/proxy6.py", "providers/proxywing.py"]
 # sysinfo.py — ДО server.py: тот его импортирует, окно между копиями на живом
 # узле не должно ловить ImportError при рестарте панели (случай node1 19.08)
 PANEL_FILES = ["webpanel/__init__.py", "webpanel/auth.py", "webpanel/sysinfo.py",

@@ -1181,7 +1181,7 @@ async function loadPool(){const rows=(await api('/api/pool')).proxies;const tb=d
     const roles=['auto','off'];
     const inact=!p.provider_active;
     const cc=p.exit_cc||p.country;
-    const id=esc(p.uid).replace(/^proxy6:|^proxyline:/,'');
+    const id=esc(p.uid).replace(/^proxy6:|^proxyline:|^proxywing:/,'');
     const sold=(p.exit_cc&&p.country&&p.exit_cc!=p.country)?'продан как '+esc(country(p.country)):'';
     const argue=(p.geo_agree===false)?'спор: '+esc(country(p.exit_cc))+'/'+esc(country(p.exit_cc_alt)):'';
     const note=sold||argue;
@@ -1354,7 +1354,9 @@ const PROV={
     'Ключ: кабинет proxy6.net → раздел «API». Если в кабинете включено ограничение API по IP, впиши туда адрес '+
     'этого сервера, иначе провайдер ответит «доступ с неверного IP».'},
   proxyline:{t:'ProxyLine',h:'Запасной провайдер: через API панель умеет только продлевать (купить и удалить нельзя), '+
-    'цены в долларах. Ключ: кабинет panel.proxyline.net → раздел «API».'}};
+    'цены в долларах. Ключ: кабинет panel.proxyline.net → раздел «API».'},
+  proxywing:{t:'ProxyWing',h:'Datacenter и ISP: Редут импортирует уже купленные HTTP/SOCKS-каналы и проверяет их как остальные. '+
+    'Автопокупка и автопродление пока выключены: у ProxyWing расчёт по месяцам. Ключ: dashboard.proxywing.com → Account → Security.'}};
 async function loadKeys(){try{const r=await api('/api/key/status');
   document.getElementById('keys').innerHTML=(r.providers||[]).map(p=>{const m=PROV[p.provider]||{};
     return '<div class="step" style="margin-top:10px">'+
@@ -1691,6 +1693,7 @@ _SETUP_HTML = """
       узел будет ходить к такому сервису через собственный канал.</div>
     <label>PROXY6 · API-ключ (рекомендуется)</label><input id="proxy6" autocomplete="off" placeholder="например 0000000000-…">
     <label>ProxyLine · API-ключ (необязательно)</label><input id="proxyline" autocomplete="off">
+    <label>ProxyWing · API-ключ (необязательно)</label><input id="proxywing" autocomplete="off" placeholder="pk_live_…">
     <button class="btn g" style="margin-top:9px" onclick="saveProv()">Проверить и сохранить</button>
     <div id="provbox" class="sub" style="margin-top:9px"></div>
     <div style="margin-top:16px"><button class="btn s" onclick="go(2)">← Назад</button>
@@ -1774,7 +1777,8 @@ async function totpVerify(){const c=document.getElementById('otp').value;
   o.textContent='Второй фактор подключён. Запасные recovery-коды (сохрани отдельно от телефона):\\n'+r.recovery.join('  ');
   done(2)}catch(e){toast(e.message,'bad')}}
 async function saveProv(){const b={proxy6:document.getElementById('proxy6').value.trim(),
-  proxyline:document.getElementById('proxyline').value.trim()};
+  proxyline:document.getElementById('proxyline').value.trim(),
+  proxywing:document.getElementById('proxywing').value.trim()};
   try{const r=await sapi('/api/setup/provider',b);const box=document.getElementById('provbox');
   box.innerHTML=Object.entries(r.result||{}).map(([k,v])=>k+': '+(v.ok?('<span class="ok">ключ рабочий, баланс '+v.balance+' '+(v.currency||'')+'</span>'):
     v.saved_unverified?('<span class="warn">сервис недоступен с сервера напрямую — ключ сохранён без проверки, узел будет ходить к нему через свой канал ('+esc(v.error)+')</span>'):

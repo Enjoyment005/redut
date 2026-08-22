@@ -3,10 +3,12 @@
 from .base import Provider, ProviderError
 from .proxyline import ProxyLine
 from .proxy6 import Proxy6
+from .proxywing import ProxyWing
 
 PROVIDER_CLASSES = {
     ProxyLine.name: ProxyLine,
     Proxy6.name: Proxy6,
+    ProxyWing.name: ProxyWing,
 }
 
 

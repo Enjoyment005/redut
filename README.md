@@ -132,6 +132,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Enjoyment005/redut/main/setu
 |---|---|---|---|
 | **PROXY6** — основной: цены в рублях, покупка и продление прямо из панели | [proxy6.net](https://proxy6.net) | `red12` | **5% пожизненно** |
 | **ProxyLine** — второй источник | [proxyline.net](https://proxyline.net) | `red12` | **10%** |
+| **ProxyWing** — datacenter и ISP, импорт уже купленных каналов | [proxywing.com](https://proxywing.com) | — | — |
 
 Бюджет: адрес обходится примерно в 4 ₽ в сутки — около 120 ₽ в месяц за постоянный канал.
 На первое пополнение закладывайте ~500 ₽: автоматика бережёт деньги — держит баланс выше

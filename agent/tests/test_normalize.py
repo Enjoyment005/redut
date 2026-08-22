@@ -5,6 +5,7 @@ import unittest
 import _ctx
 from providers.proxy6 import norm_proxy6, p6_error_text
 from providers.proxyline import norm_proxyline
+from providers.proxywing import norm_proxywing
 
 
 class TestNormProxy6(unittest.TestCase):
@@ -79,6 +80,15 @@ class TestNormProxyline(unittest.TestCase):
         self.assertEqual(n["kind"], "shared", 'type "2" = shared')
         self.assertEqual(n["descr"], "")
         self.assertEqual(n["date_end"], "2022-09-15T14:48:15.355913+03:00")
+
+
+class TestNormProxyWing(unittest.TestCase):
+    def test_contract(self):
+        order = _ctx.fixture("proxywing_proxies.json")["orders"][0]
+        n = norm_proxywing(order["proxies"][0], order, "isp")
+        self.assertEqual(n["ext_id"], "isp|ord_test123|prx_test456")
+        self.assertEqual((n["port_http"], n["port_socks5"]), (46780, 46781))
+        self.assertEqual((n["country"], n["ip_version"], n["kind"]), ("fr", 4, "dedicated"))
 
 
 if __name__ == "__main__":

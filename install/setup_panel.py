@@ -31,7 +31,7 @@ VAR = "/var/lib/vpn-panel"
 AGENT_FILES = ["update.py", "agent.py", "pool.py", "probe.py", "apply.py", "money.py",
                "states.py", "alerts.py", "country.py",
                "providers/__init__.py", "providers/base.py",
-               "providers/proxyline.py", "providers/proxy6.py"]
+               "providers/proxyline.py", "providers/proxy6.py", "providers/proxywing.py"]
 # server.py импортирует sysinfo и hygiene — класть ДО server.py, чтобы окно между
 # копиями на живом узле не ловило ImportError при рестарте панели (случай node1 19.08)
 PANEL_FILES = ["webpanel/__init__.py", "webpanel/auth.py", "webpanel/sysinfo.py",
