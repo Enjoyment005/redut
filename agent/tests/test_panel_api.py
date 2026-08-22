@@ -367,11 +367,22 @@ class _StrategyHandler(_PreviewHandler):
         return "127.0.0.1"
 
 
+class _ApplyHandler:
+    _do_apply = server.Handler._do_apply
+
+    def _json(self, status, payload):
+        self.status = status
+        return payload
+
+    def _client_ip(self):
+        return "127.0.0.1"
+
+
 class TestStrategyPreview(_AppHarness):
     """П3: превью «Сейчас с ней» стратегийно-разное и видит текущий канал.
 
     Регресс приёмки сноса №7 (17.08): rotation_candidates(exclude_host=текущий)
-    выкидывал боевой канал из превью, и все четыре стратегии «выбирали» один и
+    выкидывал боевой канал из превью, и все стратегии «выбирали» один и
     тот же запасной (Коста-Рику), а строка про докупку обрезалась до одинаковых
     первых восьми стран белого списка."""
 
@@ -456,6 +467,47 @@ class TestStrategyPreview(_AppHarness):
         self.assertTrue(r["switch_needed"])
         self.assertTrue(r["switch_started"])
         kick.assert_called_once_with("proxy6:f")
+
+    def test_current_stickiness_prevents_pointless_strategy_churn(self):
+        # Один и тот же tier: запасной быстрее на 100 мс (=10 баллов), но текущий
+        # получает +15 stickiness и должен остаться. Раньше превью игнорировало
+        # этот бонус, хотя колонка качества его показывала.
+        self.app.pool.conn.execute(
+            "UPDATE proxy SET exit_cc='de', country='de', latency_ms=200 WHERE uid='proxy6:s'")
+        self.app.pool.conn.execute(
+            "UPDATE proxy SET exit_cc='de', country='de', latency_ms=100 WHERE uid='proxy6:f'")
+        self.app.pool.conn.commit()
+        self.app.current_host = lambda: "10.0.0.2"
+        st = self.state()
+        for sid in ("reputation", "balanced", "speed"):
+            self.assertEqual(self.by_id(st, sid)["pick"]["host"], "10.0.0.2", sid)
+
+    def test_manual_mode_disables_all_strategy_badges_until_user_enables_one(self):
+        server.states_mod.set_manual_selection(self.app.pool, "proxy6:f", "10.0.0.1")
+        st = self.state()
+        self.assertEqual(st["mode"], "manual")
+        self.assertTrue(all(not s["current"] for s in st["strategies"]))
+        with mock.patch.object(server, "_strategy_switch_kick", return_value=(True, "")):
+            r = _StrategyHandler()._do_strategy({"strategy": "reputation"})
+        self.assertEqual(r["mode"], "auto")
+        self.assertTrue(r["mode_changed"])
+        self.assertEqual(server.states_mod.selection_state(self.app.pool, self.app.cfg)["mode"],
+                         "auto")
+
+    def test_manual_apply_enters_manual_mode_only_after_success(self):
+        uid = "proxy6:f"
+        row = self.app.pool.get(uid)
+        pres = {"ok": True, "disqualified": None, "score": 120,
+                "exit_ip": row["host"], "exit_cc": "ng", "tg_ok": True}
+        verify = {"ok": True, "egress_ip": row["host"], "exit_cc": "ng", "tg_code": "200"}
+        self.app.probe_row = lambda _row: pres
+        with mock.patch.object(server.apply_mod, "apply_candidate",
+                               return_value={"old_ip": "10.0.0.9", "new_ip": row["host"],
+                                             "verify": verify}):
+            r = _ApplyHandler()._do_apply(row)
+        self.assertEqual(r["selection_mode"], "manual")
+        st = server.states_mod.selection_state(self.app.pool, self.app.cfg, row["host"])
+        self.assertEqual((st["mode"], st["manual_uid"]), ("manual", uid))
 
 
 class TestPoolRowStrategyBadge(_AppHarness):

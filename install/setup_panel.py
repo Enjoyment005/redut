@@ -28,7 +28,7 @@ VAR = "/var/lib/vpn-panel"
 
 # update.py — ПЕРВЫМ: agent.py его импортирует, и на живом узле между копиями
 # файлов есть окно, где тик крона (pool-refresh/heartbeat) поймал бы ImportError.
-AGENT_FILES = ["update.py", "agent.py", "pool.py", "probe.py", "apply.py", "money.py",
+AGENT_FILES = ["update.py", "config_store.py", "agent.py", "pool.py", "probe.py", "apply.py", "money.py",
                "states.py", "alerts.py", "country.py",
                "providers/__init__.py", "providers/base.py",
                "providers/proxyline.py", "providers/proxy6.py", "providers/proxywing.py"]
@@ -75,7 +75,7 @@ DEFAULTS = {
         # в конфигах существующих узлов игнорируется.
         # насколько сильно страна влияет на выбор; переключается в панели
         # (country.STRATEGIES: reputation | balanced | speed)
-        "strategy": "reputation",
+        "strategy": "speed",
     },
     "auto_prolong": {"enabled": True, "days_before": 3, "period_days": 30},
     # Самообновление с GitHub (vpn/UPDATE-PLAN.md): auto переключается в панели,

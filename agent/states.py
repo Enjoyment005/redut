@@ -28,6 +28,7 @@ import os
 import time
 
 import apply as apply_mod
+import config_store
 import country as country_mod
 import money as money_mod
 import probe as probe_mod
@@ -42,6 +43,11 @@ REPLENISH = "REPLENISH"
 EMERGENCY = "EMERGENCY"
 FROZEN_NET = "FROZEN_NET"     # сеть сервера легла — автоматика заморожена
 FROZEN = "FROZEN"            # ручная пауза автоматики из панели (обслуживание)
+
+# --- режим выбора канала -------------------------------------------------
+SELECTION_AUTO = "auto"
+SELECTION_MANUAL = "manual"
+MANUAL_FALLBACK_STRATEGY = "speed"
 
 # --- лимиты (§8) ---
 MAX_REPLACEMENTS_PER_HOUR = 3
@@ -123,6 +129,143 @@ def age_seconds(iso_str, now=None):
 
 def _now_iso():
     return datetime.datetime.now().replace(microsecond=0).isoformat(sep=" ")
+
+
+def selection_state(pool, cfg=None, current_host=None):
+    """Единый снимок политики выбора: AUTO(strategy) или MANUAL(uid, host).
+
+    Отсутствие ключей в старой БД означает AUTO — миграция не нужна. Стратегия
+    остаётся записанной в config.json и в MANUAL служит только прогнозом: права
+    переключать здоровый закреплённый канал у неё нет.
+    """
+    mode = pool.get_setting("selection_mode") or SELECTION_AUTO
+    if mode not in (SELECTION_AUTO, SELECTION_MANUAL):
+        mode = SELECTION_AUTO
+    host = pool.get_setting("manual_host") if mode == SELECTION_MANUAL else None
+    uid = pool.get_setting("manual_uid") if mode == SELECTION_MANUAL else None
+    return {
+        "mode": mode,
+        "strategy": country_mod.strategy(cfg),
+        "manual_uid": uid,
+        "manual_host": host,
+        "manual_since": (pool.get_setting("manual_since")
+                         if mode == SELECTION_MANUAL else None),
+        "is_current": bool(mode == SELECTION_MANUAL and host and current_host
+                           and host == current_host),
+    }
+
+
+def set_manual_selection(pool, uid, host, actor="user", reason="manual-apply"):
+    """Атомарно закрепить успешно применённый человеком канал."""
+    if not host:
+        raise ValueError("ручной канал нельзя закрепить без host")
+    was = selection_state(pool)
+    pool.set_settings({
+        "selection_mode": SELECTION_MANUAL,
+        "manual_uid": uid or ("live:%s" % host),
+        "manual_host": host,
+        "manual_since": _now_iso(),
+        "selection_strategy_override": None,
+    })
+    pool.log_event("selection-mode", actor=actor, to_uid=uid,
+                   result=SELECTION_MANUAL,
+                   detail="%s; закреплён %s (было %s)" % (reason, host, was["mode"]))
+    return selection_state(pool, current_host=host)
+
+
+def set_auto_selection(pool, cfg=None, strategy=None, actor="user", reason="strategy",
+                       log_unchanged=False):
+    """Снять ручную фиксацию; стратегию на диск пишет вызывающий."""
+    was = selection_state(pool, cfg)
+    name = strategy if strategy in country_mod.STRATEGIES else country_mod.strategy(cfg)
+    pool.set_settings({
+        "selection_mode": SELECTION_AUTO,
+        "manual_uid": None,
+        "manual_host": None,
+        "manual_since": None,
+        "selection_strategy_override": None,
+    })
+    if was["mode"] != SELECTION_AUTO or log_unchanged:
+        pool.log_event("selection-mode", actor=actor, result=SELECTION_AUTO,
+                       detail="%s; стратегия=%s (было %s)" % (reason, name, was["mode"]))
+    return selection_state(pool, cfg)
+
+
+def _persist_auto_strategy(cfg, pool, name, actor, reason, log):
+    """Перейти в AUTO(name), не оставляя ручной канал без восстановления.
+
+    Ошибка диска не блокирует аварийный failover: текущий процесс всё равно
+    ранжирует по name, а override в БД заставит следующий цикл повторить запись.
+    """
+    cfg.setdefault("countries", {})["strategy"] = name
+    error = ""
+    try:
+        config_store.save_country_strategy(cfg, name)
+    except Exception as e:  # отказ config.json не должен превращаться в чёрную дыру
+        error = "%s: %s" % (type(e).__name__, e)
+        pool.set_setting("selection_strategy_override", name)
+        log("  стратегия %s действует в памяти, запись config.json не удалась: %s" % (name, error))
+    set_auto_selection(pool, cfg, strategy=name, actor=actor, reason=reason)
+    if error:
+        # set_auto_selection очищает override штатного перехода — вернуть pending.
+        pool.set_setting("selection_strategy_override", name)
+    return {"strategy": name, "persist_error": error}
+
+
+def reconcile_strategy_override(cfg, pool, log=print):
+    """Дописать на диск стратегию failover, если прежняя попытка не удалась."""
+    name = pool.get_setting("selection_strategy_override")
+    if name not in country_mod.STRATEGIES:
+        return False
+    cfg.setdefault("countries", {})["strategy"] = name
+    try:
+        config_store.save_country_strategy(cfg, name)
+    except Exception as e:
+        log("  повтор записи стратегии %s отложен: %s" % (name, e))
+        return False
+    pool.set_setting("selection_strategy_override", None)
+    pool.log_event("selection-mode", actor="auto", result="config-repaired",
+                   detail="в config.json восстановлена стратегия %s" % name)
+    return True
+
+
+def release_manual_on_fault(cfg, pool, actor="auto", reason="confirmed-proxy-fault",
+                            log=print):
+    """MANUAL -> AUTO(speed) только после подтверждённого отказа самого прокси."""
+    st = selection_state(pool, cfg)
+    if st["mode"] != SELECTION_MANUAL:
+        return {"released": False, "strategy": country_mod.strategy(cfg)}
+    detail = ("%s; ручной %s (%s) отказал — включаю Скорость и отклик"
+              % (reason, st.get("manual_uid") or "?", st.get("manual_host") or "?"))
+    r = _persist_auto_strategy(cfg, pool, MANUAL_FALLBACK_STRATEGY, actor, detail, log)
+    pool.log_event("manual-failover", actor=actor, from_uid=st.get("manual_uid"),
+                   result=MANUAL_FALLBACK_STRATEGY,
+                   detail=detail + (("; config error: " + r["persist_error"])
+                                    if r["persist_error"] else ""))
+    r["released"] = True
+    return r
+
+
+def finish_explicit_apply(cfg, pool, uid, host, verify=None, source="manual",
+                          actor="user", log=print):
+    """Зафиксировать успешный apply и нормализовать маршрут/режим выбора.
+
+    source=manual закрепляет канал. strategy/setup/recovery оставляют AUTO. Если
+    apply победил из EMERGENCY/ROTATING, прямой WAN-маршрут обязательно снимается.
+    """
+    state_before = pool.get_setting("automat_state") or OK
+    if state_before in (EMERGENCY, ROTATING) or os.path.exists(EMERGENCY_FLAG):
+        emergency_off(cfg, log)
+        pool.set_settings({"emergency_since": None, "rotating_since": None,
+                           "emergency_retry_n": None, "emergency_manual": None})
+        pool.log_event("explicit-apply", actor=actor, to_uid=uid, result="leave-direct",
+                       detail="%s: рабочий канал применён, прямой WAN-выход снят" % source)
+    pool.set_setting("automat_state", OK)
+    if verify:
+        pool.set_egress(verify)
+    if source == "manual":
+        return set_manual_selection(pool, uid, host, actor=actor, reason="ручное «В бой»")
+    return set_auto_selection(pool, cfg, actor=actor, reason="apply source=%s" % source)
 
 
 # ------------------------------------------------------------- проверки сервера
@@ -211,7 +354,7 @@ def _cc_of(row):
 UNPROBED_SCORE = 100.0
 
 
-def rank_candidates(rows, cfg=None):
+def rank_candidates(rows, cfg=None, current_host=None):
     """Упорядочить кандидатов для выбора канала (§7.4 + политика стран §6.1).
 
     Найдено на приёмке 15.08 (снос №5): первый автоматический канал ушёл в Нигерию
@@ -253,7 +396,12 @@ def rank_candidates(rows, cfg=None):
         cr = country_mod.rating(_cc_of(r), agree, cfg)
         if cr is None:            # чёрный список — не выбираем и не тратим пробу
             continue
-        full, base = probe_mod.score_from_row(r, cfg)
+        # Превью/явная смена стратегии включают боевой канал. Его +15 stickiness
+        # обязана участвовать и в РЕШЕНИИ, а не только в цифре таблицы — иначе
+        # панель дёргала IP ради мизерной разницы. Ротация передаёт список без
+        # текущего host, поэтому аварийный failover бонусом не затрагивается.
+        full, base = probe_mod.score_from_row(
+            r, cfg, is_current=bool(current_host and probe_mod._rget(r, "host") == current_host))
         # при равных очках — кто быстрее по последнему замеру (приёмка №7: под
         # «скорость и отклик» лестница оценки квантует близкие задержки в один балл,
         # и 826 мс стояли в таблице ПОСЛЕ 925 мс просто по порядку вставки)
@@ -324,6 +472,134 @@ def _cooldown_after_fail(pool, uid, log):
     log("  cooldown %s: %d мин (провал #%d)" % (uid, secs // 60, fc))
 
 
+def _strategy_ranked_rows(cfg, providers, pool, current_host):
+    """Живой снимок пула для явного применения стратегии, включая боевой канал."""
+    rows = pool.rotation_candidates()
+    if providers is not None:
+        rows = [r for r in rows if r["provider"] in providers]
+    return rank_candidates(rows, cfg, current_host=current_host)
+
+
+def _converge_strategy_locked(cfg, providers, pool, log=print, actor="user"):
+    """Под общим agent-flock привести боевой канал к ПОСЛЕДНЕЙ стратегии на диске.
+
+    Это не обычный ``apply uid``. Пока фоновое задание ждало lock, человек мог
+    выбрать другую стратегию или нажать «В бой». Поэтому цель вычисляется заново,
+    MANUAL имеет приоритет, а кандидат после живой пробы ещё раз сравнивается с
+    текущим (+15 stickiness). Провайдер в ключе сортировки не участвует.
+    """
+    try:
+        config_store.refresh_country_strategy(cfg)
+    except (OSError, ValueError) as e:
+        log("  strategy-converge: не перечитал config.json, использую снимок: %s" % e)
+    desired = country_mod.strategy(cfg)
+    try:
+        sb = apply_mod.load_json(cfg["singbox_config"])
+    except (OSError, ValueError, KeyError) as e:
+        return {"ok": False, "action": "config-unavailable", "detail": str(e),
+                "strategy": desired, "tried": []}
+    current_host = apply_mod.current_upstream(sb)
+    selection = selection_state(pool, cfg, current_host)
+    if selection["mode"] == SELECTION_MANUAL:
+        detail = "ручной канал появился позже задания — стратегию не применяю"
+        pool.log_event("strategy-apply", actor=actor, result="manual-superseded", detail=detail)
+        return {"ok": True, "action": "manual-superseded", "detail": detail,
+                "strategy": desired, "tried": []}
+
+    tried = []
+    for _ in range(MAX_CANDIDATES_PER_CYCLE):
+        ranked = _strategy_ranked_rows(cfg, providers, pool, current_host)
+        if not ranked:
+            detail = "в активном пуле нет кандидатов для стратегии %s" % desired
+            pool.log_event("strategy-apply", actor=actor, result="empty", detail=detail)
+            return {"ok": False, "action": "empty", "detail": detail,
+                    "strategy": desired, "tried": tried}
+        top = ranked[0]
+        if current_host and top["host"] == current_host:
+            detail = "текущий %s уже лучший по %s" % (current_host, desired)
+            pool.log_event("strategy-apply", actor=actor, result="stable", detail=detail)
+            return {"ok": True, "action": "stable", "detail": detail,
+                    "strategy": desired, "uid": top["uid"], "tried": tried}
+
+        row = top
+        tried.append(row["uid"])
+        res = _probe(pool, providers, row, current_host, cfg)
+        if res.get("disqualified") or not res.get("ok"):
+            _cooldown_after_fail(pool, row["uid"], log)
+            continue
+
+        # Проба обновила score. Кандидат обязан остаться лучшим и после свежего
+        # замера; иначе меню создавало бессмысленную ротацию по старым данным.
+        try:
+            config_store.refresh_country_strategy(cfg)
+        except (OSError, ValueError):
+            pass
+        latest = country_mod.strategy(cfg)
+        if latest != desired:
+            detail = "задание устарело: %s -> %s; следующий worker применит новое" % (desired, latest)
+            pool.log_event("strategy-apply", actor=actor, result="stale", detail=detail)
+            return {"ok": True, "action": "stale", "detail": detail,
+                    "strategy": latest, "tried": tried}
+        if selection_state(pool, cfg, current_host)["mode"] == SELECTION_MANUAL:
+            detail = "во время пробы включён ручной режим — переключение отменено"
+            pool.log_event("strategy-apply", actor=actor, result="manual-superseded", detail=detail)
+            return {"ok": True, "action": "manual-superseded", "detail": detail,
+                    "strategy": latest, "tried": tried}
+        reranked = _strategy_ranked_rows(cfg, providers, pool, current_host)
+        if not reranked or (current_host and reranked[0]["host"] == current_host):
+            detail = "после свежей пробы текущий канал сохранил преимущество"
+            pool.log_event("strategy-apply", actor=actor, result="stable-after-probe", detail=detail)
+            return {"ok": True, "action": "stable-after-probe", "detail": detail,
+                    "strategy": latest, "tried": tried}
+        if reranked[0]["uid"] != row["uid"]:
+            # За время сетевой пробы изменился пул; на следующей итерации берём
+            # новый фактический top, а не применяем устаревший uid.
+            continue
+        try:
+            applied = apply_mod.apply_candidate(cfg, row, res, log=log, _locked=True)
+        except apply_mod.ApplyError as e:
+            pool.bump_fail(row["uid"])
+            _cooldown_after_fail(pool, row["uid"], log)
+            pool.log_event("strategy-apply", actor=actor, to_uid=row["uid"],
+                           result="fail", detail=str(e))
+            continue
+        pool.mark_used(row["uid"])
+        pool.clear_cooldown(row["uid"])
+        finish_explicit_apply(cfg, pool, row["uid"], row["host"], applied.get("verify"),
+                              source="strategy", actor=actor, log=log)
+        detail = "%s: %s -> %s (%s)" % (desired, current_host, row["host"], row["uid"])
+        pool.log_event("strategy-apply", actor=actor, to_uid=row["uid"],
+                       result="ok", detail=detail)
+        return {"ok": True, "action": "applied", "detail": detail,
+                "strategy": desired, "uid": row["uid"], "new_ip": row["host"],
+                "verify": applied.get("verify"), "tried": tried}
+
+    detail = "не удалось применить кандидатов стратегии %s: %s" % (desired, ", ".join(tried))
+    pool.log_event("strategy-apply", actor=actor, result="exhausted", detail=detail)
+    return {"ok": False, "action": "exhausted", "detail": detail,
+            "strategy": desired, "tried": tried}
+
+
+def converge_strategy(cfg, providers, pool, log=print, actor="user", wait_seconds=0):
+    """Сходящаяся фоновая задача стратегии с ожиданием общего agent-flock.
+
+    Несколько быстрых кликов безопасны: systemd запускает независимые workers,
+    каждый после получения lock читает последнюю цель; устаревшие становятся noop.
+    """
+    deadline = time.monotonic() + max(0, int(wait_seconds or 0))
+    while True:
+        try:
+            with apply_mod.Flock(cfg.get("lock") or "/run/vpn-agent.lock"):
+                return _converge_strategy_locked(cfg, providers, pool, log=log, actor=actor)
+        except apply_mod.ApplyError as e:
+            if "flock" not in str(e).lower() or time.monotonic() >= deadline:
+                detail = "agent занят: %s" % e
+                pool.log_event("strategy-apply", actor=actor, result="locked", detail=detail)
+                return {"ok": False, "action": "locked", "detail": detail,
+                        "strategy": country_mod.strategy(cfg), "tried": []}
+            time.sleep(min(2.0, max(0.1, deadline - time.monotonic())))
+
+
 # ============================================================ ОРКЕСТРАЦИЯ
 def rotate(cfg, providers, pool, alerter, reason="manual", actor="auto",
            log=print, force=False):
@@ -380,6 +656,21 @@ def rotate(cfg, providers, pool, alerter, reason="manual", actor="auto",
 
 
 def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, state_before):
+    reconcile_strategy_override(cfg, pool, log)
+    try:
+        current_host = apply_mod.current_upstream(apply_mod.load_json(cfg["singbox_config"]))
+    except (OSError, ValueError, KeyError):
+        current_host = None
+    selection = selection_state(pool, cfg, current_host)
+    if (selection["mode"] == SELECTION_MANUAL
+            and selection.get("manual_host") != current_host):
+        # Конфиг сменился в обход штатного explicit-apply (ручная правка/rollback
+        # старой версии). Закреплять уже несуществующий host опаснее, чем честно
+        # вернуться к измеряемому дефолту.
+        release_manual_on_fault(cfg, pool, actor=actor,
+                                reason="manual-pin-drift: live=%s" % (current_host or "none"),
+                                log=log)
+        selection = selection_state(pool, cfg, current_host)
     if state_before == EMERGENCY:
         pool.set_setting("emergency_last_retry", _now_iso())
         pool.set_setting("emergency_retry_n",
@@ -421,6 +712,10 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
         # WAN-выход с флагом никто больше не снимет (инвариант флага, ревью 1.3.0).
         if in_direct:
             _leave_direct(cfg, pool, alerter, egress, log, actor, state_before)
+        if selection["mode"] == SELECTION_MANUAL:
+            return _state(pool, result, OK, "manual-watch",
+                          "ручной канал %s здоров — стратегии не переключают его"
+                          % (selection.get("manual_uid") or current_host))
         return _state(pool, result, OK, "noop", "egress жив (%s) — делать нечего" % egress["egress_ip"])
 
     # --- F1: Telegram ≠ канал: ipify через tun0 жив, мёртв только api.telegram.org ---
@@ -489,6 +784,14 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
                                 state_before, in_direct)
 
     # --- ШАГ 4: ROTATING ---
+    # До этой точки дошёл только ПОДТВЕРЖДЁННЫЙ отказ самого канала: сеть сервера
+    # жива, self-heal/RETUNE не помогли, повтор verify провалился. Только здесь
+    # разрешено снять ручную фиксацию; единичный чих её не отменяет.
+    manual_release = release_manual_on_fault(
+        cfg, pool, actor=actor, reason="подтверждённый отказ перед ROTATING", log=log)
+    if manual_release.get("released"):
+        result["manual_released"] = True
+        result["fallback_strategy"] = MANUAL_FALLBACK_STRATEGY
     # F3: кнопка панели (reason=panel) — ручной запуск, лимит замен её не касается
     if pool.rotations_last_hour() >= MAX_REPLACEMENTS_PER_HOUR and reason not in ("manual", "panel"):
         log("  лимит замен ≤%d/час исчерпан — в аварийный режим до охлаждения"
@@ -740,6 +1043,17 @@ def switch_from_provider(cfg, providers, pool, alerter, from_provider,
     cur = _pool_row_by_host(pool, host) if host else None
     if cur is None or cur.get("provider") != from_provider:
         res.update(ok=True, detail="боевой канал не у %s — переключать нечего" % from_provider)
+        return res
+    selection = selection_state(pool, cfg, host)
+    if (selection["mode"] == SELECTION_MANUAL
+            and selection.get("manual_host") == host):
+        # Удаление API-ключа не равно отказу канала. Владелец явно закрепил IP —
+        # продолжаем пассивно следить за ним и отпустим только при подтверждённой
+        # смерти, уже в AUTO(speed). Иначе фоновый pool-refresh обходил MANUAL.
+        res.update(ok=True, manual=True,
+                   detail="боевой %s закреплён вручную; ключ %s удалён, но живой "
+                          "канал не меняю — при отказе включится Скорость и отклик"
+                          % (host, from_provider))
         return res
     if pool.get_setting("automat_frozen") == "1":
         # паузу уважаем как rotate: владелец сказал «руки прочь» — боевой держим,
@@ -1048,6 +1362,12 @@ def ensure_reserve(cfg, providers, pool, alerter, log, actor, min_reserve=1):
     полон). Покупаем только когда выбирать реально не из чего.
     Best-effort: ошибки/гейты глушим (докупка резерва не должна ронять цикл)."""
     try:
+        selection = selection_state(pool, cfg)
+        if selection["mode"] == SELECTION_MANUAL:
+            # В MANUAL допускаются пассивные refresh/probe уже купленного пула и
+            # продление самого якоря, но стратегия не покупает ничего проактивно.
+            log("  N+1: ручной канал закреплён — автоматическую докупку резерва пропускаю")
+            return {"ok": True, "bought": False, "skipped": "manual-selection"}
         sb = apply_mod.load_json(cfg["singbox_config"])
         current = apply_mod.current_upstream(sb)
         have = len(selectable_candidates(pool, cfg, current, providers))

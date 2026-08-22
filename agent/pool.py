@@ -504,9 +504,18 @@ class Pool:
         return row[0] if row else default
 
     def set_setting(self, key, value):
-        self.conn.execute("INSERT OR REPLACE INTO setting(key, value) VALUES(?, ?)",
-                          (key, None if value is None else str(value)))
-        self.conn.commit()
+        self.set_settings({key: value})
+
+    def set_settings(self, values):
+        """Атомарно записать несколько ключей состояния одним commit.
+
+        Переходы автомата (например AUTO <-> MANUAL) состоят из нескольких полей;
+        отдельные commit оставляли наблюдаемое наполовину записанное состояние.
+        """
+        with self.conn:  # commit целиком либо rollback целиком при ошибке executemany
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO setting(key, value) VALUES(?, ?)",
+                [(key, None if value is None else str(value)) for key, value in values.items()])
 
     def prolonged_today(self, uid):
         """Продлевали ли этот прокси сегодня — защита от повторов автопродления.

@@ -6,6 +6,7 @@
 и auto-гейты; в оценку живых проб бонус не идёт.
 """
 import datetime
+import math
 import os
 import tempfile
 import unittest
@@ -69,6 +70,19 @@ class TestBonusFormula(unittest.TestCase):
         self.assertNotEqual(money.stability_bonus(agg(ok=50, fail=0, days=2), cfg), 0.0)
         self.assertEqual(money.stability_bonus(agg(ok=50, fail=0, days=2)), 0.0,
                          "без конфига дефолтный порог строже")
+
+    def test_broken_config_is_normalized_instead_of_crashing_decisions(self):
+        cfg = {"stability": {"min_probes": "oops", "min_days": -5,
+                             "full_probes": 0, "full_days": "nan",
+                             "beta_prior": -1, "bonus_scale": "inf",
+                             "drop_penalty": -9, "drop_cap": -2,
+                             "bonus_cap": -20}}
+        sc = money.stability_cfg(cfg)
+        self.assertGreaterEqual(sc["full_probes"], sc["min_probes"])
+        self.assertGreaterEqual(sc["full_days"], max(1, sc["min_days"]))
+        self.assertGreater(sc["beta_prior"], 0)
+        self.assertTrue(all(math.isfinite(float(v)) for v in sc.values()))
+        self.assertTrue(math.isfinite(money.stability_bonus(agg(ok=1000, days=60), cfg)))
 
 
 class TestAggregation(unittest.TestCase):

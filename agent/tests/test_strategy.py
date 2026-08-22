@@ -4,8 +4,8 @@
 Стратегия меняет три вещи — где автоматике можно покупать, в каком порядке перебирать
 пул и сколько весит страна в оценке пробы. Это прямо про деньги и про то, из какой
 страны увидят клиента, поэтому проверяем каждое из трёх для каждой стратегии, а
-отдельно — что **ни одна** не открывает чёрный список и что по умолчанию поведение
-осталось ровно тем, каким было до появления выбора.
+отдельно — что **ни одна** не открывает чёрный список и что эксплуатационный
+дефолт — «Скорость и отклик».
 """
 import unittest
 
@@ -43,13 +43,13 @@ class TestSelection(unittest.TestCase):
     def test_three_strategies_and_default(self):
         # стратегии «только избранные» больше нет (приёмка №7): белый список умер
         self.assertEqual(list(country.STRATEGIES), ["reputation", "balanced", "speed"])
-        self.assertEqual(country.DEFAULT_STRATEGY, "reputation")
+        self.assertEqual(country.DEFAULT_STRATEGY, "speed")
 
     def test_unknown_or_missing_falls_back_to_default(self):
         # сюда же падают узлы со старой стратегией "whitelist" из конфига
         for c in (None, {}, cfg(), cfg("нет-такой"), cfg("whitelist"),
                   {"countries": {"strategy": ""}}):
-            self.assertEqual(country.strategy(c), "reputation")
+            self.assertEqual(country.strategy(c), "speed")
 
     def test_strategy_is_case_and_space_tolerant(self):
         self.assertEqual(country.strategy({"countries": {"strategy": " SPEED "}}), "speed")
@@ -104,7 +104,9 @@ class TestAutoBuyGate(unittest.TestCase):
         self.assertNotIn("kz", cands)
         self.assertIn("jp", cands)
         self.assertEqual(cands[:2], ["fi", "ee"])      # trusted вперёд, порядок списка сохранён
-        self.assertEqual(cands, money.buy_candidates({"countries": {"whitelist": WL}},
+        self.assertEqual(cands, money.buy_candidates(
+                                                     {"countries": {"whitelist": WL,
+                                                                    "strategy": "reputation"}},
                                                      available=["ng", "kz", "jp"]))
 
     def test_balanced_allows_risky_but_puts_it_last(self):
@@ -132,7 +134,7 @@ class TestCandidateOrder(unittest.TestCase):
                 row("de_slow", "de", probe_ok=1, latency_ms=400)]
 
     def test_country_first_strategies_prefer_reputation(self):
-        for sid in ("whitelist", "reputation"):
+        for sid in ("reputation",):
             out = [r["host"] for r in states.rank_candidates(self.rows(), cfg(sid))]
             self.assertEqual(out[0], "de_slow", sid)
 
@@ -192,9 +194,9 @@ class TestScoreWeight(unittest.TestCase):
         self.assertEqual(self.gap("balanced"), full / 2)
         self.assertEqual(self.gap("speed"), 0)                  # страна не влияет вообще
 
-    def test_default_config_scores_exactly_as_before(self):
+    def test_default_config_is_speed(self):
         r, res = self._row(), self._res("ng")
-        self.assertEqual(probe.score(r, res), probe.score(r, res, cfg=cfg("reputation")))
+        self.assertEqual(probe.score(r, res), probe.score(r, res, cfg=cfg("speed")))
         self.assertEqual(probe.score(r, res), probe.score(r, res, cfg=None))
 
     def test_equal_reputation_countries_score_equally(self):

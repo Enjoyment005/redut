@@ -32,7 +32,9 @@ class TestProbeNewChannels(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.pool = pool_mod.Pool(os.path.join(self.tmp.name, "state.db"), server="test")
-        self.cfg = {"server": "test"}
+        # Этот набор проверяет историческую сортировку «Репутация». Системный
+        # default теперь speed, поэтому намерение теста фиксируем явно.
+        self.cfg = {"server": "test", "countries": {"strategy": "reputation"}}
 
     def tearDown(self):
         self.pool.close()

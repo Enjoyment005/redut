@@ -96,9 +96,9 @@ MONEY_CONFIG = {
         # любую страну вне чёрного списка. Старый ключ countries.whitelist в
         # конфигах узлов просто игнорируется.
         # СТРАТЕГИЯ (17.08): насколько сильно страна влияет на выбор. Переключается
-        # в панели, значения — country.STRATEGIES: reputation (по умолчанию),
-        # balanced, speed (решают замеры). Старое значение whitelist падает на дефолт.
-        "strategy": "reputation",
+        # в панели, значения — country.STRATEGIES. По умолчанию speed; к нему же
+        # возвращается ручной канал после подтверждённого отказа.
+        "strategy": "speed",
     },
     # Автопродление «якоря» (решение владельца 15.08). Продление и покупка стоят
     # одинаково (4 ₽/сутки), но новый IP — холодный: перелогины, капчи, проверки
@@ -120,7 +120,7 @@ MONEY_CONFIG = {
 OPT = "/opt/vpn-panel"
 # update.py — ПЕРВЫМ: agent.py его импортирует, и на живом узле между заливкой
 # файлов есть окно, где тик крона (pool-refresh/heartbeat) поймал бы ImportError.
-AGENT_FILES = ["update.py", "agent.py", "pool.py", "probe.py", "apply.py", "money.py",
+AGENT_FILES = ["update.py", "config_store.py", "agent.py", "pool.py", "probe.py", "apply.py", "money.py",
                "states.py", "alerts.py", "country.py",
                "providers/__init__.py", "providers/base.py",
                "providers/proxyline.py", "providers/proxy6.py", "providers/proxywing.py"]

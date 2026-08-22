@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """vpn-agent — CLI ядра: status | list | probe [uid] | pool-refresh [--probe|--probe-new]
-| apply <uid> [--dry-run] | rollback  (фаза 1)
+| apply <uid> [--dry-run] | strategy-apply | rollback  (фаза 1)
 | buy [--country] | prolong <uid> --days N | drop <uid>  (фаза 2 — деньги §6)
 | rotate | emergency on|off | heartbeat-check  (фаза 3 — автоматика §8).
 
@@ -141,6 +141,13 @@ def cmd_status(cfg, args):
     elif p.get_setting("automat_frozen") == "1":
         extra = "  (автоматика на паузе FROZEN)"
     print("автомат: %s%s" % (st, extra))
+    sel = states_mod.selection_state(p, cfg, apply_mod.current_upstream(read_singbox(cfg) or {}))
+    if sel["mode"] == states_mod.SELECTION_MANUAL:
+        print("выбор канала: MANUAL %s (%s) с %s · при отказе -> speed"
+              % (sel.get("manual_uid") or "?", sel.get("manual_host") or "?",
+                 sel.get("manual_since") or "?"))
+    else:
+        print("выбор канала: AUTO · стратегия %s" % sel["strategy"])
     hb = p.last_heartbeat()
     hb_age = states_mod.age_seconds(hb)
     print("пульс агента: %s%s" % (hb or "нет",
@@ -450,12 +457,16 @@ def cmd_apply(cfg, args):
         p.set_role(row["uid"], "auto")
         p.log_event("role", actor="auto", to_uid=row["uid"], result="auto",
                     detail="успешный apply переводит off->auto (П9)")
+    source = getattr(args, "source", "manual")
+    states_mod.finish_explicit_apply(cfg, p, row["uid"], row["host"], r.get("verify"),
+                                     source=source, actor="user", log=print)
     p.log_event("apply", actor="user", from_uid=None, to_uid=row["uid"], result="ok",
                 detail=json.dumps({"old_ip": r["old_ip"], "new_ip": r["new_ip"],
-                                   "verify": r["verify"]}, ensure_ascii=False))
-    print("✅ Применён %s: %s -> %s, egress=%s (%s), tg=%s"
+                                   "verify": r["verify"], "source": source}, ensure_ascii=False))
+    print("✅ Применён %s: %s -> %s, egress=%s (%s), tg=%s · режим=%s"
           % (row["uid"], r["old_ip"], r["new_ip"], r["verify"]["egress_ip"],
-             r["verify"]["exit_cc"], r["verify"]["tg_code"]))
+             r["verify"]["exit_cc"], r["verify"]["tg_code"],
+             states_mod.selection_state(p, cfg, row["host"])["mode"]))
     p.close()
     return 0
 
@@ -475,11 +486,39 @@ def cmd_rollback(cfg, args):
     p.log_event("rollback", actor="user", result="ok" if r["ok"] else "verify-fail",
                 detail=json.dumps({"backup": r["backup"], "bad_ip": r["bad_ip"],
                                    "good_ip": r["good_ip"]}, ensure_ascii=False))
+    if r["ok"]:
+        row = next((x for x in p.list(include_gone=True) if x["host"] == r["good_ip"]), None)
+        states_mod.finish_explicit_apply(
+            cfg, p, (row or {}).get("uid") or ("live:%s" % r["good_ip"]), r["good_ip"],
+            r.get("verify"), source="manual", actor="user", log=print)
     print(("✅" if r["ok"] else "⚠️") + " Откат: %s -> %s (бэкап %s), verify %s"
           % (r["bad_ip"], r["good_ip"], os.path.basename(r["backup"]),
              "OK" if r["ok"] else "НЕ ПРОШЁЛ: " + r["verify"]["why"]))
     p.close()
     return 0 if r["ok"] else 1
+
+
+def cmd_strategy_apply(cfg, args):
+    """Свести live-канал к последней стратегии (worker кнопки панели).
+
+    В отличие от ``apply uid`` цель не зашита в момент клика: после ожидания
+    общего lock заново читаются config.json, MANUAL и живой пул. Поэтому быстрые
+    клики не дают старому заданию победить новое.
+    """
+    if os.name != "posix":
+        print("Живое применение стратегии доступно только на сервере (Linux)")
+        return 1
+    secrets, _ = load_secrets()
+    providers = make_providers(secrets)
+    p = open_pool(cfg)
+    try:
+        r = states_mod.converge_strategy(
+            cfg, providers, p, log=print, actor="user",
+            wait_seconds=getattr(args, "wait_lock", 0))
+        print("strategy-apply: %s · %s" % (r.get("action"), r.get("detail")))
+        return 0 if r.get("ok") else 1
+    finally:
+        p.close()
 
 
 # ------------------------------------------------------------- деньги (§6, фаза 2)
@@ -880,6 +919,12 @@ def main(argv=None):
     sp = sub.add_parser("apply", help="применить кандидата (проба -> §9)")
     sp.add_argument("uid")
     sp.add_argument("--dry-run", action="store_true", help="проба+сборка+check, без применения")
+    sp.add_argument("--source", choices=("manual", "strategy", "setup", "recovery"),
+                    default="manual", help=argparse.SUPPRESS)
+    sp = sub.add_parser("strategy-apply",
+                        help="привести канал к последней выбранной стратегии (worker панели)")
+    sp.add_argument("--wait-lock", type=int, default=0, metavar="SEC",
+                    help=argparse.SUPPRESS)
     sp = sub.add_parser("rollback", help="откат на бэкап из кольца")
     sp.add_argument("--backup", help="конкретный файл кольца (дефолт: самый свежий)")
     sp = sub.add_parser("buy", help="⚠️ купить прокси (PROXY6, деньги §6.2)")
@@ -923,7 +968,8 @@ def main(argv=None):
 
     cfg = load_config(args.config)
     handlers = {"status": cmd_status, "list": cmd_list, "pool-refresh": cmd_pool_refresh,
-                "probe": cmd_probe, "apply": cmd_apply, "rollback": cmd_rollback,
+                "probe": cmd_probe, "apply": cmd_apply, "strategy-apply": cmd_strategy_apply,
+                "rollback": cmd_rollback,
                 "buy": cmd_buy, "prolong": cmd_prolong, "drop": cmd_drop,
                 "rotate": cmd_rotate, "emergency": cmd_emergency,
                 "switch-provider": cmd_switch_provider,

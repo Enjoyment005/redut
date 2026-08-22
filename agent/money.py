@@ -24,6 +24,7 @@ buy НЕ повторяем, а ищем `getproxy?descr=<тот же>`: про�
 """
 import datetime
 import json
+import math
 import re
 import secrets as _secrets
 
@@ -69,9 +70,39 @@ DEFAULT_STABILITY = {
 
 
 def stability_cfg(cfg):
-    m = dict(DEFAULT_STABILITY)
-    m.update((cfg or {}).get("stability") or {})
-    return m
+    """Нормализованные безопасные параметры обучения.
+
+    Файл правится по SSH, поэтому опечатка не должна уронить покупки/панель
+    делением на ноль, NaN или ``int('oops')``. Некорректное поле откатывается к
+    дефолту, диапазоны зажимаются, full-порог не может быть ниже min-порога.
+    """
+    raw = (cfg or {}).get("stability") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    def number(key, integer=False, minimum=0.0):
+        try:
+            value = float(raw.get(key, DEFAULT_STABILITY[key]))
+        except (TypeError, ValueError):
+            value = float(DEFAULT_STABILITY[key])
+        if not math.isfinite(value):
+            value = float(DEFAULT_STABILITY[key])
+        value = max(float(minimum), value)
+        return int(value) if integer else value
+
+    min_probes = number("min_probes", integer=True, minimum=1)
+    min_days = number("min_days", minimum=0)
+    return {
+        "min_probes": min_probes,
+        "min_days": min_days,
+        "full_probes": max(min_probes, number("full_probes", integer=True, minimum=1)),
+        "full_days": max(min_days, number("full_days", minimum=1)),
+        "beta_prior": number("beta_prior", minimum=0.01),
+        "bonus_scale": number("bonus_scale", minimum=0),
+        "drop_penalty": number("drop_penalty", minimum=0),
+        "drop_cap": number("drop_cap", minimum=0),
+        "bonus_cap": number("bonus_cap", minimum=0),
+    }
 
 
 def _days_seen(agg, now=None):

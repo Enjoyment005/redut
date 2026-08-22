@@ -76,10 +76,11 @@ class TestHardBlock(unittest.TestCase):
         """Бывшие в блоке страны СНГ теперь разрешены, но с низкой оценкой —
         автоматика их сама не покупает, человек может."""
         import country
+        cfg = {"countries": {"strategy": "reputation"}}
         for cc in ("kz", "kg", "tj", "uz", "tm", "am", "az", "md", "ge"):
             self.assertNotIn(cc, probe.HARD_BLOCK_CC)
-            self.assertIsNotNone(country.rating(cc))
-            self.assertFalse(country.auto_allowed(cc))
+            self.assertIsNotNone(country.rating(cc, cfg=cfg))
+            self.assertFalse(country.auto_allowed(cc, cfg=cfg))
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@
   GET  /api/ipinfo                  технический паспорт текущего IP выхода (ASN, оператор,
                                     город, пояс, PTR, датацентр; кэш по IP — для карты)
   --- настройки (§12; лимиты трат по-прежнему только по SSH) ---
-  GET  /api/strategy                четыре стратегии выбора стран + предпросмотр на живых данных
+  GET  /api/strategy                три стратегии выбора стран + предпросмотр на живых данных
   POST /api/strategy                {strategy} — сменить правило (config.json, без рестарта)
   --- ключи провайдеров (§12; сам ключ обратно не отдаётся никогда) ---
   GET  /api/key/status              по провайдеру: задан ли ключ, хвост, баланс, живых в пуле
@@ -64,6 +64,7 @@ sys.path.insert(0, PANEL_DIR)
 
 import alerts as alerts_mod        # noqa: E402
 import apply as apply_mod          # noqa: E402
+import config_store                # noqa: E402
 import country as country_mod      # noqa: E402
 import money as money_mod          # noqa: E402
 import pool as pool_mod            # noqa: E402
@@ -233,13 +234,19 @@ def _strategy_switch_kick(uid):
     время сетевых проб. uid приходит из нашей БД, а не из тела запроса.
     """
     if os.name != "posix":
-        threading.Thread(target=lambda: _run_agent(["apply", uid], timeout=900),
+        threading.Thread(target=lambda: _run_agent(
+            ["strategy-apply", "--wait-lock", "900"], timeout=960),
                          name="strategy-switch", daemon=True).start()
         return True, ""
+    # Имя уникально: фиксированный redut-strategy-switch терял второй быстрый
+    # клик как «unit already exists». Workers сериализует /run/vpn-agent.lock;
+    # каждый после ожидания вычисляет цель заново, поэтому последний выбор сходится.
+    unit = "redut-strategy-%x" % time.time_ns()
     rc, out = apply_mod.run_cmd(["systemd-run", "--collect", "-p", "RuntimeMaxSec=900",
-                                 "--unit", "redut-strategy-switch",
-                                 "/usr/local/bin/vpn-agent", "apply", uid])
-    if rc == 0 or "already" in (out or "").lower():
+                                 "--unit", unit,
+                                 "/usr/local/bin/vpn-agent", "strategy-apply",
+                                 "--wait-lock", "840"])
+    if rc == 0:
         return True, ""
     return False, (out or "systemd-run rc=%s" % rc)[:200]
 
@@ -394,20 +401,14 @@ class App:
         Лимиты трат остаются недосягаемы из браузера (§6.2) — здесь только одна строка."""
         if name not in country_mod.STRATEGIES:
             raise ValueError("неизвестная стратегия %r" % name)
-        path = self.cfg.get("_source") or ETC_CONFIG
-        with _CONFIG_LOCK:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-            data.setdefault("countries", {})["strategy"] = name
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            try:
-                os.chmod(tmp, 0o644)     # конфиг читает и агент из-под cron
-            except OSError:
-                pass
-            os.replace(tmp, path)
-            self.cfg.setdefault("countries", {})["strategy"] = name
+        config_store.save_country_strategy(self.cfg, name)
+
+    def refresh_strategy(self):
+        """Подхватить MANUAL->AUTO(speed), записанный отдельным процессом агента."""
+        try:
+            return config_store.refresh_country_strategy(self.cfg)
+        except (OSError, ValueError):
+            return None
 
     def save_update_auto(self, on):
         """Тумблер автообновления: точечная правка config.json (по образцу save_strategy —
@@ -717,6 +718,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/rollback":
             r = apply_mod.rollback_from_ring(APP.cfg)
             with _DB_LOCK:
+                row = next((x for x in APP.pool.list(include_gone=True)
+                            if x["host"] == r["good_ip"]), None) if r.get("ok") else None
+                if r.get("ok"):
+                    states_mod.finish_explicit_apply(
+                        APP.cfg, APP.pool, (row or {}).get("uid") or ("live:%s" % r["good_ip"]),
+                        r["good_ip"], r.get("verify"), source="manual", actor="user",
+                        log=lambda m: None)
                 APP.pool.log_event("rollback", actor="user", result="ok" if r["ok"] else "verify-fail",
                                    detail=json.dumps({"bad": r["bad_ip"], "good": r["good_ip"]}, ensure_ascii=False),
                                    src_ip=self._client_ip())
@@ -892,7 +900,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------ стратегия стран (§6.1)
     def _strategy_state(self):
-        """GET /api/strategy: четыре стратегии + что изменится ПРЯМО СЕЙЧАС.
+        """GET /api/strategy: три стратегии + что изменится ПРЯМО СЕЙЧАС.
 
         Абстрактное описание («репутация важнее скорости») человеку мало что говорит,
         поэтому к каждой стратегии считаем живые факты: кого из нынешнего пула она
@@ -900,9 +908,11 @@ class Handler(BaseHTTPRequestHandler):
         порядком таблицы пула; раньше текущий исключался, и все стратегии «выбирали»
         одного и того же запасного), какие страны пула проходят её авто-гейт покупки
         и где докупка разрешена. Всё считается на месте, без обращений к провайдеру."""
+        APP.refresh_strategy()
         cur_host = APP.current_host()
         with _DB_LOCK:
             rows = APP.pool.rotation_candidates()
+            selection = states_mod.selection_state(APP.pool, APP.cfg, cur_host)
         rows = [r for r in rows if r["provider"] in APP.providers]   # только активные (П7)
         pool_cc = []
         for r in rows:
@@ -914,7 +924,7 @@ class Handler(BaseHTTPRequestHandler):
             cfg = dict(APP.cfg)
             cfg["countries"] = dict(APP.cfg.get("countries") or {}, strategy=sid)
             st = country_mod.strategy_info(name=sid)
-            top = states_mod.rank_candidates(rows, cfg)[:1]
+            top = states_mod.rank_candidates(rows, cfg, current_host=cur_host)[:1]
             with _DB_LOCK:   # F8: buy_candidates читает выученную стабильность из БД
                 buy = money_mod.buy_candidates(cfg, available=pool_cc, pool=APP.pool)
             pick = self._brief(top[0]) if top else None
@@ -924,13 +934,20 @@ class Handler(BaseHTTPRequestHandler):
             # отличаются друг от друга на живых данных (а не только за кромкой топ-8)
             pool_pass = [c for c in pool_cc if country_mod.auto_allowed(c, True, cfg)]
             out.append({"id": sid, "title": st["title"], "short": st["short"], "desc": st["desc"],
-                        "current": sid == country_mod.strategy(APP.cfg),
+                        "current": (selection["mode"] == states_mod.SELECTION_AUTO
+                                    and sid == country_mod.strategy(APP.cfg)),
                         "buy": buy[:8], "buy_total": len(buy),
                         "buy_mode": ("gated" if st.get("auto_gate") else "open"),
                         "pool_pass": pool_pass,
                         "pool_block": [c for c in pool_cc if c not in pool_pass],
                         "pick": pick})
-        return {"current": country_mod.strategy(APP.cfg), "strategies": out,
+        return {"current": country_mod.strategy(APP.cfg), "mode": selection["mode"],
+                "manual": {"uid": selection.get("manual_uid"),
+                           "host": selection.get("manual_host"),
+                           "since": selection.get("manual_since")}
+                          if selection["mode"] == states_mod.SELECTION_MANUAL else None,
+                "fallback_strategy": states_mod.MANUAL_FALLBACK_STRATEGY,
+                "strategies": out,
                 "blacklist": sorted(country_mod.blacklist(APP.cfg)),
                 "pool_size": len(rows)}
 
@@ -948,10 +965,17 @@ class Handler(BaseHTTPRequestHandler):
         name = str(body.get("strategy") or "").strip().lower()
         if name not in country_mod.STRATEGIES:
             return self._json(400, {"error": "неизвестная стратегия"})
+        APP.refresh_strategy()
         was = country_mod.strategy(APP.cfg)
-        if name != was:
-            APP.save_strategy(name)
-            with _DB_LOCK:
+        with _DB_LOCK:
+            was_mode = states_mod.selection_state(APP.pool, APP.cfg)["mode"]
+        # Пишем и при повторном выборе: у старого/мигрированного config.json ключа
+        # может не быть, а явный выбор пользователя должен стать устойчивым.
+        APP.save_strategy(name)
+        with _DB_LOCK:
+            states_mod.set_auto_selection(APP.pool, APP.cfg, strategy=name, actor="user",
+                                          reason="стратегия выбрана в панели")
+            if name != was:
                 APP.pool.log_event("strategy", actor="user", result=name,
                                    detail="было: %s" % was, src_ip=self._client_ip())
         state = self._strategy_state()
@@ -969,7 +993,8 @@ class Handler(BaseHTTPRequestHandler):
                                    detail="%s -> %s%s" % (name, pick["uid"],
                                           (": " + switch_error) if switch_error else ""),
                                    src_ip=self._client_ip())
-        state.update({"ok": True, "was": was, "changed": name != was,
+        state.update({"ok": True, "was": was, "was_mode": was_mode,
+                      "changed": name != was, "mode_changed": was_mode != states_mod.SELECTION_AUTO,
                       "switch_needed": switch_needed, "switch_started": switch_started,
                       "switch_error": switch_error, "target": pick})
         return self._json(200, state)
@@ -1144,6 +1169,7 @@ class Handler(BaseHTTPRequestHandler):
             APP.write_secrets(merge_key(data, name, None))
         cur_host = APP.current_host()
         with _DB_LOCK:
+            selection = states_mod.selection_state(APP.pool, APP.cfg, cur_host)
             battle = None
             if cur_host:
                 battle = APP.pool.conn.execute(
@@ -1155,20 +1181,29 @@ class Handler(BaseHTTPRequestHandler):
             APP.pool.log_event("key-del", actor="user", result="ok",
                                detail="%s: удалено из пула %d, баланс убран%s"
                                % (name, pr["deleted"],
-                                  "; боевой на нём — переключаю по стратегии" if battle else ""),
+                                  ("; боевой закреплён вручную — сохраняю до отказа"
+                                   if battle and selection["mode"] == states_mod.SELECTION_MANUAL
+                                   else "; боевой на нём — переключаю по стратегии"
+                                   if battle else "")),
                                src_ip=self._client_ip())
         warning = ""
         switching = False
         if battle:
-            switching, err = _switch_provider_kick(name)
-            warning = ("Боевой канал принадлежит %s: он продолжает работать, а панель уже "
-                       "переключает его на другого провайдера по текущей стратегии "
-                       "(проверка → переключение → проверка → автооткат). Если живых "
-                       "кандидатов не найдётся, канал останется как есть, письмо расскажет, "
-                       "и попытка повторится при следующем обновлении пула" % name)
-            if err:
-                warning += ". Не удалось запустить переключение сейчас (%s) — " \
-                           "его сделает ближайший цикл обновления пула" % err
+            if selection["mode"] == states_mod.SELECTION_MANUAL:
+                warning = ("Боевой канал %s закреплён вручную. Ключ %s удалён, но пока "
+                           "канал здоров, Redut его не меняет. Если прокси подтвердит отказ, "
+                           "ручной режим снимется и включится «Скорость и отклик»."
+                           % (cur_host, name))
+            else:
+                switching, err = _switch_provider_kick(name)
+                warning = ("Боевой канал принадлежит %s: он продолжает работать, а панель уже "
+                           "переключает его на другого провайдера по текущей стратегии "
+                           "(проверка → переключение → проверка → автооткат). Если живых "
+                           "кандидатов не найдётся, канал останется как есть, письмо расскажет, "
+                           "и попытка повторится при следующем обновлении пула" % name)
+                if err:
+                    warning += ". Не удалось запустить переключение сейчас (%s) — " \
+                               "его сделает ближайший цикл обновления пула" % err
         return self._json(200, {"ok": True, "deleted": True, "provider": name,
                                 "purged": pr["deleted"], "battle": bool(battle),
                                 "switch_started": switching, "warning": warning})
@@ -1337,13 +1372,19 @@ class Handler(BaseHTTPRequestHandler):
                 APP.pool.set_role(row["uid"], "auto")
                 APP.pool.log_event("role", actor="auto", to_uid=row["uid"], result="auto",
                                    detail="успешный apply переводит off->auto (П9)")
+            selection = states_mod.finish_explicit_apply(
+                APP.cfg, APP.pool, row["uid"], row["host"], r.get("verify"),
+                source="manual", actor="user", log=lambda m: None)
             APP.pool.log_event("apply", actor="user", to_uid=row["uid"], result="ok",
                                detail=json.dumps({"old_ip": r["old_ip"], "new_ip": r["new_ip"],
-                                                  "verify": r["verify"]}, ensure_ascii=False),
+                                                  "verify": r["verify"], "source": "manual"},
+                                                 ensure_ascii=False),
                                src_ip=self._client_ip())
-            APP.pool.set_egress(r.get("verify"))
         return self._json(200, {"ok": True, "old_ip": r["old_ip"], "new_ip": r["new_ip"],
-                                "egress": r["verify"]["egress_ip"], "egress_cc": r["verify"]["exit_cc"]})
+                                "egress": r["verify"]["egress_ip"],
+                                "egress_cc": r["verify"]["exit_cc"],
+                                "selection_mode": selection["mode"],
+                                "fallback_strategy": states_mod.MANUAL_FALLBACK_STRATEGY})
 
     # ------------------------------------------------ логин
     def _do_login(self):
@@ -1605,7 +1646,9 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------ сборка status/pool
     def _status(self):
+        APP.refresh_strategy()
         sb = APP.read_singbox() or {}
+        cur_host = apply_mod.current_upstream(sb)
         out = {"server": APP.cfg.get("server"), "role": APP.cfg.get("role"),
                "version": update_mod.node_version(),
                "subnet": APP.cfg.get("subnet"), "final": (sb.get("route") or {}).get("final"),
@@ -1658,6 +1701,7 @@ class Handler(BaseHTTPRequestHandler):
             out["emergency_since"] = APP.pool.get_setting("emergency_since")
             out["frozen"] = APP.pool.get_setting("automat_frozen") == "1"
             out["heartbeat"] = APP.pool.last_heartbeat()
+            selection = states_mod.selection_state(APP.pool, APP.cfg, cur_host)
             # последняя проба выхода: сам статус её не делает (curl через tun0 — до 15 с
             # на каждый опрос), отдаём то, что записали панель или агент §8.
             eg = APP.pool.get_egress()
@@ -1669,8 +1713,16 @@ class Handler(BaseHTTPRequestHandler):
         out["cc_blacklist"] = sorted(country_mod.blacklist(APP.cfg))
         st = country_mod.strategy_info(APP.cfg)
         out["strategy"] = st["id"]
-        out["strategy_title"] = st["title"]
-        out["strategy_short"] = st["short"]
+        out["selection_mode"] = selection["mode"]
+        out["manual_uid"] = selection.get("manual_uid")
+        out["manual_host"] = selection.get("manual_host")
+        out["manual_since"] = selection.get("manual_since")
+        out["manual_fallback_strategy"] = states_mod.MANUAL_FALLBACK_STRATEGY
+        out["strategy_title"] = ("Ручной канал" if selection["mode"] == states_mod.SELECTION_MANUAL
+                                 else st["title"])
+        out["strategy_short"] = (
+            "стратегии отключены; при подтверждённом отказе включится «Скорость и отклик»"
+            if selection["mode"] == states_mod.SELECTION_MANUAL else st["short"])
         out["auto_prolong"] = states_mod.auto_prolong_cfg(APP.cfg)
         return out
 

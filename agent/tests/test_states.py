@@ -13,6 +13,8 @@ import _ctx  # noqa: F401  (кладёт panel/ в sys.path)
 import pool as pool_mod
 import states
 
+REP = {"countries": {"strategy": "reputation"}}
+
 
 def mk_norm(ext_id, host, country="de"):
     return {"provider": "proxy6", "ext_id": str(ext_id), "ip": host, "host": host,
@@ -40,21 +42,21 @@ class TestRankCandidates(unittest.TestCase):
         # ровно баг сноса №5 (первый канал ушёл в ng при живой lv в пуле)
         rows = [self._row("ng", "ng", exit_cc="ng", probe_ok=1, score=60.0),
                 self._row("lv", "lv")]
-        out = [r["host"] for r in states.rank_candidates(rows)]
+        out = [r["host"] for r in states.rank_candidates(rows, REP)]
         self.assertEqual(out[0], "lv")
         self.assertEqual(out, ["lv", "ng"])
 
     def test_probed_trusted_before_raw_trusted(self):
         rows = [self._row("lv_raw", "lv"),
                 self._row("de_ok", "de", exit_cc="de", probe_ok=1, score=150.0)]
-        out = [r["host"] for r in states.rank_candidates(rows)]
+        out = [r["host"] for r in states.rank_candidates(rows, REP)]
         self.assertEqual(out, ["de_ok", "lv_raw"])   # при равной стране — выше по реальному score
 
     def test_exit_cc_overrides_declared_country(self):
         # продан как lv, но geoip видит ng -> ранжируем по фактической стране
         rows = [self._row("x", "lv", exit_cc="ng", probe_ok=1, score=60.0),
                 self._row("y", "fi")]
-        out = [r["host"] for r in states.rank_candidates(rows)]
+        out = [r["host"] for r in states.rank_candidates(rows, REP)]
         self.assertEqual(out[0], "y")
 
 
@@ -186,7 +188,8 @@ class TestPoolAutomat(unittest.TestCase):
         self._addc(1, "ng", "ng", probe_ok=1, score=60.0)
         self._addc(2, "lv", "lv", probe_ok=0, score=None)
         self._addc(3, "mx", "mx", probe_ok=0, score=None)
-        sel = [r["host"] for r in states.selectable_candidates(self.pool, {"role": None}, None)]
+        sel = [r["host"] for r in states.selectable_candidates(
+            self.pool, {"role": None, **REP}, None)]
         self.assertEqual(sel[0], "lv")           # trusted сырой — первым, раньше пробованной ng
         # ng и mx обе low-trust; среди равной страны пробованный рабочий (ng) выше сырого (mx)
         self.assertEqual(sel, ["lv", "ng", "mx"])

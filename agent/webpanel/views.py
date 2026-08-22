@@ -543,8 +543,9 @@ _DASH_HTML = """
       и в каком порядке перебирать прокси из пула.<br>
       <b>Россия, Украина и Беларусь запрещены при любой стратегии</b> — это запрет в коде, а не
       настройка.<br>
-      Смена правила <b>не трогает текущий канал</b>: он продолжит работать, а новое правило
-      сработает при следующей смене — ротации, кнопке «В бой» или покупке.</div>
+      Смена правила <b>применяется сразу</b>: панель пересчитает пул по новой стратегии и,
+      если другой канал действительно лучше, безопасно проверит его, переключится и откатится при провале.
+      Ручная фиксация при этом снимается.</div>
     <div class="sub" id="stmeta" style="margin-bottom:4px"></div>
     <div id="strategies"></div>
     </div>
@@ -1212,7 +1213,7 @@ async function loadPool(){const rows=(await api('/api/pool')).proxies;const tb=d
         roles.map(r=>'<option'+(r==p.role?' selected':'')+'>'+r+'</option>').join('')+'</select></td>'+
       '<td><button class="btn s tiny" onclick="probe(this,\\''+esc(p.uid)+'\\')" title="Проверить прокси — безопасно, ничего не меняет">Тест</button> '+
         '<button class="btn g tiny" onclick="apply(this,\\''+esc(p.uid)+'\\')"'+(inact?' disabled':'')+
-        ' title="'+(inact?'У провайдера нет ключа — панель не управляет этим прокси':'Сделать боевым: проверка → переключение → проверка → автооткат при провале. Для off после успеха роль станет auto')+'">В бой</button> '+
+        ' title="'+(inact?'У провайдера нет ключа — панель не управляет этим прокси':'Сделать боевым и закрепить вручную: проверка → переключение → проверка → автооткат. При отказе вернётся AUTO(speed)')+'">В бой</button> '+
         '<button class="btn a tiny" onclick="prolong(this,\\''+esc(p.uid)+'\\')"'+(inact?' disabled':'')+
         ' title="'+(inact?'У провайдера нет ключа — продлить нечем':'Продлить аренду — тратит деньги')+'">Продлить</button> '+
         '<button class="btn r tiny" onclick="del(this,\\''+esc(p.uid)+'\\')"'+((p.provider!='proxy6'||inact)?' disabled':'')+
@@ -1250,6 +1251,9 @@ async function loadMoney(){try{const m=await api('/api/money');const L=m.limits|
   ].join('')}catch(e){}}
 /* какое правило выбора стран сейчас действует — подробности в карточке ниже */
 function stTile(){const s=window.__S||{};
+  if(s.selection_mode==='manual')return tile('выбор канала','<span class="warn">ручной</span> · '+esc(s.manual_host||'—'),
+    'Канал закреплён человеком: стратегии не переключают его и не покупают резерв. Redut продолжает проверки и продление. '+
+    'Только после подтверждённого отказа фиксация снимется и включится «Скорость и отклик».');
   return tile('стратегия стран',esc(s.strategy_title||'—'),
     (s.strategy_short?(s.strategy_short+'. '):'')+
     'Правило, как панель выбирает между надёжной страной и хорошими замерами: где ей разрешено '+
@@ -1320,8 +1324,10 @@ async function del(btn,uid){if(!confirm('Удалить прокси '+uid+' Н�
    Тексты стратегий приходят с сервера (country.STRATEGIES) — там же, где сама логика,
    чтобы описание в панели не разошлось с поведением. */
 async function loadStrategy(){try{const r=await api('/api/strategy');
-  document.getElementById('stmeta').textContent='пул для выбора: '+r.pool_size+' шт · запрещено навсегда: '+
-    (r.blacklist||[]).map(country).join(', ');
+  document.getElementById('stmeta').textContent=(r.mode==='manual'
+    ?('РУЧНОЙ РЕЖИМ · закреплён '+esc((r.manual||{}).host||'?')+
+      ' · стратегии ниже не активны; при отказе включится «Скорость и отклик» · ')
+    :'')+'пул для выбора: '+r.pool_size+' шт · запрещено навсегда: '+(r.blacklist||[]).map(country).join(', ');
   document.getElementById('strategies').innerHTML=(r.strategies||[]).map(s=>{
     /* П3: строка «Сейчас с ней» обязана быть стратегийно-разной — и по правилу
        докупки, и по судьбе стран нынешнего пула, и по выбору канала */
@@ -1334,7 +1340,7 @@ async function loadStrategy(){try{const r=await api('/api/strategy');
       (s.pool_pass&&s.pool_pass.length?' — страны пула ('+names(s.pool_pass)+') разрешены':'')+
       '; сначала пробует: '+(names((s.buy||[]).slice(0,4))||'—');
     const pick=s.pick?(esc(s.pick.host)+(s.pick.cc?(' · '+country(s.pick.cc)):'')+
-      (s.pick.is_current?' — текущий канал, останется':' — сменило бы при ближайшей ротации')):'пул пуст';
+      (s.pick.is_current?' — текущий канал, останется':' — переключится сразу после включения')):'пул пуст';
     return '<div class="step" style="margin-top:10px'+(s.current?';border-color:rgba(5,255,161,.45);background:rgba(5,255,161,.05)':'')+'">'+
       '<b>'+esc(s.title)+'</b>'+
       (s.current?'<span class="pill ok">включена сейчас</span>':'<span class="pill">'+esc(s.short)+'</span>')+
@@ -1348,13 +1354,14 @@ async function loadStrategy(){try{const r=await api('/api/strategy');
 
 async function setStrategy(id,title){
   if(!confirm('Включить стратегию «'+title+'»?\\n\\nПанель сразу выберет лучший канал по новому правилу. '+
-    'Если это не текущий прокси, она безопасно проверит новый, переключит сервер и сама откатится при провале.'))return;
+    'Если сейчас включён ручной режим, его фиксация снимется. Если лучший — не текущий прокси, панель безопасно '+
+    'проверит новый, переключит сервер и сама откатится при провале.'))return;
   try{const r=await api('/api/strategy',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({strategy:id})});
     if(r.switch_started)toast('Стратегия «'+title+'» включена — переключаю на '+
       esc((r.target||{}).host||'лучший канал')+' по схеме проверка → смена → проверка','warn');
     else if(r.switch_error)toast('Стратегия включена, но переключение не запустилось: '+r.switch_error,'bad');
-    else toast(r.changed?('Стратегия «'+title+'» включена; текущий канал уже лучший по этому правилу'):
+    else toast((r.changed||r.mode_changed)?('Стратегия «'+title+'» включена; текущий канал уже лучший по этому правилу'):
       'Эта стратегия и так была включена','ok');
     await loadStrategy();await loadStatus();await loadMoney();await loadPool();
     if(r.switch_started)setTimeout(async()=>{try{await reloadAll()}catch(_){}},15000)}
@@ -1588,11 +1595,13 @@ async function probe(btn,uid){btn.disabled=true;toast('Проверяю '+uid+'�
   toast(uid+': '+(r.ok?'годен, оценка '+r.score:'не прошёл ('+(r.disqualified||'')+')')+', выход '+(r.exit_ip||'—')+
     (r.exit_cc?(' из '+country(r.exit_cc)):''),r.ok?'ok':'bad');await loadPool()}catch(e){toast(e.message,'bad')}btn.disabled=false}
 
-async function apply(btn,uid){if(!confirm('Сделать '+uid+' боевым?\\n\\nПорядок: проверка прокси → переключение сервера → повторная проверка. '+
-    'Если после переключения станет хуже, панель вернёт прежний прокси сама. Клиенты в этот момент могут на пару секунд потерять связь.'))return;
+async function apply(btn,uid){if(!confirm('Сделать '+uid+' боевым и закрепить вручную?\\n\\nПорядок: проверка прокси → переключение сервера → повторная проверка. '+
+    'Если после переключения станет хуже, панель вернёт прежний прокси сама. После успеха стратегии отключатся: Redut будет держать этот канал, '+
+    'а при его подтверждённом отказе вернётся к «Скорость и отклик». Клиенты в этот момент могут на пару секунд потерять связь.'))return;
   btn.disabled=true;toast('Переключаю на '+uid+'…');
   try{const r=await api('/api/proxy/'+encodeURIComponent(uid)+'/apply',{method:'POST'});
-    toast('Готово: было '+r.old_ip+', стало '+r.new_ip+'. Сайты теперь видят '+r.egress+' ('+country(r.egress_cc)+')','ok');await reloadAll()}
+    toast('Готово: было '+r.old_ip+', стало '+r.new_ip+'. Ручной режим включён; сайты видят '+r.egress+
+      ' ('+country(r.egress_cc)+'). При отказе включится «Скорость и отклик».','ok');await reloadAll()}
   catch(e){toast('переключение: '+e.message,'bad');await reloadAll()}btn.disabled=false}
 
 async function rollback(){if(!confirm('Вернуть предыдущий конфиг из резервной копии?\\n\\nПригодится, если после смены прокси стало хуже.'))return;toast('Откатываю…');

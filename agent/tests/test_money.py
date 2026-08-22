@@ -73,7 +73,8 @@ def cfg(**money_over):
          "buy_period_days": 7, "buy_version": 4, "currency": "RUB"}
     m.update(money_over)
     return {"server": "node1", "money": m,
-            "countries": {"whitelist": ["fi", "de", "ru"]}}   # ru нарочно — должен вычищаться
+            "countries": {"strategy": "reputation",
+                          "whitelist": ["fi", "de", "ru"]}}   # ru нарочно — должен вычищаться
 
 
 class Base(unittest.TestCase):
