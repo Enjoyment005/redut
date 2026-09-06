@@ -9,6 +9,7 @@ import datetime
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import _ctx      # noqa: F401
 import apply as apply_mod
@@ -48,6 +49,82 @@ class TestEmergencyBackoff(unittest.TestCase):
         self.assertEqual(states.emergency_retry_delay(None), 120)
         self.assertEqual(states.emergency_retry_delay("мусор"), 120)
         self.assertEqual(states.emergency_retry_delay(-3), 120)
+
+
+class TestEmergencyKernelTransitions(unittest.TestCase):
+    """Kernel-команда и effective route обязаны подтвердиться до смены состояния."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.flag = os.path.join(self.tmp.name, "emergency.flag")
+        self.posix = mock.patch.object(states.os, "name", "posix")
+        self.flag_path = mock.patch.object(states, "EMERGENCY_FLAG", self.flag)
+        self.posix.start()
+        self.flag_path.start()
+
+    def tearDown(self):
+        self.flag_path.stop()
+        self.posix.stop()
+        self.tmp.cleanup()
+
+    def _set_flag(self):
+        with open(self.flag, "w", encoding="utf-8") as f:
+            f.write("active\n")
+
+    def test_on_rejects_failed_route_command(self):
+        with mock.patch.object(states.apply_mod, "run_cmd", return_value=(1, "denied")), \
+             mock.patch.object(states, "_middleman_default") as current:
+            self.assertFalse(states.emergency_on({"gw": "192.0.2.1", "wan": "ens3"},
+                                                 log=lambda *_: None))
+        current.assert_not_called()
+        self.assertFalse(os.path.exists(self.flag))
+
+    def test_on_rejects_unverified_effective_route(self):
+        with mock.patch.object(states.apply_mod, "run_cmd", return_value=(0, "")), \
+             mock.patch.object(states, "_middleman_default",
+                               side_effect=["default via 192.0.2.2 dev ens3",
+                                            "default dev tun0 scope link"]):
+            self.assertFalse(states.emergency_on({"gw": "192.0.2.1", "wan": "ens3"},
+                                                 log=lambda *_: None))
+        self.assertFalse(os.path.exists(self.flag))
+
+    def test_on_rejects_failed_masquerade(self):
+        with mock.patch.object(states.apply_mod, "run_cmd",
+                               side_effect=[(1, "missing"), (1, "denied")]) as run:
+            self.assertFalse(states.emergency_on(
+                {"subnet": "10.66.0.0/24", "gw": "192.0.2.1", "wan": "ens3"},
+                log=lambda *_: None))
+        self.assertEqual(run.call_count, 2)
+        self.assertFalse(os.path.exists(self.flag))
+
+    def test_on_writes_flag_only_after_effective_route_matches(self):
+        with mock.patch.object(states.apply_mod, "run_cmd", return_value=(0, "")), \
+             mock.patch.object(states, "_middleman_default",
+                               return_value="default via 192.0.2.1 dev ens3 proto static"):
+            self.assertTrue(states.emergency_on({"gw": "192.0.2.1", "wan": "ens3"},
+                                                log=lambda *_: None))
+        self.assertTrue(os.path.exists(self.flag))
+
+    def test_off_keeps_flag_when_route_command_fails(self):
+        self._set_flag()
+        with mock.patch.object(states.apply_mod, "run_cmd", return_value=(1, "denied")), \
+             mock.patch.object(states, "_middleman_default") as current:
+            self.assertFalse(states.emergency_off({}, log=lambda *_: None))
+        current.assert_not_called()
+        self.assertTrue(os.path.exists(self.flag))
+
+    def test_off_unlinks_flag_only_after_tun0_is_effective(self):
+        self._set_flag()
+        with mock.patch.object(states.apply_mod, "run_cmd", return_value=(0, "")), \
+             mock.patch.object(states, "_middleman_default",
+                               return_value="default dev tun0 scope link"):
+            self.assertTrue(states.emergency_off({}, log=lambda *_: None))
+        self.assertFalse(os.path.exists(self.flag))
+
+    def test_route_match_is_token_exact(self):
+        with mock.patch.object(states, "_middleman_default",
+                               return_value="default via 192.0.2.1 dev ens30"):
+            self.assertFalse(states._middleman_default_matches("ens3", "192.0.2.1"))
 
 
 class _DbBase(unittest.TestCase):
@@ -221,6 +298,18 @@ class TestAlertDedup(_DbBase):
 class TestManualEmergencySticks(_DbBase):
     """F7: ручная авария помечается manual; ручное снятие пишет verify в журнал."""
 
+    def setUp(self):
+        super().setUp()
+        self.on_patcher = mock.patch.object(states, "emergency_on", return_value=True)
+        self.off_patcher = mock.patch.object(states, "emergency_off", return_value=True)
+        self.on = self.on_patcher.start()
+        self.off = self.off_patcher.start()
+
+    def tearDown(self):
+        self.off_patcher.stop()
+        self.on_patcher.stop()
+        super().tearDown()
+
     def test_manual_flag_set_and_cleared(self):
         states.set_emergency({}, self.pool, _NullAlerter(), on=True, log=lambda *a: None)
         self.assertEqual(self.pool.get_setting("emergency_manual"), "1")
@@ -243,6 +332,30 @@ class TestManualEmergencySticks(_DbBase):
         self.assertEqual(self.pool.get_setting("emergency_retry_n"), "0")
         self.assertIsNone(self.pool.get_setting("emergency_manual"),
                           "авто-вход не помечается ручным")
+
+    def test_failed_manual_enter_does_not_commit_state_or_manual_flag(self):
+        self.on.return_value = False
+        r = states.set_emergency({}, self.pool, _NullAlerter(), on=True, log=lambda *a: None)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["state"], states.OK)
+        self.assertIsNone(self.pool.get_setting("automat_state"))
+        self.assertIsNone(self.pool.get_setting("emergency_manual"))
+
+    def test_failed_manual_exit_preserves_emergency_state(self):
+        states.set_emergency({}, self.pool, _NullAlerter(), on=True, log=lambda *a: None)
+        self.off.return_value = False
+        r = states.set_emergency({}, self.pool, _NullAlerter(), on=False, log=lambda *a: None)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["state"], states.EMERGENCY)
+        self.assertEqual(self.pool.get_setting("automat_state"), states.EMERGENCY)
+        self.assertEqual(self.pool.get_setting("emergency_manual"), "1")
+
+    def test_failed_transition_is_not_ok_even_when_previous_state_was_ok(self):
+        result = states._transition_failed(
+            self.pool, {}, states.OK, "emergency-enter-failed", "kernel command failed")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["state"], states.OK)
+        self.assertEqual(self.pool.get_setting("automat_state"), states.OK)
 
 
 class TestLeaveDirect(_DbBase):
@@ -282,6 +395,22 @@ class TestLeaveDirect(_DbBase):
         ev = self.pool.conn.execute(
             "SELECT result FROM event WHERE action='rotating'").fetchone()
         self.assertEqual(ev["result"], "off")
+
+    def test_failed_leave_preserves_state_and_suppresses_recovered(self):
+        a = _SpyAlerter()
+        self.pool.set_setting("automat_state", states.EMERGENCY)
+        self.pool.set_setting("emergency_retry_n", "3")
+        states.emergency_off = lambda cfg, log=print: False
+        self.assertFalse(states._leave_direct(
+            {"singbox_config": "x"}, self.pool, a,
+            {"egress_ip": "5.5.5.5", "exit_cc": "fi"},
+            lambda *a_: None, "auto", states.EMERGENCY))
+        self.assertEqual(a.calls, [])
+        self.assertEqual(self.pool.get_setting("automat_state"), states.EMERGENCY)
+        self.assertEqual(self.pool.get_setting("emergency_retry_n"), "3")
+        ev = self.pool.conn.execute(
+            "SELECT result FROM event WHERE action='emergency'").fetchone()
+        self.assertEqual(ev["result"], "off-failed")
 
 
 class TestCalmRetune(_DbBase):

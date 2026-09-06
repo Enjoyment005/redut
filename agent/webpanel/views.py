@@ -1083,7 +1083,9 @@ function beacon(s,clients){
   const stale=(s.egress_age!=null&&s.egress_age>STALE);
   if(s.emergency){cls='b-bad';ttl='Аварийный режим включён';
     txt='Клиенты в интернете, но выходят с российского IP самого сервера — блокировки НЕ обходятся. '+
-        'Это временно: нажми «Ротация», чтобы вернуться на зарубежный прокси, потом сними аварию.'+who}
+        'Это временно: нажми «Ротация», чтобы вернуться на зарубежный прокси, потом сними аварию.'+
+        ((s.dns_rescue&&/^active_/.test((s.dns_rescue.state||{}).phase||''))?
+          ' DNS Rescue временно восстанавливает только обычные DNS-запросы IPv4 через WireGuard.':'')+who}
   else if(s.automat==='ROTATING'){cls='b-warn';ttl='Перебираю пул прокси';
     txt='Боевой прокси умер — панель перебирает запасные из пула (это НЕ авария). На время перебора '+
         'клиенты выходят напрямую через сервер, с российского IP. Обычно занимает пару минут; '+
@@ -1131,8 +1133,13 @@ async function loadStatus(){const s=await api('/api/status');window.__S=s;
   const aut=s.emergency?('<span class="bad">АВАРИЯ'+(s.emergency_since?(' с '+esc(s.emergency_since)):'')+'</span>')
     :(AUTL[s.automat]?('<span class="warn">'+AUTL[s.automat]+'</span>')
     :(s.frozen?'<span class="warn">на паузе</span>':'<span class="ok">'+esc(s.automat||'OK')+'</span>'));
+  const dr=(s.dns_rescue||{}),drs=(dr.state||{}),drc=(dr.coverage||{});
+  const dractive=/^active_/.test(drs.phase||'');
+  const drtxt=dractive?('<span class="warn">'+esc(drs.phase)+' · '+esc(drs.active_slot||'?')+'</span>'):
+    (drs.configured_mode==='disabled'?'<span class="mut">выключен</span>':esc(drs.phase||'idle'));
   document.getElementById('status').innerHTML=[
     tile('автоматика',aut,'Сторож проверяет связь и, если прокси умер, сам переключает на живой или докупает новый. «На паузе» — не вмешивается.'),
+    tile('DNS Rescue',drtxt,'Последний аварийный режим DNS. Охват: только IPv4 UDP/TCP 53, пришедший через wg0; IPv6 и встроенный DoH приложений не контролируются.'),
     tile('прокси на выходе',esc(cur.socks_out||'?'),'Зарубежный прокси, через который сервер выпускает трафик наружу. Технически — SOCKS5-upstream.'),
     tile('канал telegram',esc(cur.http_tg||'?'),'Telegram ходит отдельным http-каналом того же прокси — так надёжнее.'),
     tile('IP на выходе',window.__EGBUSY?'<span class="mut">проверяю…</span>':

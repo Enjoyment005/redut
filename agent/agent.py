@@ -31,6 +31,7 @@ import money as money_mod           # noqa: E402
 import config_schema                # noqa: E402
 import learning as learning_mod     # noqa: E402
 import replay as replay_mod         # noqa: E402
+import dns_rescue as dns_rescue_mod  # noqa: E402
 import pool as pool_mod             # noqa: E402
 import probe as probe_mod           # noqa: E402
 import states as states_mod         # noqa: E402
@@ -203,6 +204,11 @@ def cmd_status(cfg, args):
     elif p.get_setting("automat_frozen") == "1":
         extra = "  (автоматика на паузе FROZEN)"
     print("автомат: %s%s" % (st, extra))
+    dns_status = dns_rescue_mod.status(cfg, p)
+    dns_state = dns_status["state"]
+    print("DNS Rescue: mode=%s phase=%s scope=%s (IPv4 wg0 UDP/TCP 53 only)"
+          % (dns_state.get("configured_mode"), dns_state.get("phase"),
+             dns_state.get("active_scope") or "—"))
     sel = states_mod.selection_state(p, cfg, apply_mod.current_upstream(read_singbox(cfg) or {}))
     if sel["mode"] == states_mod.SELECTION_MANUAL:
         print("выбор канала: MANUAL %s (%s) с %s · при отказе -> speed"
@@ -542,8 +548,15 @@ def cmd_apply(cfg, args):
         p.set_role(row["uid"], "auto")
         p.log_event("role", actor="auto", to_uid=row["uid"], result="auto",
                     detail="успешный apply переводит off->auto (П9)")
-    states_mod.finish_explicit_apply(cfg, p, row["uid"], row["host"], r.get("verify"),
-                                     source=source, actor="user", log=print)
+    post = states_mod.finish_explicit_apply(
+        cfg, p, row["uid"], row["host"], r.get("verify"),
+        source=source, actor="user", log=print)
+    if post.get("ok") is False:
+        p.log_event("apply", actor="user", from_uid=None, to_uid=row["uid"],
+                    result="post-state-pending", detail=post["error"])
+        print("⚠️ Прокси применён, но завершение состояния отложено: %s" % post["error"])
+        p.close()
+        return 1
     p.log_event("apply", actor="user", from_uid=None, to_uid=row["uid"], result="ok",
                 detail=json.dumps({"old_ip": r["old_ip"], "new_ip": r["new_ip"],
                                    "verify": r["verify"], "source": source}, ensure_ascii=False))
@@ -570,14 +583,20 @@ def cmd_rollback(cfg, args):
         print("❌ %s" % e)
         p.close()
         return 1
+    if r["ok"]:
+        row = next((x for x in p.list(include_gone=True) if x["host"] == r["good_ip"]), None)
+        post = states_mod.finish_explicit_apply(
+            cfg, p, (row or {}).get("uid") or ("live:%s" % r["good_ip"]), r["good_ip"],
+            r.get("verify"), source="manual", actor="user", log=print)
+        if post.get("ok") is False:
+            p.log_event("rollback", actor="user", result="post-state-pending",
+                        detail=post["error"])
+            print("⚠️ Конфигурация откатана, но завершение состояния отложено: %s" % post["error"])
+            p.close()
+            return 1
     p.log_event("rollback", actor="user", result="ok" if r["ok"] else "verify-fail",
                 detail=json.dumps({"backup": r["backup"], "bad_ip": r["bad_ip"],
                                    "good_ip": r["good_ip"]}, ensure_ascii=False))
-    if r["ok"]:
-        row = next((x for x in p.list(include_gone=True) if x["host"] == r["good_ip"]), None)
-        states_mod.finish_explicit_apply(
-            cfg, p, (row or {}).get("uid") or ("live:%s" % r["good_ip"]), r["good_ip"],
-            r.get("verify"), source="manual", actor="user", log=print)
     apply_mod.commit_operation(p, r)
     print(("✅" if r["ok"] else "⚠️") + " Откат: %s -> %s (бэкап %s), verify %s"
           % (r["bad_ip"], r["good_ip"], os.path.basename(r["backup"]),
@@ -896,12 +915,42 @@ def cmd_emergency(cfg, args):
     p = open_pool(cfg)
     alerter = _make_alerter(cfg, secrets)
     if os.name != "posix":
-        print("⚠️ Маршруты аварийного режима меняются только на сервере (Linux); ставлю только флаг.")
+        print("⚠️ Маршруты аварийного режима меняются только на сервере (Linux).")
     r = states_mod.set_emergency(cfg, p, alerter, on=(args.state == "on"), log=print, actor="user")
-    print("Аварийный режим: %s (состояние автомата: %s)"
-          % ("ВКЛючён — прямой выход через WAN" if args.state == "on" else "выключен", r["state"]))
+    if r.get("ok"):
+        print("Аварийный режим: %s (состояние автомата: %s)"
+              % ("ВКЛючён — прямой выход через WAN" if args.state == "on" else "выключен",
+                 r["state"]))
+    else:
+        print("Аварийный режим НЕ изменён: %s (состояние автомата: %s)"
+              % (r.get("error") or "операция не подтверждена", r["state"]))
     p.close()
-    return 0
+    return 0 if r.get("ok") else 1
+
+
+def cmd_dns_rescue(cfg, args):
+    p = open_pool(cfg)
+    try:
+        action = args.dns_action
+        if action == "status":
+            result = dns_rescue_mod.status(cfg, p)
+        elif action == "observe":
+            result = dns_rescue_mod.observe(cfg, p)
+        elif action == "activate":
+            result = dns_rescue_mod.activate(cfg, p, scope=args.scope,
+                                             slot_id=args.slot, actor="user")
+        elif action == "deactivate":
+            result = dns_rescue_mod.deactivate(cfg, p, actor="user")
+        else:
+            result = {"ok": True, "state": dns_rescue_mod.reconcile(cfg, p)}
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True,
+                         allow_nan=False))
+        return 0 if result.get("ok", action in ("status", "reconcile")) else 1
+    except dns_rescue_mod.DNSRescueError as error:
+        print("DNS Rescue: %s" % error)
+        return 1
+    finally:
+        p.close()
 
 
 def cmd_switch_provider(cfg, args):
@@ -988,6 +1037,10 @@ def cmd_heartbeat_check(cfg, args):
     providers = make_providers(secrets)
     p = open_pool(cfg)
     alerter = _make_alerter(cfg, secrets)
+    dns_rescue_mod.reconcile(cfg, p, actor="recovery")
+    dns_rescue_mod.automatic_tick(
+        cfg, p, p.get_setting("automat_state") or states_mod.OK,
+        manual_emergency=p.get_setting("emergency_manual") == "1", log=print)
     r = states_mod.heartbeat_check(p, alerter)
     if r["stale"]:
         print("⚠️ Пульс агента устарел (%.1f ч)%s"
@@ -1059,6 +1112,15 @@ def main(argv=None):
     sp.add_argument("--force", action="store_true", help="игнорировать паузу FROZEN и тайминг аварии")
     sp = sub.add_parser("emergency", help="аварийный режим вкл/выкл (прямой выход через WAN §8)")
     sp.add_argument("state", choices=["on", "off"])
+    sp = sub.add_parser("dns-rescue", help="изолированный DNS Rescue (по умолчанию выключен)")
+    dns_sub = sp.add_subparsers(dest="dns_action", required=True)
+    dns_sub.add_parser("status", help="режим, фаза, охват и незавершённые операции")
+    dns_sub.add_parser("observe", help="UDP/TCP probe без перехвата")
+    act = dns_sub.add_parser("activate", help="ручной canary activation")
+    act.add_argument("--scope", default="all", help="all или peer:<IPv4>")
+    act.add_argument("--slot", help="id безопасного resolver slot")
+    dns_sub.add_parser("deactivate", help="убрать redirect и остановить gateway")
+    dns_sub.add_parser("reconcile", help="закрыть прерванную DNS saga")
     sp = sub.add_parser("switch-provider",
                         help="П7-2: увести боевой канал с провайдера без ключа (после удаления ключа)")
     sp.add_argument("--from", dest="from_provider", required=True,
@@ -1091,6 +1153,7 @@ def main(argv=None):
                 "rollback": cmd_rollback,
                 "buy": cmd_buy, "prolong": cmd_prolong, "drop": cmd_drop,
                 "rotate": cmd_rotate, "emergency": cmd_emergency,
+                "dns-rescue": cmd_dns_rescue,
                 "switch-provider": cmd_switch_provider,
                 "heartbeat-check": cmd_heartbeat_check, "learning-replay": cmd_learning_replay,
                 "auto-prolong": cmd_auto_prolong,

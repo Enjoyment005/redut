@@ -39,6 +39,8 @@
   --- автоматика (фаза 3, машина состояний §8; отдельным процессом vpn-agent) ---
   POST /api/rotate                  запустить диагностику -> RETUNE/ROTATING/REPLENISH/EMERGENCY
   POST /api/emergency               {on: bool} — прямой выход через WAN вкл/выкл
+  GET  /api/dns-rescue              режим, фаза, ограниченный охват, открытые DNS saga
+  POST /api/dns-rescue              {action, scope?, slot?} — observe/canary/off/reconcile
   (состояние автомата + пульс — в GET /api/status: automat/emergency/heartbeat)
   --- обновления с GitHub (vpn/UPDATE-PLAN.md) ---
   GET  /api/update/status           версии узла/маяка, когда проверялось, авто вкл/выкл, ход установки
@@ -66,6 +68,8 @@ import alerts as alerts_mod        # noqa: E402
 import apply as apply_mod          # noqa: E402
 import config_store                # noqa: E402
 import config_schema               # noqa: E402
+import dns_rescue as dns_rescue_mod  # noqa: E402
+import dns_rescue as dns_rescue_mod  # noqa: E402
 import country as country_mod      # noqa: E402
 import metrics as metrics_mod      # noqa: E402
 import money as money_mod          # noqa: E402
@@ -641,6 +645,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, self._status())
         if path == "/api/config/diagnostics":
             return self._json(200, config_schema.diagnostics(APP.cfg))
+        if path == "/api/dns-rescue":
+            with _DB_LOCK:
+                return self._json(200, dns_rescue_mod.status(APP.cfg, APP.pool))
+        if path == "/api/dns-rescue":
+            with _DB_LOCK:
+                return self._json(200, dns_rescue_mod.status(APP.cfg, APP.pool))
         if path == "/api/pool":
             with _DB_LOCK:
                 rows = APP.pool.list(include_gone=True)
@@ -817,19 +827,29 @@ class Handler(BaseHTTPRequestHandler):
             r = apply_mod.rollback_from_ring(APP.cfg, pool=APP.saga_pool,
                                              requested_by="user",
                                              selection_source="manual")
+            post_error = None
             with _DB_LOCK:
                 row = next((x for x in APP.pool.list(include_gone=True)
                             if x["host"] == r["good_ip"]), None) if r.get("ok") else None
                 if r.get("ok"):
-                    states_mod.finish_explicit_apply(
+                    post = states_mod.finish_explicit_apply(
                         APP.cfg, APP.pool, (row or {}).get("uid") or ("live:%s" % r["good_ip"]),
                         r["good_ip"], r.get("verify"), source="manual", actor="user",
                         log=lambda m: None)
-                APP.pool.log_event("rollback", actor="user", result="ok" if r["ok"] else "verify-fail",
+                    if post.get("ok") is False:
+                        post_error = post["error"]
+                APP.pool.log_event("rollback", actor="user",
+                                   result=("post-state-pending" if post_error else
+                                           ("ok" if r["ok"] else "verify-fail")),
                                    detail=json.dumps({"bad": r["bad_ip"], "good": r["good_ip"]}, ensure_ascii=False),
                                    src_ip=self._client_ip())
                 APP.pool.set_egress(r.get("verify"))
-                apply_mod.commit_operation(APP.saga_pool, r)
+                if not post_error:
+                    apply_mod.commit_operation(APP.saga_pool, r)
+            if post_error:
+                return self._json(503, {"ok": False, "error": post_error,
+                                        "post_state_pending": True,
+                                        "bad_ip": r["bad_ip"], "good_ip": r["good_ip"]})
             return self._json(200, {"ok": r["ok"], "bad_ip": r["bad_ip"], "good_ip": r["good_ip"],
                                     "egress": r["verify"]["egress_ip"]})
         if path == "/api/rotate":
@@ -879,6 +899,32 @@ class Handler(BaseHTTPRequestHandler):
                 APP.pool.log_event("panel-emergency", actor="user",
                                    result="on" if on else "off", src_ip=self._client_ip())
             return self._json(200, {"ok": rc == 0, "state": st, "on": on, "output": (out or "")[-600:]})
+        if path == "/api/dns-rescue":
+            body = json.loads(self._body() or b"{}") or {}
+            action = body.get("action")
+            if action not in ("observe", "activate", "deactivate", "reconcile"):
+                return self._json(400, {"error": "неизвестное действие DNS Rescue"})
+            command = ["dns-rescue", action]
+            if action == "activate":
+                command += ["--scope", str(body.get("scope") or "all")]
+                if body.get("slot"):
+                    command += ["--slot", str(body["slot"])]
+            rc, output = _run_agent(command, timeout=90)
+            return self._json(200 if rc == 0 else 409,
+                              {"ok": rc == 0, "output": (output or "")[-1500:]})
+        if path == "/api/dns-rescue":
+            body = json.loads(self._body() or b"{}") or {}
+            action = body.get("action")
+            if action not in ("observe", "activate", "deactivate", "reconcile"):
+                return self._json(400, {"error": "неизвестное действие DNS Rescue"})
+            command = ["dns-rescue", action]
+            if action == "activate":
+                command += ["--scope", str(body.get("scope") or "all")]
+                if body.get("slot"):
+                    command += ["--slot", str(body["slot"])]
+            rc, output = _run_agent(command, timeout=90)
+            return self._json(200 if rc == 0 else 409,
+                              {"ok": rc == 0, "output": (output or "")[-1500:]})
 
         parts = path.strip("/").split("/")   # api proxy <uid> <action>
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "proxy":
@@ -1482,12 +1528,19 @@ class Handler(BaseHTTPRequestHandler):
             selection = states_mod.finish_explicit_apply(
                 APP.cfg, APP.pool, row["uid"], row["host"], r.get("verify"),
                 source="manual", actor="user", log=lambda m: None)
-            APP.pool.log_event("apply", actor="user", to_uid=row["uid"], result="ok",
+            post_error = selection.get("error") if selection.get("ok") is False else None
+            APP.pool.log_event("apply", actor="user", to_uid=row["uid"],
+                               result="post-state-pending" if post_error else "ok",
                                detail=json.dumps({"old_ip": r["old_ip"], "new_ip": r["new_ip"],
                                                   "verify": r["verify"], "source": "manual"},
-                                                 ensure_ascii=False),
+                                                ensure_ascii=False),
                                src_ip=self._client_ip())
-            apply_mod.commit_operation(APP.saga_pool, r)
+            if not post_error:
+                apply_mod.commit_operation(APP.saga_pool, r)
+        if post_error:
+            return self._json(503, {"ok": False, "error": post_error,
+                                    "post_state_pending": True,
+                                    "old_ip": r["old_ip"], "new_ip": r["new_ip"]})
         return self._json(200, {"ok": True, "old_ip": r["old_ip"], "new_ip": r["new_ip"],
                                 "egress": r["verify"]["egress_ip"],
                                 "egress_cc": r["verify"]["exit_cc"],
@@ -1809,6 +1862,8 @@ class Handler(BaseHTTPRequestHandler):
             out["emergency_since"] = APP.pool.get_setting("emergency_since")
             out["frozen"] = APP.pool.get_setting("automat_frozen") == "1"
             out["heartbeat"] = APP.pool.last_heartbeat()
+            out["dns_rescue"] = dns_rescue_mod.status(APP.cfg, APP.pool)
+            out["dns_rescue"] = dns_rescue_mod.status(APP.cfg, APP.pool)
             selection = states_mod.selection_state(APP.pool, APP.cfg, cur_host)
             # последняя проба выхода: сам статус её не делает (curl через tun0 — до 15 с
             # на каждый опрос), отдаём то, что записали панель или агент §8.

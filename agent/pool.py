@@ -270,6 +270,48 @@ _SCHEMA = [
         note TEXT,
         saved_at TEXT NOT NULL
     )""",
+    # DNS Rescue has its own typed saga.  It is intentionally not folded into
+    # proxy `operation`: DNS recovery must never look like permission to rotate,
+    # buy, delete, or modify the primary sing-box channel.
+    """CREATE TABLE IF NOT EXISTS dns_rescue_state(
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+        phase TEXT NOT NULL,
+        configured_mode TEXT NOT NULL,
+        incident_id TEXT,
+        active_scope TEXT,
+        active_slot TEXT,
+        activated_at TEXT,
+        attempt_used INTEGER NOT NULL DEFAULT 0,
+        return_successes INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        updated_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS dns_rescue_operation(
+        id TEXT PRIMARY KEY,
+        incident_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        slot_id TEXT,
+        scope TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        requested_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        finished_at TEXT,
+        error TEXT,
+        idempotency_key TEXT NOT NULL UNIQUE
+    )""",
+    """CREATE TABLE IF NOT EXISTS dns_probe_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        incident_id TEXT,
+        slot_id TEXT,
+        transport TEXT NOT NULL,
+        ok INTEGER NOT NULL,
+        latency_ms INTEGER,
+        rcode INTEGER,
+        answers INTEGER NOT NULL DEFAULT 0,
+        error_kind TEXT
+    )""",
     "CREATE INDEX IF NOT EXISTS idx_proxy_provider ON proxy(provider)",
     "CREATE INDEX IF NOT EXISTS idx_event_ts ON event(ts)",
     "CREATE INDEX IF NOT EXISTS idx_probe_log_ts ON probe_log(ts)",
@@ -280,6 +322,9 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS idx_operation_phase ON operation(phase, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_spend_operation_phase"
     " ON spend_operation(phase, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_dns_operation_phase"
+    " ON dns_rescue_operation(phase, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_dns_probe_ts ON dns_probe_log(ts)",
 ]
 
 # Retention (E1): сырьё probe_log — 90 дней; event — 180 (это и security-журнал:
@@ -292,7 +337,7 @@ EVENT_KEEP_DAYS = 180
 # дальше уже не воскрешение мигнувшей выдачи, а новая покупка того же id.
 MEMO_KEEP_DAYS = 30
 
-SCHEMA_VERSION = "7"
+SCHEMA_VERSION = "8"
 
 # Поля, которые обновляет refresh (остальные — роль/проба/счётчики — сохраняются)
 _REFRESH_FIELDS = ("ip", "host", "port_http", "port_socks5", "user", "password",
@@ -1105,9 +1150,17 @@ class Pool:
         a = self.conn.execute("DELETE FROM probe_log WHERE ts < ?", (cut_p,)).rowcount
         b = self.conn.execute("DELETE FROM event WHERE ts < ?", (cut_e,)).rowcount
         c = self.conn.execute("DELETE FROM proxy_memo WHERE saved_at < ?", (cut_m,)).rowcount
+        d = self.conn.execute("DELETE FROM dns_probe_log WHERE ts < ?", (cut_p,)).rowcount
+        # Never prune an open DNS saga.  Terminal incident evidence follows the
+        # security-event retention period.
+        e = self.conn.execute(
+            "DELETE FROM dns_rescue_operation WHERE finished_at < ?"
+            " AND phase IN ('committed','rolled_back','failed')", (cut_e,)).rowcount
         self.set_setting("prune_last", day)      # заодно коммитит DELETE'ы
         return {"probe_log": a if a and a > 0 else 0, "event": b if b and b > 0 else 0,
-                "proxy_memo": c if c and c > 0 else 0}
+                "proxy_memo": c if c and c > 0 else 0,
+                "dns_probe_log": d if d and d > 0 else 0,
+                "dns_operations": e if e and e > 0 else 0}
 
     def mark_used(self, uid):
         self.conn.execute("UPDATE proxy SET last_used_at=? WHERE uid=?", (now_iso(), uid))
@@ -1372,6 +1425,139 @@ class Pool:
                 (stamp, str(op_id)))
             return True
         return self.run_transaction(write)
+
+    # ---------- DNS Rescue: isolated incident state and saga ----------
+    _DNS_PHASES = ("planned", "staging", "started", "redirected", "verifying",
+                   "committed", "rollback", "rolled_back", "failed")
+    _DNS_TERMINAL = ("committed", "rolled_back", "failed")
+    _DNS_TRANSITIONS = {
+        "planned": {"staging", "failed"},
+        "staging": {"started", "rollback", "failed"},
+        "started": {"redirected", "rollback", "failed"},
+        "redirected": {"verifying", "rollback", "failed"},
+        "verifying": {"committed", "rollback", "failed"},
+        "rollback": {"rolled_back", "failed"},
+        "committed": set(), "rolled_back": set(), "failed": set(),
+    }
+
+    def dns_state(self):
+        row = self.conn.execute(
+            "SELECT * FROM dns_rescue_state WHERE singleton=1").fetchone()
+        return dict(row) if row else {
+            "singleton": 1, "phase": "idle", "configured_mode": "disabled",
+            "incident_id": None, "active_scope": None, "active_slot": None,
+            "activated_at": None, "attempt_used": 0, "return_successes": 0,
+            "last_error": None, "updated_at": None,
+        }
+
+    def set_dns_state(self, **values):
+        allowed = {"phase", "configured_mode", "incident_id", "active_scope",
+                   "active_slot", "activated_at", "attempt_used", "return_successes",
+                   "last_error"}
+        unknown = set(values) - allowed
+        if unknown:
+            raise ValueError("unknown dns state fields: %s" % ",".join(sorted(unknown)))
+        current = self.dns_state()
+        current.update(values)
+        if current["phase"] not in ("idle", "probing", "active_proxy", "active_direct",
+                                    "failed", "recovering"):
+            raise ValueError("invalid dns rescue phase")
+        current["attempt_used"] = 1 if current.get("attempt_used") else 0
+        current["return_successes"] = max(0, int(current.get("return_successes") or 0))
+        stamp = now_iso()
+        def write(conn):
+            conn.execute(
+                "INSERT OR REPLACE INTO dns_rescue_state(singleton,phase,configured_mode,"
+                "incident_id,active_scope,active_slot,activated_at,attempt_used,"
+                "return_successes,last_error,updated_at) VALUES(1,?,?,?,?,?,?,?,?,?,?)",
+                (current["phase"], current["configured_mode"], current.get("incident_id"),
+                 current.get("active_scope"), current.get("active_slot"),
+                 current.get("activated_at"), current["attempt_used"],
+                 current["return_successes"], str(current.get("last_error") or "")[:500] or None,
+                 stamp))
+        self.run_transaction(write)
+        return self.dns_state()
+
+    def begin_dns_operation(self, incident_id, kind, slot_id, scope, actor,
+                            idempotency_key):
+        incident_id, kind = str(incident_id or "").strip(), str(kind or "").strip()
+        scope, actor, key = str(scope or "").strip(), str(actor or "").strip(), str(idempotency_key or "").strip()
+        if not all((incident_id, kind, scope, actor, key)):
+            raise ValueError("dns operation fields are required")
+        if scope != "all" and not re.fullmatch(r"peer:[A-Za-z0-9+/=_:.-]{1,160}", scope):
+            raise ValueError("invalid dns rescue scope")
+        op_id, stamp = uuid.uuid4().hex, now_iso()
+        def write(conn):
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO dns_rescue_operation(id,incident_id,kind,phase,"
+                "slot_id,scope,actor,requested_at,updated_at,idempotency_key)"
+                " VALUES(?,?,?,'planned',?,?,?,?,?,?)",
+                (op_id, incident_id, kind, slot_id or None, scope, actor, stamp, stamp, key))
+            row = conn.execute(
+                "SELECT * FROM dns_rescue_operation WHERE idempotency_key=?", (key,)).fetchone()
+            if cur.rowcount == 0 and (row["incident_id"], row["kind"], row["slot_id"],
+                                      row["scope"], row["actor"]) != (
+                    incident_id, kind, slot_id or None, scope, actor):
+                raise ValueError("dns idempotency key is bound to another intent")
+            return dict(row)
+        return self.run_transaction(write)
+
+    def transition_dns_operation(self, op_id, phase, error=""):
+        if phase not in self._DNS_PHASES:
+            raise ValueError("invalid dns operation phase")
+        def write(conn):
+            row = conn.execute("SELECT * FROM dns_rescue_operation WHERE id=?",
+                               (str(op_id),)).fetchone()
+            if not row:
+                raise KeyError("dns operation not found")
+            current = row["phase"]
+            if current == phase:
+                return dict(row)
+            if current not in self._DNS_TRANSITIONS or phase not in self._DNS_TRANSITIONS[current]:
+                raise ValueError("invalid dns operation transition: %s -> %s" % (current, phase))
+            stamp = now_iso()
+            conn.execute(
+                "UPDATE dns_rescue_operation SET phase=?,updated_at=?,finished_at=?,error=? WHERE id=?",
+                (phase, stamp, stamp if phase in self._DNS_TERMINAL else None,
+                 str(error or "")[:500] or None, str(op_id)))
+            return dict(conn.execute(
+                "SELECT * FROM dns_rescue_operation WHERE id=?", (str(op_id),)).fetchone())
+        return self.run_transaction(write)
+
+    def unfinished_dns_operations(self, limit=100):
+        rows = self.conn.execute(
+            "SELECT * FROM dns_rescue_operation WHERE phase NOT IN ('committed','rolled_back','failed')"
+            " ORDER BY requested_at,id LIMIT ?", (max(1, min(1000, int(limit))),)).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_dns_probe(self, result, incident_id=None, slot_id=None):
+        # Fixed schema is a privacy boundary: no QNAME, endpoint, address,
+        # packet, or arbitrary error string can enter this journal.
+        transport = str((result or {}).get("transport") or "")
+        if transport not in ("udp", "tcp"):
+            raise ValueError("invalid dns probe transport")
+        def bounded_int(key, minimum, maximum, default=None):
+            value = (result or {}).get(key, default)
+            if value is None:
+                return None
+            return max(minimum, min(maximum, int(value)))
+        stamp = now_iso()
+        def write(conn):
+            cur = conn.execute(
+                "INSERT INTO dns_probe_log(ts,incident_id,slot_id,transport,ok,latency_ms,"
+                "rcode,answers,error_kind) VALUES(?,?,?,?,?,?,?,?,?)",
+                (stamp, incident_id or None, slot_id or None, transport,
+                 1 if (result or {}).get("ok") else 0,
+                 bounded_int("latency_ms", 0, 60000), bounded_int("rcode", 0, 15),
+                 bounded_int("answers", 0, 65535, 0),
+                 str((result or {}).get("error_kind") or "")[:64] or None))
+            return cur.lastrowid
+        return self.run_transaction(write)
+
+    def dns_operations(self, limit=100):
+        return [dict(row) for row in self.conn.execute(
+            "SELECT * FROM dns_rescue_operation ORDER BY requested_at DESC,id DESC LIMIT ?",
+            (max(1, min(1000, int(limit))),)).fetchall()]
 
     # ---------- настройки автомата (§8) ----------
     def get_setting(self, key, default=None):

@@ -1,0 +1,18 @@
+[Unit]
+Description=Redut isolated DNS Rescue gateway
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sing-box run -c /etc/redut-dns-rescue/config.json -D /var/lib/redut-dns-rescue
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/redut-dns-rescue /run/redut-dns-rescue
+
+[Install]
+# Intentionally no WantedBy: vpn-agent starts this unit only for an approved incident.

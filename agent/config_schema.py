@@ -11,7 +11,7 @@ import datetime
 import config_store
 
 
-CURRENT_VERSION = 1
+CURRENT_VERSION = 2
 _STRATEGIES = {"reputation", "balanced", "speed"}
 _CURRENCIES = {"RUB", "USD", "EUR"}
 _PATHS = ("db", "ring", "singbox_config", "boot_script", "lock")
@@ -43,7 +43,18 @@ def _migrate_0_1(data):
     return data
 
 
-_MIGRATIONS = {0: _migrate_0_1}
+def _migrate_1_2(data):
+    # DNS Rescue is deliberately opt-in.  Migration must never turn network
+    # interception on merely because a package was upgraded.
+    data["config_schema_version"] = 2
+    block = data.get("dns_rescue")
+    if not isinstance(block, dict):
+        data["dns_rescue"] = {"mode": "disabled", "owner_approved": False,
+                              "automatic_ready": False}
+    return data
+
+
+_MIGRATIONS = {0: _migrate_0_1, 1: _migrate_1_2}
 
 
 def migration_plan(raw):
@@ -418,6 +429,112 @@ def normalize(raw, defaults=None, source=""):
         update["auto"] = False
     cfg["update"] = update
 
+    # DNS Rescue is a separate, last-resort subsystem.  Any malformed safety
+    # field disables activation; defaults may describe candidates but never
+    # authorize traffic interception.
+    dns_defaults = {
+        "mode": "disabled", "owner_approved": False, "automatic_ready": False,
+        "active_probes": False, "listen_ip": "", "listen_port": 1053,
+        "request_timeout_seconds": 3.0, "activation_deadline_seconds": 30,
+        "active_check_seconds": 5, "active_failures": 3,
+        "return_checks": 3, "return_interval_seconds": 60,
+        "isolated_ttl_seconds": 900, "qps_per_peer": 50,
+        "candidates": [
+            {"id": "cloudflare-proxy", "operator": "cloudflare",
+             "endpoint": "https://1.1.1.1/dns-query", "transport": "proxy"},
+            {"id": "google-proxy", "operator": "google",
+             "endpoint": "https://8.8.8.8/dns-query", "transport": "proxy"},
+            {"id": "cloudflare-direct", "operator": "cloudflare",
+             "endpoint": "https://1.1.1.1/dns-query", "transport": "direct"},
+            {"id": "google-direct", "operator": "google",
+             "endpoint": "https://8.8.8.8/dns-query", "transport": "direct"},
+        ],
+    }
+    if isinstance(defaults.get("dns_rescue"), dict):
+        dns_defaults.update(copy.deepcopy(defaults["dns_rescue"]))
+    raw_dns = cfg.get("dns_rescue", dns_defaults)
+    dns_invalid = not isinstance(raw_dns, dict)
+    dns = _mapping(raw_dns, issues, "dns_rescue")
+    dns_issue_start = len(issues)
+    mode = str(dns.get("mode") or "disabled").strip().lower()
+    if mode not in ("disabled", "observe_only", "manual_canary", "automatic_last_resort"):
+        _issue(issues, "dns_rescue.mode", "неизвестный режим", "disabled")
+        mode = "disabled"
+    dns["mode"] = mode
+    for key in ("owner_approved", "automatic_ready", "active_probes"):
+        dns[key] = _bool(dns.get(key, dns_defaults[key]), False, issues,
+                         "dns_rescue.%s" % key, dangerous=True)
+    listen_ip = dns.get("listen_ip", dns_defaults["listen_ip"])
+    if listen_ip:
+        try:
+            parsed = ipaddress.ip_address(str(listen_ip))
+            if parsed.version != 4:
+                raise ValueError
+            listen_ip = str(parsed)
+        except ValueError:
+            _issue(issues, "dns_rescue.listen_ip", "ожидался IPv4 адрес wg0", "empty")
+            listen_ip = ""
+    dns["listen_ip"] = listen_ip
+    numeric = {
+        "listen_port": (1024, 65535, True),
+        "request_timeout_seconds": (0.2, 10.0, False),
+        "activation_deadline_seconds": (5, 120, True),
+        "active_check_seconds": (2, 60, True),
+        "active_failures": (1, 10, True),
+        "return_checks": (2, 10, True),
+        "return_interval_seconds": (10, 600, True),
+        "isolated_ttl_seconds": (60, 3600, True),
+        "qps_per_peer": (1, 500, True),
+    }
+    for key, (lo, hi, integer) in numeric.items():
+        dns[key] = _number(dns.get(key, dns_defaults[key]), dns_defaults[key], issues,
+                           "dns_rescue.%s" % key, lo, hi, integer=integer,
+                           dangerous=(key == "listen_port"))
+    slots = dns.get("candidates", dns_defaults["candidates"])
+    normalized_slots, seen_ids, operators = [], set(), set()
+    if not isinstance(slots, list) or len(slots) > 4:
+        _issue(issues, "dns_rescue.candidates", "ожидался список максимум из 4 слотов", "empty")
+        slots = []
+    for index, item in enumerate(slots):
+        path = "dns_rescue.candidates.%d" % index
+        if not isinstance(item, dict):
+            _issue(issues, path, "ожидался объект", "drop")
+            continue
+        sid = str(item.get("id") or "").strip().lower()
+        operator = str(item.get("operator") or "").strip().lower()
+        endpoint = str(item.get("endpoint") or "").strip()
+        transport = str(item.get("transport") or "").strip().lower()
+        valid = (bool(re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", sid))
+                 and sid not in seen_ids
+                 and bool(re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", operator))
+                 and transport in ("proxy", "direct"))
+        match = re.fullmatch(r"https://(\d{1,3}(?:\.\d{1,3}){3})/(dns-query|resolve)", endpoint)
+        try:
+            valid = valid and bool(match) and ipaddress.ip_address(match.group(1)).version == 4
+        except (ValueError, AttributeError):
+            valid = False
+        if not valid:
+            _issue(issues, path, "невалидный безопасный слот", "drop")
+            continue
+        normalized_slots.append({"id": sid, "operator": operator,
+                                 "endpoint": endpoint, "transport": transport})
+        seen_ids.add(sid)
+        operators.add(operator)
+    dns["candidates"] = sorted(normalized_slots,
+                               key=lambda x: (x["transport"] != "proxy", x["id"]))
+    if mode == "automatic_last_resort" and (len(operators) < 2 or len(dns["candidates"]) < 2):
+        _issue(issues, "dns_rescue.candidates", "для auto нужны минимум два оператора", "disabled")
+        mode = dns["mode"] = "disabled"
+    if (dns_invalid or len(issues) > dns_issue_start or safe_mode
+            or not dns["owner_approved"]):
+        if mode in ("manual_canary", "automatic_last_resort"):
+            dns["mode"] = "disabled"
+        dns["automatic_ready"] = False
+        dns["active_probes"] = False
+    if dns["mode"] != "automatic_last_resort":
+        dns["automatic_ready"] = False
+    cfg["dns_rescue"] = dns
+
     for key in ("subnet", "gw", "server_ip"):
         value = cfg.get(key)
         if value in (None, ""):
@@ -451,7 +568,8 @@ def normalize(raw, defaults=None, source=""):
     if safe_mode:
         for path in ("money.buy_enabled", "money.delete_enabled",
                      "auto_prolong.enabled", "update.auto",
-                     "learning.owner_approved"):
+                     "learning.owner_approved", "dns_rescue.mode",
+                     "dns_rescue.automatic_ready", "dns_rescue.active_probes"):
             sources[path] = "safe-default"
     cfg["_config_meta"] = {"schema_version": CURRENT_VERSION,
                            "source_version": version,

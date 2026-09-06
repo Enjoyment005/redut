@@ -78,7 +78,11 @@ ALERT_DEDUP_SEC = 6 * 3600              # F7: no_funds/pool_empty/no_market ≤1
 # С 1.0.2 (снос №4, 15.08): если канал ещё НЕ выбран (UP_HOST пуст), boot-скрипт сам
 # ставит прямой выход и пишет этот флаг — после ребута нет окна «чёрной дыры» до тика
 # сторожа (было 143 с); restore_emergency_routes тогда видит флаг + не-tun0 и ничего не трогает.
-EMERGENCY_FLAG = "/run/vpn-agent-emergency"
+DEFAULT_EMERGENCY_FLAG = "/run/vpn-agent-emergency"
+EMERGENCY_FLAG = DEFAULT_EMERGENCY_FLAG
+# Durable intent survives reboot.  Boot and post-start helpers may observe it,
+# but only the agent mutates it while holding the common network lock.
+EMERGENCY_INTENT = "/var/lib/vpn-panel/emergency.intent"
 # ТОЛЬКО полный путь: агента дёргает cron с PATH=/usr/bin:/bin, а iptables лежит в
 # /usr/sbin — короткое имя из крона даёт [Errno 2], и emergency_on «добавлял» MASQUERADE
 # только в логе (найдено 15.08 на приёмке публичной сборки; тот же класс, что и sing-box §12.4).
@@ -86,6 +90,18 @@ IPTABLES = "/usr/sbin/iptables"
 
 # Прямые проверки живости сети (мимо прокси). -k: 1.1.1.1/8.8.8.8 по IP без валид. cert.
 NET_CHECK_URLS = ("https://api.ipify.org", "https://1.1.1.1", "https://8.8.8.8")
+
+
+def _emergency_intent(cfg=None):
+    configured = (cfg or {}).get("emergency_intent")
+    if configured:
+        return configured
+    # Tests and embedders commonly override the runtime flag. Keep their
+    # durable companion in the same isolated directory rather than touching
+    # the host's real /var/lib path.
+    if EMERGENCY_FLAG != DEFAULT_EMERGENCY_FLAG:
+        return EMERGENCY_FLAG + ".intent"
+    return EMERGENCY_INTENT
 
 
 # --------------------------------------------------------- чистые решения (тест)
@@ -331,8 +347,19 @@ def finish_explicit_apply(cfg, pool, uid, host, verify=None, source="manual",
     apply победил из EMERGENCY/ROTATING, прямой WAN-маршрут обязательно снимается.
     """
     state_before = pool.get_setting("automat_state") or OK
-    if state_before in (EMERGENCY, ROTATING) or os.path.exists(EMERGENCY_FLAG):
-        emergency_off(cfg, log)
+    if (state_before in (EMERGENCY, ROTATING) or os.path.exists(EMERGENCY_FLAG)
+            or os.path.exists(_emergency_intent(cfg))):
+        if not emergency_off(cfg, log):
+            hold_state = state_before if state_before in (EMERGENCY, ROTATING) else EMERGENCY
+            pool.set_setting("automat_state", hold_state)
+            pool.log_event("explicit-apply", actor=actor, to_uid=uid,
+                           result="leave-direct-failed",
+                           detail="%s: proxy применён, но выход из прямого режима не подтверждён"
+                                  % source)
+            selection = selection_state(pool, cfg, host)
+            selection.update(ok=False, state=hold_state,
+                             error="выход из прямого режима не подтверждён")
+            return selection
         pool.set_settings({"emergency_since": None, "rotating_since": None,
                            "emergency_retry_n": None, "emergency_manual": None})
         pool.log_event("explicit-apply", actor=actor, to_uid=uid, result="leave-direct",
@@ -360,9 +387,11 @@ def recover_apply_post_state(cfg, pool, operation, verify=None, log=print):
             pool.log_event("role", actor="auto", to_uid=uid, result="auto",
                            detail="saga recovery: успешный apply переводит off->auto")
     if source in ("manual", "strategy", "setup", "recovery"):
-        finish_explicit_apply(cfg, pool, uid or ("live:%s" % host), host, verify,
-                              source=source, actor=operation.get("requested_by") or "auto",
-                              log=log)
+        post = finish_explicit_apply(
+            cfg, pool, uid or ("live:%s" % host), host, verify,
+            source=source, actor=operation.get("requested_by") or "auto", log=log)
+        if post.get("ok") is False:
+            raise apply_mod.ApplyError(post.get("error") or "apply post-state не завершён")
     elif verify:
         pool.set_egress(verify)
     pool.log_event("operation-recovery", actor="auto", to_uid=uid, result="post-state",
@@ -933,8 +962,15 @@ def _converge_strategy_locked(cfg, providers, pool, log=print, actor="user"):
             continue
         pool.mark_used(row["uid"])
         pool.clear_cooldown(row["uid"])
-        finish_explicit_apply(cfg, pool, row["uid"], row["host"], applied.get("verify"),
-                              source="strategy", actor=actor, log=log)
+        post = finish_explicit_apply(
+            cfg, pool, row["uid"], row["host"], applied.get("verify"),
+            source="strategy", actor=actor, log=log)
+        if post.get("ok") is False:
+            emit_strategy("post-state-pending", post["error"], reranked,
+                          to_uid=row["uid"], policy=decision)
+            return {"ok": False, "action": "post-state-pending", "detail": post["error"],
+                    "strategy": desired, "uid": row["uid"], "new_ip": row["host"],
+                    "verify": applied.get("verify"), "decision": decision, "tried": tried}
         detail = "%s: %s -> %s (%s)" % (desired, current_host, row["host"], row["uid"])
         if decision is not None:
             if decision["bypass"]:
@@ -1015,49 +1051,52 @@ def rotate(cfg, providers, pool, alerter, reason="manual", actor="auto",
     pool.heartbeat()                                   # §6.3: цикл агента прошёл
     result = {"state": None, "action": None, "detail": "", "ok": False}
 
-    if pool.get_setting("automat_frozen") == "1" and not force:
-        # Пауза НЕ затирает automat_state (ревью 1.3.0): FROZEN в состоянии хоронил
-        # EMERGENCY/ROTATING, и после снятия паузы прямой WAN-выход оставался
-        # осиротевшим навсегда (флаг есть, а снять его некому — нарушение
-        # инварианта флага). Пауза видна панели через automat_frozen; прямой
-        # выход на паузе поддерживаем (ребут не должен дать чёрную дыру).
-        state_now = pool.get_setting("automat_state") or OK
-        if state_now in (EMERGENCY, ROTATING):
-            restore_emergency_routes(cfg, pool, log, actor)
-        result.update(state=state_now, action="manual-pause",
-                      detail="автоматика на паузе (FROZEN) — пропускаю", ok=False)
-        return result
-    if os.name != "posix":
-        result.update(state=pool.get_setting("automat_state") or OK, action="noop",
-                      detail="rotate доступен только на сервере (Linux)")
-        return result
-
-    state_before = pool.get_setting("automat_state") or OK
-    if state_before == EMERGENCY and not force:
-        restore_emergency_routes(cfg, pool, log, actor)
-        # F7: ручную аварию автоматика НЕ снимает — снимет только человек
-        if pool.get_setting("emergency_manual") == "1":
-            return _state(pool, result, EMERGENCY, "manual-emergency",
-                          "авария включена вручную — автоматика её не снимает (кнопка/CLI)")
-        # F6: backoff 2→5→10→15→30 мин вместо ровных 15 (watchdog долбит каждые 2 мин)
-        delay = emergency_retry_delay(pool.get_setting("emergency_retry_n"))
-        age = age_seconds(pool.get_setting("emergency_last_retry"))
-        if age is not None and age < delay:
-            return _state(pool, result, EMERGENCY, "emergency-wait",
-                          "аварийный режим: до следующей попытки %d с (backoff)" % (delay - age))
-    if state_before == ROTATING and not force:
-        # инвариант флага: прямой выход времён перебора переживает ребут/сброс
-        # маршрута так же, как аварийный; окна повтора у ROTATING нет — добираем
-        # пул каждым тиком сторожа
-        restore_emergency_routes(cfg, pool, log, actor)
-
     try:
         with apply_mod.Flock(cfg.get("lock") or "/run/vpn-agent.lock"):
+            # All state used to authorize a network mutation is re-read only
+            # after the lock.  A losing cron/button must not restore routes from
+            # a stale pre-lock snapshot or overwrite the winner's state.
+            state_before = pool.get_setting("automat_state") or OK
+            if pool.get_setting("automat_frozen") == "1" and not force:
+                if state_before in (EMERGENCY, ROTATING):
+                    restore_emergency_routes(cfg, pool, log, actor)
+                result.update(state=state_before, action="manual-pause",
+                              detail="автоматика на паузе (FROZEN) — пропускаю", ok=False)
+                return result
+            if os.name != "posix":
+                result.update(state=state_before, action="noop",
+                              detail="rotate доступен только на сервере (Linux)")
+                return result
+            if state_before == EMERGENCY:
+                try:
+                    import dns_rescue as dns_rescue_mod
+                    dns_rescue_mod.automatic_tick(
+                        cfg, pool, state_before,
+                        manual_emergency=pool.get_setting("emergency_manual") == "1",
+                        log=log, _locked=True)
+                except Exception as error:
+                    pool.log_event("dns-rescue", actor=actor, result="tick-failed",
+                                   detail=type(error).__name__)
+            if state_before == EMERGENCY and not force:
+                restore_emergency_routes(cfg, pool, log, actor)
+                if pool.get_setting("emergency_manual") == "1":
+                    return _state(pool, result, EMERGENCY, "manual-emergency",
+                                  "авария включена вручную — автоматика её не снимает (кнопка/CLI)")
+                delay = emergency_retry_delay(pool.get_setting("emergency_retry_n"))
+                age = age_seconds(pool.get_setting("emergency_last_retry"))
+                if age is not None and age < delay:
+                    return _state(pool, result, EMERGENCY, "emergency-wait",
+                                  "аварийный режим: до следующей попытки %d с (backoff)"
+                                  % (delay - age))
+            if state_before == ROTATING and not force:
+                restore_emergency_routes(cfg, pool, log, actor)
             return _rotate_locked(cfg, providers, pool, alerter, reason, actor, log,
                                   result, state_before)
     except apply_mod.ApplyError as e:
-        # flock занят — другой процесс (кнопка/cron) уже правит конфиг. Не наша очередь.
-        return _state(pool, result, state_before, "locked", "flock занят: %s" % e)
+        # No state write here: the lock winner may already have moved it.
+        result.update(state=pool.get_setting("automat_state") or OK, action="locked",
+                      detail="flock занят: %s" % e, ok=False)
+        return result
 
 
 def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, state_before):
@@ -1089,7 +1128,8 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
     egress = apply_mod.verify_egress()
     pool.set_egress(egress)          # дашборд показывает эту метку, сам пробу не гоняет
     sb_h = singbox_health(cfg)
-    in_direct = state_before in (EMERGENCY, ROTATING) or os.path.exists(EMERGENCY_FLAG)
+    in_direct = (state_before in (EMERGENCY, ROTATING)
+                 or os.path.exists(EMERGENCY_FLAG) or os.path.exists(_emergency_intent(cfg)))
     # F6: в прямом выходе middleman-маршрут СОЗНАТЕЛЬНО не tun0 — здоровье sing-box
     # считаем без него, иначе каждый ретрай уходил бы в self-heal и дёргал маршрут.
     sb_ok = sb_h["ok"] or (in_direct and sb_h["active"] and sb_h["tun0"])
@@ -1118,8 +1158,8 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
         # выход через tun0 жив. Прямой выход снимаем по ФАКТУ (in_direct: состояние
         # ИЛИ флаг) — состояние могло быть затёрто паузой/чужим сбоем, а осиротевший
         # WAN-выход с флагом никто больше не снимет (инвариант флага, ревью 1.3.0).
-        if in_direct:
-            _leave_direct(cfg, pool, alerter, egress, log, actor, state_before)
+        if in_direct and not _leave_direct(cfg, pool, alerter, egress, log, actor, state_before):
+            return _direct_exit_failed(pool, result, state_before)
         if selection["mode"] == SELECTION_MANUAL:
             return _state(pool, result, OK, "manual-watch",
                           "ручной канал %s здоров — стратегии не переключают его"
@@ -1136,8 +1176,9 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
                 and apply_mod.verify_egress()["ok"]):
             pool.log_event("self-heal", actor=actor, result="ok", detail="sing-box/tun0 восстановлены")
             _reset_streaks(pool)
-            if in_direct:
-                _leave_direct(cfg, pool, alerter, apply_mod.verify_egress(), log, actor, state_before)
+            if in_direct and not _leave_direct(
+                    cfg, pool, alerter, apply_mod.verify_egress(), log, actor, state_before):
+                return _direct_exit_failed(pool, result, state_before)
             return _state(pool, result, OK, "self-heal", "sing-box восстановлен")
         log("  self-heal не помог — вероятно, виноват прокси, иду дальше")
 
@@ -1147,9 +1188,10 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
                     prior_evidence=initial_evidence)
     if rt.get("ok"):
         _reset_streaks(pool)
-        if in_direct:
-            _leave_direct(cfg, pool, alerter, rt.get("verify") or apply_mod.verify_egress(),
-                          log, actor, state_before)
+        if in_direct and not _leave_direct(
+                cfg, pool, alerter, rt.get("verify") or apply_mod.verify_egress(),
+                log, actor, state_before):
+            return _direct_exit_failed(pool, result, state_before)
         return _state(pool, result, OK, "retune", rt.get("detail", "RETUNE ок"))
     if rt.get("external_outage"):
         decision = rt.get("health_decision") or {}
@@ -1158,8 +1200,8 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
                       decision.get("reason"), len(decision.get("failed_targets") or []),
                       decision.get("successful_signals"), decision.get("threshold")))
         pool.log_event("health-quorum", actor=actor, result="held", detail=detail)
-        if in_direct:
-            _leave_direct(cfg, pool, alerter, egress, log, actor, state_before)
+        if in_direct and not _leave_direct(cfg, pool, alerter, egress, log, actor, state_before):
+            return _direct_exit_failed(pool, result, state_before)
         return _state(pool, result, DEGRADED, "quorum-held",
                       detail + " — IP не меняю")
 
@@ -1194,8 +1236,9 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
         pool.set_egress(egress2)
         if egress2["ok"]:
             _reset_streaks(pool)
-            if in_direct:
-                _leave_direct(cfg, pool, alerter, egress2, log, actor, state_before)
+            if in_direct and not _leave_direct(
+                    cfg, pool, alerter, egress2, log, actor, state_before):
+                return _direct_exit_failed(pool, result, state_before)
             pool.log_event("suspect", actor=actor, result="flap",
                            detail="повтор verify через %d с прошёл — единичный чих, деструктив отменён"
                                   % RECHECK_DELAY_SEC)
@@ -1221,16 +1264,21 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
     if pool.rotations_last_hour() >= MAX_REPLACEMENTS_PER_HOUR and reason not in ("manual", "panel"):
         log("  лимит замен ≤%d/час исчерпан — в аварийный режим до охлаждения"
             % MAX_REPLACEMENTS_PER_HOUR)
-        _enter_emergency(cfg, pool, alerter,
-                         "лимит замен ≤%d/час исчерпан (антифлаппинг §8)" % MAX_REPLACEMENTS_PER_HOUR,
-                         log, actor, state_before)
+        if not _enter_emergency(
+                cfg, pool, alerter,
+                "лимит замен ≤%d/час исчерпан (антифлаппинг §8)" % MAX_REPLACEMENTS_PER_HOUR,
+                log, actor, state_before):
+            return _transition_failed(
+                pool, result, state_before, "emergency-enter-failed",
+                "лимит замен исчерпан, но прямой аварийный выход не подтверждён")
         return _state(pool, result, EMERGENCY, "rate-limited", "лимит замен/час — авария")
 
     rot = try_rotating(cfg, providers, pool, alerter, log, actor)
     if rot.get("ok"):
         _reset_streaks(pool)
-        if in_direct:
-            _leave_direct(cfg, pool, alerter, rot["verify"], log, actor, state_before)
+        if in_direct and not _leave_direct(
+                cfg, pool, alerter, rot["verify"], log, actor, state_before):
+            return _direct_exit_failed(pool, result, state_before)
         ensure_reserve(cfg, providers, pool, alerter, log, actor)   # N+1: из пула, не покупкой (§6.5)
         return _state(pool, result, OK, "rotate", rot.get("detail", "ротация ок"))
 
@@ -1239,7 +1287,12 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
     # перебора — СТРОГО под флагом (инвариант: сторож не вернёт default в мёртвый tun0);
     # маршрутами ROTATING управляет ровно как EMERGENCY, отличие — только UI и алерты.
     if rot.get("capped"):
-        emergency_on(cfg, log)
+        if not emergency_on(cfg, log):
+            pool.log_event("rotating", actor=actor, result="direct-failed",
+                           detail="не удалось подтвердить прямой выход для безопасного перебора")
+            return _transition_failed(
+                pool, result, state_before, "direct-enter-failed",
+                "прямой выход для ROTATING не подтверждён; состояние не изменено")
         pool.set_setting("automat_state", ROTATING)
         if state_before != ROTATING:
             pool.set_setting("rotating_since", _now_iso())
@@ -1256,13 +1309,18 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
     rep = try_replenish(cfg, providers, pool, alerter, log, actor)
     if rep.get("ok"):
         _reset_streaks(pool)
-        if in_direct:
-            _leave_direct(cfg, pool, alerter, rep["verify"], log, actor, state_before)
+        if in_direct and not _leave_direct(
+                cfg, pool, alerter, rep["verify"], log, actor, state_before):
+            return _direct_exit_failed(pool, result, state_before)
         return _state(pool, result, OK, "replenish", rep.get("detail", "докупка ок"))
 
     # --- EMERGENCY ---
-    _enter_emergency(cfg, pool, alerter, rep.get("reason") or "живых кандидатов нет и купить нельзя",
-                     log, actor, state_before)
+    if not _enter_emergency(
+            cfg, pool, alerter, rep.get("reason") or "живых кандидатов нет и купить нельзя",
+            log, actor, state_before):
+        return _transition_failed(
+            pool, result, state_before, "emergency-enter-failed",
+            "прямой аварийный выход не подтверждён; состояние не изменено")
     return _state(pool, result, EMERGENCY, "emergency", rep.get("reason") or "авария")
 
 
@@ -1319,11 +1377,14 @@ def _tg_degraded(cfg, providers, pool, alerter, result, egress, log, actor, stat
     rt = try_retune(cfg, providers, pool, alerter, log, actor)
     if rt.get("ok"):
         _reset_streaks(pool)
-        if in_direct or state_before in (EMERGENCY, ROTATING):
-            _leave_direct(cfg, pool, alerter, rt.get("verify") or egress, log, actor, state_before)
+        if ((in_direct or state_before in (EMERGENCY, ROTATING))
+                and not _leave_direct(
+                    cfg, pool, alerter, rt.get("verify") or egress, log, actor, state_before)):
+            return _direct_exit_failed(pool, result, state_before)
         return _state(pool, result, OK, "retune", rt.get("detail", "RETUNE ок"))
     if in_direct or state_before in (EMERGENCY, ROTATING):
-        _leave_direct(cfg, pool, alerter, egress, log, actor, state_before)
+        if not _leave_direct(cfg, pool, alerter, egress, log, actor, state_before):
+            return _direct_exit_failed(pool, result, state_before)
     if streak == TG_ALERT_STREAK:
         pool.log_event("degraded", actor=actor, result="tg",
                        detail="api.telegram.org недоступен %d проверок подряд; канал (ipify) жив"
@@ -1951,6 +2012,35 @@ def ensure_reserve(cfg, providers, pool, alerter, log, actor, min_reserve=1):
 
 
 # ------------------------------------------------------------------- EMERGENCY
+def _write_intent(path, content):
+    parent = os.path.dirname(path)
+    os.makedirs(parent, exist_ok=True)
+    tmp = "%s.tmp-%s" % (path, os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _remove_intent(path):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def emergency_on(cfg, log=print):
     """default таблицы middleman -> прямой выход через WAN (§8): вместо чёрной
     дыры в мёртвый tun0 клиенты выходят напрямую через ens3 (с masquerade).
@@ -1970,17 +2060,63 @@ def emergency_on(cfg, log=print):
                 log("  emergency: добавлен MASQUERADE %s -> %s" % (subnet, wan))
             else:
                 log("  emergency: MASQUERADE %s -> %s НЕ добавлен: %s" % (subnet, wan, out2))
-    if gw:
-        apply_mod.run_cmd(["ip", "route", "replace", "default", "via", gw, "dev", wan, "table", "middleman"])
-        log("  emergency: middleman default -> via %s dev %s (прямой выход)" % (gw, wan))
-    else:
-        apply_mod.run_cmd(["ip", "route", "replace", "default", "dev", wan, "table", "middleman"])
-        log("  emergency: middleman default -> dev %s" % wan)
+                return False
+        rc, out = apply_mod.run_cmd([IPTABLES, "-t", "nat", "-C", "POSTROUTING",
+                                     "-s", subnet, "-o", wan, "-j", "MASQUERADE"])
+        if rc != 0:
+            log("  emergency: MASQUERADE %s -> %s не подтверждён: %s" % (subnet, wan, out))
+            return False
+    flag_existed = os.path.exists(EMERGENCY_FLAG)
     try:
         with open(EMERGENCY_FLAG, "w") as f:
-            f.write(_now_iso() + "\n")   # сигнал сторожу: не трогай маршрут
-    except OSError:
-        pass
+            f.write(_now_iso() + "\n")   # сторож не должен вмешаться во время cutover
+    except OSError as e:
+        log("  emergency: не удалось записать runtime-флаг %s: %s" % (EMERGENCY_FLAG, e))
+        return False
+    if gw:
+        cmd = ["ip", "route", "replace", "default", "via", gw, "dev", wan,
+               "table", "middleman"]
+    else:
+        cmd = ["ip", "route", "replace", "default", "dev", wan, "table", "middleman"]
+    rc, out = apply_mod.run_cmd(cmd)
+    if rc != 0:
+        log("  emergency: middleman default НЕ переключён на %s: %s" % (wan, out))
+        if not flag_existed:
+            try:
+                os.unlink(EMERGENCY_FLAG)
+            except OSError:
+                log("  emergency: временный runtime-флаг не удалён; требуется reconcile")
+        return False
+    if not _middleman_default_matches(wan, gw):
+        log("  emergency: фактический middleman default не совпал с ожидаемым прямым маршрутом")
+        if not flag_existed:
+            rb_rc, rb_out = apply_mod.run_cmd(
+                ["ip", "route", "replace", "default", "dev", "tun0", "table", "middleman"])
+            if rb_rc == 0 and _middleman_default_matches("tun0"):
+                try:
+                    os.unlink(EMERGENCY_FLAG)
+                except OSError:
+                    log("  emergency: rollback выполнен, но runtime-флаг не удалён; требуется reconcile")
+            else:
+                log("  emergency: rollback в tun0 не подтверждён (%s); runtime-флаг сохранён" % rb_out)
+        return False
+    # Persist only after the route is proven.  If persistence fails, restore
+    # tun0; otherwise a reboot could silently convert an acknowledged direct
+    # mode into a black hole.
+    try:
+        _write_intent(_emergency_intent(cfg), _now_iso() + "\n")
+    except OSError as e:
+        log("  emergency: durable intent не записан: %s" % e)
+        if not flag_existed:
+            rb_rc, _rb_out = apply_mod.run_cmd(
+                ["ip", "route", "replace", "default", "dev", "tun0", "table", "middleman"])
+            if rb_rc == 0 and _middleman_default_matches("tun0"):
+                _remove_intent(EMERGENCY_FLAG)
+        return False
+    if gw:
+        log("  emergency: middleman default -> via %s dev %s (прямой выход)" % (gw, wan))
+    else:
+        log("  emergency: middleman default -> dev %s" % wan)
     return True
 
 
@@ -1989,11 +2125,22 @@ def emergency_off(cfg, log=print):
     в норме клиентский трафик в ens3 не идёт, правило безвредно."""
     if os.name != "posix":
         return False
-    apply_mod.run_cmd(["ip", "route", "replace", "default", "dev", "tun0", "table", "middleman"])
-    try:
-        os.unlink(EMERGENCY_FLAG)
-    except OSError:
-        pass
+    rc, out = apply_mod.run_cmd(
+        ["ip", "route", "replace", "default", "dev", "tun0", "table", "middleman"])
+    if rc != 0:
+        log("  emergency off: middleman default НЕ возвращён в tun0: %s" % out)
+        return False
+    if not _middleman_default_matches("tun0"):
+        log("  emergency off: фактический middleman default не совпал с tun0")
+        return False
+    if not _remove_intent(_emergency_intent(cfg)):
+        log("  emergency off: durable intent не удалён; возвращаю прямой маршрут")
+        emergency_on(cfg, log)
+        return False
+    if not _remove_intent(EMERGENCY_FLAG):
+        log("  emergency off: runtime-флаг не удалён; возвращаю прямой маршрут")
+        emergency_on(cfg, log)
+        return False
     log("  emergency off: middleman default -> tun0")
     return True
 
@@ -2007,6 +2154,22 @@ def _middleman_default():
     return ""
 
 
+def _middleman_default_matches(dev, gw=None):
+    """Проверить effective default таблицы middleman без substring-совпадений."""
+    tokens = _middleman_default().split()
+    if not tokens or tokens[0] != "default":
+        return False
+    try:
+        actual_dev = tokens[tokens.index("dev") + 1]
+    except (ValueError, IndexError):
+        return False
+    try:
+        actual_gw = tokens[tokens.index("via") + 1]
+    except (ValueError, IndexError):
+        actual_gw = None
+    return actual_dev == dev and actual_gw == (gw or None)
+
+
 def restore_emergency_routes(cfg, pool, log=print, actor="auto"):
     """Мы в EMERGENCY, но прямой выход сбит — восстановить его СРАЗУ, не дожидаясь окна
     повтора (15 мин). Два случая, оба найдены 15.08 на приёмке публичной сборки:
@@ -2015,12 +2178,14 @@ def restore_emergency_routes(cfg, pool, log=print, actor="auto"):
       • переустановка/ручной запуск boot-скрипта при живом флаге: маршрут снова tun0.
     emergency_on идемпотентен; попытка выйти из аварии остаётся по расписанию.
     Возвращает True, если восстанавливали."""
-    if not os.path.exists(EMERGENCY_FLAG):
+    if not os.path.exists(EMERGENCY_FLAG) and not os.path.exists(_emergency_intent(cfg)):
         why = "после перезагрузки (флага в /run не было)"
-    elif "dev tun0" in _middleman_default():
+    elif _middleman_default_matches(cfg.get("wan") or "ens3", cfg.get("gw")):
+        return False
+    elif _middleman_default_matches("tun0"):
         why = "после сброса маршрута (переустановка/boot-скрипт вернули middleman в tun0)"
     else:
-        return False
+        why = "после сброса/расхождения маршрута middleman"
     if not emergency_on(cfg, log):
         return False
     log("  emergency: прямой выход восстановлен %s" % why)
@@ -2031,6 +2196,10 @@ def restore_emergency_routes(cfg, pool, log=print, actor="auto"):
 
 def _enter_emergency(cfg, pool, alerter, reason, log, actor, state_before):
     ok = emergency_on(cfg, log)
+    if not ok:
+        pool.log_event("emergency", actor=actor, result="on-failed",
+                       detail="прямой выход не подтверждён; состояние не изменено: %s" % reason)
+        return False
     pool.set_setting("automat_state", EMERGENCY)
     pool.set_setting("emergency_last_retry", _now_iso())
     pool.set_setting("rotating_since", None)
@@ -2041,7 +2210,23 @@ def _enter_emergency(cfg, pool, alerter, reason, log, actor, state_before):
         # сделал бы ЭТУ аварию несгораемой для автоматики (ревью 1.3.0)
         pool.set_setting("emergency_manual", None)
         pool.log_event("emergency", actor=actor, result="on", detail=reason)
+        if actor != "user":
+            incident_id = "dns-%s" % _now_iso().replace(" ", "T").replace(":", "")
+            pool.set_settings({"dns_incident_id": incident_id,
+                               "dns_recovery_exhausted": "1"})
         alerter.emergency(reason=reason)             # письмо один раз при входе
+        if actor != "user":
+            try:
+                import dns_rescue as dns_rescue_mod
+                rescue = dns_rescue_mod.automatic_tick(
+                    cfg, pool, EMERGENCY, manual_emergency=False, log=log, _locked=True)
+                if rescue.get("action") not in ("ineligible", "active"):
+                    log("  dns-rescue: %s" % rescue.get("action"))
+            except Exception as error:
+                # DNS isolation failure must not undo the confirmed direct WAN
+                # fallback or broaden authority to proxy/money operations.
+                pool.log_event("dns-rescue", actor="auto", result="isolated-failure",
+                               detail=type(error).__name__)
     else:
         pool.log_event("emergency", actor=actor, result="retry", detail=reason)
     return ok
@@ -2051,7 +2236,11 @@ def _leave_direct(cfg, pool, alerter, verify, log, actor, state_before=EMERGENCY
     """Снять прямой выход WAN — ЕДИНЫЙ путь для EMERGENCY и ROTATING (инвариант
     флага): маршрут возвращается в tun0, флаг снимается, счётчики чистятся.
     Письмо recovered — только про аварию: ROTATING входил без письма."""
-    emergency_off(cfg, log)
+    if not emergency_off(cfg, log):
+        action = "rotating" if state_before == ROTATING else "emergency"
+        pool.log_event(action, actor=actor, result="off-failed",
+                       detail="маршрут tun0/runtime-флаг не подтверждены; прямой режим сохранён")
+        return False
     pool.set_setting("emergency_since", None)
     pool.set_setting("rotating_since", None)
     pool.set_setting("emergency_retry_n", None)
@@ -2060,45 +2249,77 @@ def _leave_direct(cfg, pool, alerter, verify, log, actor, state_before=EMERGENCY
         pool.log_event("rotating", actor=actor, result="off",
                        detail="перебор завершён — рабочий выход egress=%s, прямой выход снят"
                               % (verify or {}).get("egress_ip"))
-        return
+        return True
     pool.log_event("emergency", actor=actor, result="off",
                    detail="восстановлен рабочий выход egress=%s" % (verify or {}).get("egress_ip"))
     alerter.recovered(new_ip=apply_mod.current_upstream(apply_mod.load_json(cfg["singbox_config"])),
                       egress=(verify or {}).get("egress_ip"), cc=(verify or {}).get("exit_cc"))
+    return True
+
+
+def _direct_exit_failed(pool, result, state_before):
+    """Не показывать OK/DEGRADED, пока фактический прямой режим не удалось снять."""
+    hold_state = state_before if state_before in (EMERGENCY, ROTATING) else EMERGENCY
+    return _state(pool, result, hold_state, "direct-exit-failed",
+                  "рабочий tun0 найден, но снять прямой выход безопасно не удалось")
 
 
 # ------------------------------------------------------------- ручные тумблеры
-def set_emergency(cfg, pool, alerter, on, log=print, actor="user"):
+def set_emergency(cfg, pool, alerter, on, log=print, actor="user", _locked=False):
     """Ручное вкл/выкл аварийного режима (CLI/панель).
 
     F7: ручная авария «залипает» — помечается emergency_manual, и автоматика её
     не снимает (раньше снимала на первом же живом egress). Ручное снятие пишет
     в журнал результат verify (приёмка §9 п.7): видно, что реально ожило."""
-    if on:
-        _enter_emergency(cfg, pool, alerter, "включён вручную", log, actor,
-                         pool.get_setting("automat_state") or OK)
-        pool.set_setting("emergency_manual", "1")
-        return {"ok": True, "state": EMERGENCY}
-    emergency_off(cfg, log)
-    pool.set_setting("automat_state", OK)
-    pool.set_setting("emergency_since", None)
-    pool.set_setting("emergency_manual", None)
-    pool.set_setting("emergency_retry_n", None)
-    v = None
-    if os.name == "posix":
-        v = apply_mod.verify_egress()
-        pool.set_egress(v)
-    detail = "выключен вручную"
-    if v is not None:
-        detail += "; verify: " + ("egress=%s cc=%s ok" % (v["egress_ip"], v["exit_cc"])
-                                  if v["ok"] else "ПРОВАЛ (%s)" % v["why"])
-    pool.log_event("emergency", actor=actor, result="off-manual", detail=detail)
-    return {"ok": True, "state": OK, "verify": v}
+    def change():
+        # Re-read after flock: the button/cron state seen before waiting is stale.
+        state_before = pool.get_setting("automat_state") or OK
+        if on:
+            if not _enter_emergency(cfg, pool, alerter, "включён вручную", log, actor,
+                                    state_before):
+                return {"ok": False, "state": state_before,
+                        "error": "прямой выход не подтверждён"}
+            pool.set_setting("emergency_manual", "1")
+            return {"ok": True, "state": EMERGENCY}
+        if not emergency_off(cfg, log):
+            pool.log_event("emergency", actor=actor, result="off-manual-failed",
+                           detail="ручное выключение не подтверждено; состояние сохранено")
+            return {"ok": False, "state": state_before,
+                    "error": "маршрут tun0/runtime-флаг не подтверждены"}
+        pool.set_settings({"automat_state": OK, "emergency_since": None,
+                           "emergency_manual": None, "emergency_retry_n": None,
+                           "dns_recovery_exhausted": None})
+        v = None
+        if os.name == "posix":
+            v = apply_mod.verify_egress()
+            pool.set_egress(v)
+        detail = "выключен вручную"
+        if v is not None:
+            detail += "; verify: " + ("egress=%s cc=%s ok" % (v["egress_ip"], v["exit_cc"])
+                                      if v["ok"] else "ПРОВАЛ (%s)" % v["why"])
+        pool.log_event("emergency", actor=actor, result="off-manual", detail=detail)
+        return {"ok": True, "state": OK, "verify": v}
+
+    if _locked:
+        return change()
+    try:
+        with apply_mod.Flock(cfg.get("lock") or "/run/vpn-agent.lock"):
+            return change()
+    except apply_mod.ApplyError as error:
+        return {"ok": False, "state": pool.get_setting("automat_state") or OK,
+                "error": "flock занят: %s" % error}
 
 
 def _state(pool, result, state, action, detail):
     pool.set_setting("automat_state", state)
     result.update(state=state, action=action, detail=detail, ok=(state == OK))
+    return result
+
+
+def _transition_failed(pool, result, state, action, detail):
+    """Сохранить прежнее состояние, не превращая failed action в ok=True при state=OK."""
+    _state(pool, result, state, action, detail)
+    result["ok"] = False
     return result
 
 

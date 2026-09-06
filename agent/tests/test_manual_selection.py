@@ -84,6 +84,21 @@ class TestSelectionMode(unittest.TestCase):
         with open(self.cfg_path, encoding="utf-8") as f:
             self.assertEqual(json.load(f)["countries"]["strategy"], "reputation")
 
+    def test_healthy_cycle_does_not_report_ok_when_direct_exit_fails(self):
+        self.pool.set_setting("automat_state", states.EMERGENCY)
+        self.pool.set_setting("emergency_retry_n", "2")
+        with mock.patch.object(states, "net_alive", return_value=(True, "x")), \
+             mock.patch.object(states.apply_mod, "verify_egress", return_value=_verify(True)), \
+             mock.patch.object(states, "singbox_health",
+                               return_value={"ok": True, "active": True, "tun0": True}), \
+             mock.patch.object(states, "_leave_direct", return_value=False) as leave:
+            r = self.cycle(state_before=states.EMERGENCY)
+        leave.assert_called_once()
+        self.assertFalse(r["ok"])
+        self.assertEqual((r["state"], r["action"]),
+                         (states.EMERGENCY, "direct-exit-failed"))
+        self.assertEqual(self.pool.get_setting("automat_state"), states.EMERGENCY)
+
     def test_server_network_failure_does_not_release_manual(self):
         self.pin()
         with mock.patch.object(states, "net_alive", return_value=(False, None)), \
@@ -163,6 +178,31 @@ class TestSelectionMode(unittest.TestCase):
         states.finish_explicit_apply(self.cfg, self.pool, self.uid, "10.0.0.1",
                                      _verify(True), source="manual")
         self.assertEqual(self.mode()["mode"], "manual")
+
+    def test_explicit_apply_keeps_operation_pending_when_direct_exit_fails(self):
+        self.pool.set_setting("automat_state", states.EMERGENCY)
+        self.pool.set_setting("emergency_manual", "1")
+        with mock.patch.object(states, "emergency_off", return_value=False):
+            post = states.finish_explicit_apply(
+                self.cfg, self.pool, self.uid, "10.0.0.1", _verify(True), source="manual")
+        self.assertFalse(post["ok"])
+        self.assertEqual(post["state"], states.EMERGENCY)
+        self.assertEqual(self.pool.get_setting("automat_state"), states.EMERGENCY)
+        self.assertEqual(self.pool.get_setting("emergency_manual"), "1")
+        self.assertEqual(self.mode()["mode"], "auto",
+                         "manual selection фиксируется только после завершённого выхода")
+
+    def test_recovery_callback_raises_until_direct_exit_is_confirmed(self):
+        self.pool.set_setting("automat_state", states.EMERGENCY)
+        operation = {
+            "id": "op-pending", "requested_by": "auto", "to_uid": self.uid,
+            "desired_state": {"uid": self.uid, "to_host": "10.0.0.1",
+                              "selection_source": "manual", "promote_role": False},
+        }
+        with mock.patch.object(states, "emergency_off", return_value=False), \
+             self.assertRaises(states.apply_mod.ApplyError):
+            states.recover_apply_post_state(
+                self.cfg, self.pool, operation, _verify(True), log=lambda *_: None)
 
     def test_manual_mode_blocks_proactive_reserve_purchase(self):
         self.pin()

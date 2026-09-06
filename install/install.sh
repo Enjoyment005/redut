@@ -56,11 +56,26 @@ cur=""
 if [ "$cur" != "$SINGBOX_VERSION" ]; then
     tmp="$(mktemp -d)"; arch="linux-amd64"
     url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-${arch}.tar.gz"
+    case "$SINGBOX_VERSION:$arch" in
+        1.11.7:linux-amd64) expected_sha="30420c7e1a0e4b9c7ee2ff3992c53257be85dec2bdc93074594c8b92d19d4d71" ;;
+        *) rm -r -- "$tmp"; die "нет доверенного SHA256 для sing-box $SINGBOX_VERSION/$arch" ;;
+    esac
     log "  качаю $url"
-    curl -fsSL "$url" -o "$tmp/sb.tgz" || wget -qO "$tmp/sb.tgz" "$url" || { rm -rf "$tmp"; die "не скачался sing-box"; }
-    tar -xzf "$tmp/sb.tgz" -C "$tmp" || { rm -rf "$tmp"; die "не распаковался sing-box"; }
-    install -m 0755 "$tmp/sing-box-${SINGBOX_VERSION}-${arch}/sing-box" /usr/local/bin/sing-box || { rm -rf "$tmp"; die "install sing-box"; }
-    rm -rf "$tmp"
+    curl -fsSL "$url" -o "$tmp/sb.tgz" || wget -qO "$tmp/sb.tgz" "$url" || { rm -r -- "$tmp"; die "не скачался sing-box"; }
+    actual_sha="$(sha256sum "$tmp/sb.tgz" | awk '{print $1}')"
+    [ "$actual_sha" = "$expected_sha" ] || { rm -r -- "$tmp"; die "SHA256 sing-box не совпал"; }
+    tar -xzf "$tmp/sb.tgz" -C "$tmp" || { rm -r -- "$tmp"; die "не распаковался sing-box"; }
+    candidate="$tmp/sing-box-${SINGBOX_VERSION}-${arch}/sing-box"
+    [ -x "$candidate" ] || { rm -r -- "$tmp"; die "в архиве нет sing-box"; }
+    cand_ver="$("$candidate" version 2>/dev/null | awk '/version/{print $NF; exit}')"
+    [ "$cand_ver" = "$SINGBOX_VERSION" ] || { rm -r -- "$tmp"; die "версия кандидата sing-box неверна"; }
+    install -m 0755 "$candidate" /usr/local/bin/sing-box.new || { rm -r -- "$tmp"; die "stage sing-box"; }
+    [ ! -x /usr/local/bin/sing-box ] || cp -a /usr/local/bin/sing-box /usr/local/bin/sing-box.previous
+    mv /usr/local/bin/sing-box.new /usr/local/bin/sing-box || {
+        [ ! -x /usr/local/bin/sing-box.previous ] || mv /usr/local/bin/sing-box.previous /usr/local/bin/sing-box
+        rm -r -- "$tmp"; die "activate sing-box";
+    }
+    rm -r -- "$tmp"
 fi
 got="$(/usr/local/bin/sing-box version 2>/dev/null | awk '/version/{print $NF; exit}')"
 [ "$got" = "$SINGBOX_VERSION" ] || die "sing-box версия '$got' != '$SINGBOX_VERSION'"
@@ -165,9 +180,9 @@ EOF
 # ── 5. sing-box config из шаблона с подстановкой upstream ────────────────
 log "5/12 sing-box config"
 mkdir -p /etc/sing-box
-python3 - "$TPL/sing-box.config.json" /etc/sing-box/config.json <<'PY' || die "сборка sing-box config"
+python3 - "$TPL/sing-box.config.json" /etc/sing-box/config.json.candidate /etc/sing-box/config.json <<'PY' || die "сборка sing-box config"
 import json, os, sys
-src, dst = sys.argv[1], sys.argv[2]
+src, dst, live_path = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(src, encoding="utf-8") as f:
     c = json.load(f)
 host = os.environ["UP_HOST"]; user = os.environ["UP_USER"]; pw = os.environ["UP_PASS"]
@@ -185,9 +200,9 @@ socks = int(os.environ["UP_SOCKS"] or 0); http = int(os.environ["UP_HTTP"] or 0)
 # ровно на «обновлении». Теперь секции, которыми владеет агент (outbounds, route), не
 # пересобираются: из шаблона идут только inbounds/dns/log; результат проверяет sing-box check.
 kept = False
-if os.environ.get("UP_FORCE") != "1" and os.path.isfile(dst):
+if os.environ.get("UP_FORCE") != "1" and os.path.isfile(live_path):
     try:
-        with open(dst, encoding="utf-8") as f:
+        with open(live_path, encoding="utf-8") as f:
             live = json.load(f)
         cur = {o.get("tag"): o for o in live.get("outbounds", [])}
         so = cur.get("socks-out") or {}
@@ -209,7 +224,13 @@ if not kept:
 with open(dst, "w", encoding="utf-8") as f:
     json.dump(c, f, ensure_ascii=False, indent=2)
 PY
-/usr/local/bin/sing-box check -c /etc/sing-box/config.json || die "sing-box check не прошёл"
+/usr/local/bin/sing-box check -c /etc/sing-box/config.json.candidate || {
+    rm -f /etc/sing-box/config.json.candidate
+    die "sing-box check не прошёл"
+}
+[ ! -f /etc/sing-box/config.json ] || cp -a /etc/sing-box/config.json /etc/sing-box/config.json.previous
+chmod 600 /etc/sing-box/config.json.candidate
+mv /etc/sing-box/config.json.candidate /etc/sing-box/config.json || die "не активировать sing-box config"
 # Действующий upstream (сохранённый живой или из params.sh; в публичной сборке при первой
 # установке — ПУСТО: канал появится после мастера). Именно он идёт в boot-скрипт и verify.
 UP_HOST_EFF="$(python3 -c 'import json,sys
@@ -223,6 +244,12 @@ put_tpl "$TPL/sing-box.service"     /etc/systemd/system/sing-box.service      06
 put_tpl "$TPL/singbox-post.sh"      /usr/local/bin/singbox-post.sh            0755
 put_tpl "$TPL/singbox-watchdog.sh"  /usr/local/bin/singbox-watchdog.sh        0755
 put_tpl "$TPL/vpn-boot-setup.service" /etc/systemd/system/vpn-boot-setup.service 0644
+put_tpl "$TPL/redut-dns-rescue.service" /etc/systemd/system/redut-dns-rescue.service 0644
+mkdir -p /etc/redut-dns-rescue /var/lib/redut-dns-rescue /run/redut-dns-rescue
+chmod 700 /etc/redut-dns-rescue /var/lib/redut-dns-rescue /run/redut-dns-rescue
+# Installing/updating never enables interception.  If a prior incident is not
+# active, leave the isolated gateway stopped; recovery is handled by vpn-agent.
+systemctl disable redut-dns-rescue.service >/dev/null 2>&1 || true
 
 # Гигиена следов: журналы (IP клиентов и dst), история логинов/команд, apt/dpkg.
 # Скрипт ставим всегда; крон (0 */3) навешиваем в §11 при CLEANUP=1 (по умолчанию вкл).
@@ -253,15 +280,19 @@ if [ -f /etc/ru_whitelist_net.ipset ]; then
     grep '^add ' /etc/ru_whitelist_net.ipset | sed 's/^add [^ ]* /add ru_whitelist_net /' | ipset restore -! 2>/dev/null || true
 fi
 
-# mangle PREROUTING: whitelist(домены+сети) RETURN -> §11 RETURN (внутри VPN + сам сервер) -> MARK 0x64
-iptables -t mangle -F PREROUTING
-iptables -t mangle -A PREROUTING -s $SUBNET -m set --match-set ru_whitelist dst -j RETURN
+# mangle: Redut owns only REDUT_PREROUTING. Never flush a built-in chain: the
+# host firewall, Docker and an operator may legitimately own other rules.
+iptables -t mangle -N REDUT_PREROUTING 2>/dev/null || true
+iptables -t mangle -F REDUT_PREROUTING
+iptables -t mangle -C PREROUTING -s $SUBNET -j REDUT_PREROUTING 2>/dev/null || \
+    iptables -t mangle -I PREROUTING 1 -s $SUBNET -j REDUT_PREROUTING
+iptables -t mangle -A REDUT_PREROUTING -s $SUBNET -m set --match-set ru_whitelist dst -j RETURN
 if ipset list -n ru_whitelist_net >/dev/null 2>&1; then
-    iptables -t mangle -A PREROUTING -s $SUBNET -m set --match-set ru_whitelist_net dst -j RETURN
+    iptables -t mangle -A REDUT_PREROUTING -s $SUBNET -m set --match-set ru_whitelist_net dst -j RETURN
 fi
-iptables -t mangle -A PREROUTING -s $SUBNET -d $SUBNET -j RETURN
-iptables -t mangle -A PREROUTING -s $SUBNET -d $SERVER_IP/32 -j RETURN
-iptables -t mangle -A PREROUTING -s $SUBNET -j MARK --set-mark 0x64
+iptables -t mangle -A REDUT_PREROUTING -s $SUBNET -d $SUBNET -j RETURN
+iptables -t mangle -A REDUT_PREROUTING -s $SUBNET -d $SERVER_IP/32 -j RETURN
+iptables -t mangle -A REDUT_PREROUTING -s $SUBNET -j MARK --set-mark 0x64
 
 # nat/forward — ЕДИНСТВЕННОЕ место (в wg0.conf их нет), идемпотентно (-C || -A)
 iptables -t nat -C POSTROUTING -s $SUBNET -o $WAN -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s $SUBNET -o $WAN -j MASQUERADE
@@ -271,7 +302,13 @@ iptables -C FORWARD -o wg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o wg0 -
 # ждём tun0 от sing-box (до 30 с)
 for i in \$(seq 1 30); do ip link show tun0 >/dev/null 2>&1 && break; sleep 1; done
 
-if [ -n "\$UP_HOST" ]; then
+if [ -f /var/lib/vpn-panel/emergency.intent ]; then
+    # Durable desired state wins over service restarts and reboots.
+    ip route replace default via $GW dev $WAN table middleman
+    mkdir -p /run
+    cp /var/lib/vpn-panel/emergency.intent /run/vpn-agent-emergency 2>/dev/null || \
+        echo "\$(date '+%F %T') boot: durable direct intent" > /run/vpn-agent-emergency
+elif [ -n "\$UP_HOST" ]; then
     # канал выбран: клиенты -> tun0 -> sing-box -> upstream
     ip route replace default dev tun0 table middleman
     # анти-луп: до самого upstream — напрямую через WAN
@@ -284,6 +321,8 @@ else
     # флаг и не-tun0 — восстанавливать нечего, а из аварии выйдет сам, когда появится канал.
     ip route replace default via $GW dev $WAN table middleman
     echo "\$(date '+%F %T') boot: канал не выбран — прямой выход" > /run/vpn-agent-emergency
+    mkdir -p /var/lib/vpn-panel
+    ( umask 077; echo "\$(date '+%F %T') boot: no upstream" > /var/lib/vpn-panel/emergency.intent )
 fi
 ip route replace $SUBNET dev wg0 table middleman
 ip rule del fwmark 0x64 2>/dev/null || true

@@ -14,9 +14,12 @@ for i in $(seq 1 30); do
     [ "$(cat /sys/class/net/tun0/carrier 2>/dev/null)" = "1" ] && break
     sleep 0.3
 done
-if [ -f /run/vpn-agent-emergency ]; then
+if [ -f /run/vpn-agent-emergency ] || [ -f /var/lib/vpn-panel/emergency.intent ]; then
     echo "singbox-post: аварийный режим / прямой выход — маршрут middleman не трогаю (агент вернёт tun0 сам)"
     exit 0
 fi
-$IP route replace default dev tun0 table middleman
+# vpn-agent owns middleman.  ExecStartPost only observes and requests a guarded
+# reconciliation, avoiding a second route writer during apply/rollback.
+AGENT=/usr/local/bin/vpn-agent
+[ -x "$AGENT" ] && "$AGENT" rotate --reason singbox-post >/dev/null 2>&1 || true
 exit 0

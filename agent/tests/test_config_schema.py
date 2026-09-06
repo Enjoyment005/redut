@@ -192,7 +192,7 @@ class TestConfigSchema(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(original, f)
             dry = config_schema.migrate_file(path, dry_run=True)
-            self.assertEqual(dry["steps"], ["0->1"])
+            self.assertEqual(dry["steps"], ["0->1", "1->2"])
             with open(path, encoding="utf-8") as f:
                 self.assertEqual(json.load(f), original)
             done = config_schema.migrate_file(path)
@@ -201,7 +201,8 @@ class TestConfigSchema(unittest.TestCase):
                 self.assertEqual(json.load(f), original)
             with open(path, encoding="utf-8") as f:
                 migrated = json.load(f)
-            self.assertEqual(migrated["config_schema_version"], 1)
+            self.assertEqual(migrated["config_schema_version"], 2)
+            self.assertEqual(migrated["dns_rescue"]["mode"], "disabled")
             again = config_schema.migrate_file(path)
             self.assertFalse(again["changed"])
             self.assertIsNone(again["backup"])

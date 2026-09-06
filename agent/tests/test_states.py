@@ -321,9 +321,18 @@ class TestEmergencyRestoreRoutes(unittest.TestCase):
 
     def test_flag_present_route_direct_noop(self):
         self._set_flag()
-        self.assertFalse(states.restore_emergency_routes({}, self.pool, log=lambda *a: None))
+        self.assertFalse(states.restore_emergency_routes(
+            {"gw": "198.51.100.1", "wan": "ens3"}, self.pool, log=lambda *a: None))
         self.assertEqual(self.on_calls, [])
         self.assertEqual(self._events(), [])
+
+    def test_flag_present_wrong_direct_route_restores(self):
+        self._set_flag()
+        self.route = "default via 198.51.100.2 dev ens3"
+        self.assertTrue(states.restore_emergency_routes(
+            {"gw": "198.51.100.1", "wan": "ens3"}, self.pool, log=lambda *a: None))
+        self.assertEqual(len(self.on_calls), 1)
+        self.assertIn("расхождения", self._events()[0][1])
 
     def test_emergency_on_failed_no_event(self):
         states.emergency_on = lambda cfg, log=print: False    # не posix / не смогли

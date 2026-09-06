@@ -28,7 +28,7 @@ throttled_log(){ # $1=stamp-файл $2=сообщение
 # Аварийный режим агента: он владеет маршрутами (middleman -> WAN). Сторож ничего
 # не «чинит» (иначе вернул бы default в мёртвый tun0 и убил бы прямой выход) —
 # только даёт агенту повторить попытку восстановиться (агент сам держит backoff, §8/F6).
-if [ -f /run/vpn-agent-emergency ]; then
+if [ -f /run/vpn-agent-emergency ] || [ -f /var/lib/vpn-panel/emergency.intent ]; then
     # маркеры двух-провалов начинают с чистого листа после выхода из аварии (F1):
     # иначе довесок с тиков до аварии превратил бы первый же чих в «2-й подряд»
     rm -f /run/singbox-wd.upfail /run/singbox-wd.sbfail
@@ -46,9 +46,12 @@ fi
 if [ "$(cat /sys/class/net/tun0/carrier 2>/dev/null)" != "1" ]; then
     log "tun0 down/absent -> restart sing-box"; systemctl restart sing-box; sleep 5; REPAIRED=1
 fi
-# 2) маршрут middleman default на месте?
+# Route ownership belongs to vpn-agent.  Watchdog observes and asks the agent to
+# reconcile; it never races a panel click by writing middleman directly.
 if ! $IP route show table middleman 2>/dev/null | grep -q '^default dev tun0'; then
-    $IP route replace default dev tun0 table middleman && log "restored middleman default route"; REPAIRED=1
+    log "middleman default drift -> vpn-agent rotate"
+    if [ -x "$AGENT" ]; then "$AGENT" rotate --reason watchdog >> "$LOG" 2>&1; fi
+    exit 0
 fi
 # 3) реальный выход через tun0
 OUT=$(curl -s --max-time 10 --interface tun0 https://api.ipify.org 2>/dev/null)
@@ -83,7 +86,9 @@ PY
         else
             log "tun0 egress dead, upstream $UHOST:$UPORT ALIVE -> restart sing-box ($N)"
             systemctl restart sing-box; sleep 5
-            $IP route replace default dev tun0 table middleman
+            # vpn-agent is the sole route writer; the next guarded rotate
+            # reconciles middleman after the service restart.
+            "$AGENT" rotate --reason watchdog >> "$LOG" 2>&1 || true
         fi
         rm -f /run/singbox-wd.upfail          # виноват был sing-box, не upstream
         REPAIRED=1

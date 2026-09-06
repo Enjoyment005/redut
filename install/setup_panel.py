@@ -30,6 +30,7 @@ VAR = "/var/lib/vpn-panel"
 # файлов есть окно, где тик крона (pool-refresh/heartbeat) поймал бы ImportError.
 AGENT_FILES = ["update.py", "config_store.py", "config_schema.py", "health.py", "learning.py",
                "metrics.py", "replay.py",
+               "dns_probe.py", "dns_runtime.py", "dns_rescue.py",
                "agent.py", "pool.py", "probe.py", "apply.py", "money.py",
                "states.py", "alerts.py", "country.py",
                "providers/__init__.py", "providers/base.py",
@@ -180,7 +181,8 @@ def write_config(name, net, port, subnet, wg_port, dnsmasq):
         try:
             with open(path, encoding="utf-8") as f:
                 old = json.load(f)
-            for k in ("money", "countries", "auto_prolong", "update", "stability", "learning"):
+            for k in ("money", "countries", "auto_prolong", "update", "stability", "learning",
+                      "dns_rescue"):
                 if isinstance(old.get(k), dict) and old[k]:
                     cfg[k] = old[k]
                     print("  config.json: сохранён настроенный блок '%s'" % k)

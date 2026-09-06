@@ -137,6 +137,7 @@ OPT = "/opt/vpn-panel"
 # файлов есть окно, где тик крона (pool-refresh/heartbeat) поймал бы ImportError.
 AGENT_FILES = ["update.py", "config_store.py", "config_schema.py", "health.py", "learning.py",
                "metrics.py", "replay.py",
+               "dns_probe.py", "dns_runtime.py", "dns_rescue.py",
                "agent.py", "pool.py", "probe.py", "apply.py", "money.py",
                "states.py", "alerts.py", "country.py",
                "providers/__init__.py", "providers/base.py",
@@ -267,7 +268,8 @@ def main(argv=None):
             except ValueError:
                 existing = {}
         final_cfg = {**cfg, "panel_port": a.panel_port}
-        for k in ("money", "countries", "auto_prolong", "update", "stability", "learning"):
+        for k in ("money", "countries", "auto_prolong", "update", "stability", "learning",
+                  "dns_rescue"):
             if isinstance(existing.get(k), dict) and existing[k]:
                 final_cfg[k] = existing[k]
                 print("  config.json: сохранён настроенный владельцем блок '%s' (§6.2)" % k)
