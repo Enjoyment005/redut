@@ -1,4 +1,5 @@
 #!/bin/bash
+# REDUT_BASE_CONTRACT=2
 # singbox-post.sh — ExecStartPost для sing-box.
 # После старта дождаться tun0 (carrier=1) и вернуть default-маршрут в таблицу middleman.
 # Нужно потому, что sing-box работает с auto_route:false и НЕ управляет таблицей middleman:

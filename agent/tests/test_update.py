@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -45,6 +46,48 @@ class TestUpdateLockHandoff(unittest.TestCase):
         self.assertEqual(captured["pass_fds"], (17,))
         self.assertEqual(captured["env"]["REDUT_LOCK_FD"], "17")
         self.assertEqual(captured["env"]["REDUT_LOCK_HELD"], "1")
+
+
+class TestDNSUpdatePreflightStateIntegrity(unittest.TestCase):
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(self.db) and os.unlink(self.db))
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("CREATE TABLE dns_rescue_state (singleton INTEGER, phase TEXT)")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _allowed(self):
+        with mock.patch.object(update, "_unit_active_state", return_value="inactive"):
+            return update.dns_update_preflight({"db": self.db})
+
+    def test_missing_singleton_row_is_not_treated_as_idle(self):
+        allowed, reason = self._allowed()
+        self.assertFalse(allowed)
+        self.assertIn("unreadable", reason)
+
+    def test_empty_phase_is_not_treated_as_idle(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("INSERT INTO dns_rescue_state(singleton, phase) VALUES(1, '')")
+            conn.commit()
+        finally:
+            conn.close()
+        allowed, reason = self._allowed()
+        self.assertFalse(allowed)
+        self.assertIn("unreadable", reason)
+
+    def test_explicit_idle_singleton_is_allowed(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("INSERT INTO dns_rescue_state(singleton, phase) VALUES(1, 'idle')")
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(self._allowed(), (True, ""))
 
 
 class FakePool:
@@ -407,13 +450,18 @@ class TestApplyOrchestration(unittest.TestCase):
             self._paths[name] = getattr(update, name)
             setattr(update, name, os.path.join(self.dir, sub))
         self._origs = (update.download_tree, update._run_setup, update.baseline_health,
-                       update.verify_health, update.node_version)
+                       update.verify_health, update.node_version,
+                       update._cancel_boot_setup_before_rollback,
+                       update.dns_update_preflight)
         update.baseline_health = lambda cfg: {"units": {"sing-box": True, "vpn-panel": True},
                                               "peers": 2, "panel": True}
-        self.setup_runs, self.setup_rc, self.verify_q = [], [], []
+        self.setup_runs, self.setup_rc, self.verify_q, self.events = [], [], [], []
         update.download_tree = self._fake_download
         update._run_setup = self._fake_setup
         update.verify_health = lambda cfg, baseline, **kw: self.verify_q.pop(0)
+        update.dns_update_preflight = lambda cfg: (True, "")
+        update._cancel_boot_setup_before_rollback = \
+            lambda log: self.events.append("cancel-boot") or True
         # node_version БЕЗ путей — версия узла (мок); С путями — честное чтение
         # (оркестрация читает VERSION деревьев: защита от полуустановки, ревью 17.08)
         real_nv = self._origs[4]
@@ -426,7 +474,9 @@ class TestApplyOrchestration(unittest.TestCase):
 
     def _restore(self):
         (update.download_tree, update._run_setup, update.baseline_health,
-         update.verify_health, update.node_version) = self._origs
+         update.verify_health, update.node_version,
+         update._cancel_boot_setup_before_rollback,
+         update.dns_update_preflight) = self._origs
         for name, val in self._paths.items():
             setattr(update, name, val)
 
@@ -448,6 +498,7 @@ class TestApplyOrchestration(unittest.TestCase):
     def _fake_setup(self, tree, log, lock_fd=None):
         with open(os.path.join(tree, "VERSION"), encoding="utf-8") as f:
             self.setup_runs.append(f.read().strip())
+        self.events.append("setup:" + self.setup_runs[-1])
         return (self.setup_rc.pop(0) if self.setup_rc else 0), ""
 
     def _tree_ver(self, path):
@@ -485,6 +536,56 @@ class TestApplyOrchestration(unittest.TestCase):
         self.assertEqual(len(self.alerter.sent), 1)
         self.assertIn("🔴", self.alerter.sent[0][0])
         self.assertEqual((update.status_read() or {}).get("phase"), "failed")
+        self.assertEqual(self.events,
+                         ["setup:1.3.0", "cancel-boot", "setup:1.2.0"])
+
+    def test_rollback_is_refused_if_target_boot_job_cannot_be_stopped(self):
+        self.verify_q[:] = [(False, "панель не отвечает по HTTPS")]
+        update._cancel_boot_setup_before_rollback = \
+            lambda log: self.events.append("cancel-failed") or False
+        r = update.apply(self.cfg, pool=self.pool, alerter=self.alerter,
+                         target="1.3.0", manual=True)
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["rolled_back"])
+        self.assertEqual(self.events, ["setup:1.3.0", "cancel-failed"])
+        self.assertEqual(self._tree_ver(update.REDUT_SRC), "1.3.0")
+        self.assertEqual(self._tree_ver(update.REDUT_PREV), "1.2.0")
+
+    def test_rollback_barrier_stops_all_boot_activation_sources(self):
+        calls = []
+
+        def run(command, **_kwargs):
+            calls.append(command)
+            if command[1] == "stop":
+                return 0, "", ""
+            if command[1] == "show":
+                return 0, "ActiveState=activating\nSubState=start-pre\nMainPID=42\n", ""
+            return 3, "inactive\n", ""
+
+        with mock.patch.object(update, "_run", side_effect=run):
+            self.assertTrue(self._origs[5](lambda _m: None))
+        self.assertEqual(calls[0], [
+            "systemctl", "stop", "redut-dns-rescue-watchdog.timer",
+            "redut-dns-rescue-watchdog.service"])
+        checked = [command[-1] for command in calls[1:3]]
+        self.assertEqual(checked, ["redut-dns-rescue-watchdog.timer",
+                                   "redut-dns-rescue-watchdog.service"])
+        self.assertIn(["systemctl", "stop", "vpn-boot-setup"], calls)
+
+    def test_rollback_barrier_preserves_completed_remain_after_exit_boot(self):
+        calls = []
+
+        def run(command, **_kwargs):
+            calls.append(command)
+            if command[1] == "stop":
+                return 0, "", ""
+            if command[1] == "show":
+                return 0, "ActiveState=active\nSubState=exited\nMainPID=0\n", ""
+            return 3, "inactive\n", ""
+
+        with mock.patch.object(update, "_run", side_effect=run):
+            self.assertTrue(self._origs[5](lambda _m: None))
+        self.assertNotIn(["systemctl", "stop", "vpn-boot-setup"], calls)
 
     def test_setup_rc_nonzero_rolls_back(self):
         self.setup_rc[:] = [1, 0]
@@ -525,6 +626,50 @@ class TestApplyOrchestration(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertIn("нездоров", r["why"])
         self.assertEqual(self.setup_runs, [])
+
+    def test_dns_preflight_is_authoritative_after_download_under_network_lock(self):
+        downloaded = []
+        original_download = update.download_tree
+
+        def download(*args, **kwargs):
+            result = original_download(*args, **kwargs)
+            downloaded.append(True)
+            return result
+
+        def preflight(_cfg):
+            self.assertTrue(downloaded, "preflight must run after artifact download")
+            return False, "DNS Rescue generation active"
+
+        update.download_tree = download
+        with mock.patch.object(update, "dns_update_preflight", side_effect=preflight):
+            r = update.apply(self.cfg, pool=self.pool, alerter=self.alerter,
+                             target="1.3.0", manual=True)
+        self.assertFalse(r["ok"])
+        self.assertIn("DNS Rescue", r["why"])
+        self.assertEqual(self.setup_runs, [])
+        self.assertFalse(os.path.exists(update.REDUT_NEW))
+        self.assertEqual(self._tree_ver(update.REDUT_SRC), "1.2.0")
+
+    def test_baseline_is_sampled_after_download_not_before_it(self):
+        downloaded = []
+        original_download = update.download_tree
+
+        def download(*args, **kwargs):
+            result = original_download(*args, **kwargs)
+            downloaded.append(True)
+            return result
+
+        def baseline(_cfg):
+            self.assertTrue(downloaded, "baseline must run after artifact download")
+            return {"units": {"sing-box": True, "vpn-panel": True},
+                    "peers": 2, "panel": True}
+
+        update.download_tree = download
+        update.baseline_health = baseline
+        self.verify_q[:] = [(True, "")]
+        r = update.apply(self.cfg, pool=self.pool, alerter=self.alerter,
+                         target="1.3.0", manual=True)
+        self.assertTrue(r["ok"], r)
 
     def test_download_network_error_no_letter(self):
         def boom(repo, version, dest=None, log=None):
@@ -626,17 +771,16 @@ class TestApplyOrchestration(unittest.TestCase):
         self.assertEqual(self._tree_ver(update.REDUT_SRC), "1.2.0")   # откат на НАСТОЯЩИЙ «до»
         self.assertEqual(self.setup_runs, ["1.3.0", "1.2.0"])
 
-    def test_rollback_trusts_health_not_rc(self):
-        # Инфраструктурный сбой (легли зеркала apt): и новая установка, и откат
-        # падают rc!=0, но узел цел и проходит проверку — это УСПЕШНЫЙ откат,
-        # а не «ОТКАТ НЕ ПОДТВЕРДИЛСЯ» (ревью 17.08).
+    def test_rollback_rc_failure_cannot_hide_stopped_dns_supervision(self):
+        # Barrier остановил timer/watchdog/boot. Даже если core-health зелёный,
+        # ранний rc!=0 старого setup не доказывает восстановление supervision.
         self.setup_rc[:] = [1, 1]
         self.verify_q[:] = [(True, "")]                    # verify — только для отката
         r = update.apply(self.cfg, pool=self.pool, alerter=self.alerter,
                          target="1.3.0", manual=True)
         self.assertFalse(r["ok"])
-        self.assertTrue(r["rolled_back"])
-        self.assertIn("Откат прошёл", self.alerter.sent[0][1])
+        self.assertFalse(r["rolled_back"])
+        self.assertIn("ОТКАТ НЕ ПОДТВЕРДИЛСЯ", self.alerter.sent[0][1])
 
     # ── принудительная переустановка (1.6.0): та же версия заново, лечение узла ──
     def test_force_reinstall_same_version(self):

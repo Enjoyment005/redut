@@ -1,4 +1,5 @@
 #!/bin/bash
+# REDUT_BASE_CONTRACT=2
 # singbox-watchdog.sh v3 — УМНЫЙ сторож sing-box. Запуск по cron */2.
 # Наблюдает: неактивный sing-box, упавший tun0, потерянный маршрут middleman.
 # Сам сеть не меняет: единственный writer — vpn-agent под /run/vpn-agent.lock.

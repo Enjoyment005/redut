@@ -469,6 +469,11 @@ class App:
 
     def _load_secrets(self):
         self.secrets, self.secrets_path = load_secrets()
+        if self.secrets_path:
+            self.secrets, self.admin_epoch = auth.ensure_admin_credential_epoch(
+                self.secrets_path, self.store)
+        else:
+            self.admin_epoch = self.store.credential_epoch()
         self.admin = self.secrets.get("admin")
         self.provisioned = bool(self.admin)   # admin есть -> панель настроена
         self.providers = make_providers(self.secrets)
@@ -566,20 +571,8 @@ class App:
     def save_update_auto(self, on):
         """Тумблер автообновления: точечная правка config.json (по образцу save_strategy —
         cfg целиком не выгружаем, чтобы не зашить в файл подмешанные дефолты)."""
-        path = self.cfg.get("_source") or ETC_CONFIG
         with _CONFIG_LOCK:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-            data.setdefault("update", {})["auto"] = bool(on)
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            try:
-                os.chmod(tmp, 0o644)     # конфиг читает и агент из-под cron
-            except OSError:
-                pass
-            os.replace(tmp, path)
-            self.cfg.setdefault("update", {})["auto"] = bool(on)
+            config_store.save_update_auto(self.cfg, on)
 
     def read_singbox(self):
         try:
@@ -700,6 +693,19 @@ class Handler(BaseHTTPRequestHandler):
             raise RequestBodyError(400, "тело запроса короче Content-Length")
         return data
 
+    def _json_object_body(self, limit=None):
+        """Read a bounded JSON object and map client syntax/type errors to HTTP 400."""
+        raw = self._body(limit=limit)
+        if not raw:
+            return {}
+        try:
+            body = json.loads(raw)
+        except (TypeError, ValueError, UnicodeDecodeError):
+            raise RequestBodyError(400, "тело должно быть корректным JSON-объектом")
+        if not isinstance(body, dict):
+            raise RequestBodyError(400, "тело должно быть JSON-объектом")
+        return body
+
     def log_message(self, fmt, *args):
         pass  # без access-логов (OPSEC); значимое пишем в event
 
@@ -790,8 +796,7 @@ class Handler(BaseHTTPRequestHandler):
                                                        "currency", "balance_after"), r)) for r in rows]})
         if path == "/api/clients":
             try:
-                return self._json(200, {"clients": clients_mod.list_clients(APP.cfg),
-                                        "next_ip": clients_mod.next_free_ip(APP.cfg)})
+                return self._json(200, clients_mod.client_inventory(APP.cfg))
             except clients_mod.ClientError as e:
                 return self._json(500, {"error": str(e)})
         if path == "/api/key/status":
@@ -880,8 +885,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(403, {"error": "CSRF-токен неверен"})
         try:
             return self._api_post(path)
+        except RequestBodyError:
+            raise
         except ProviderError as e:
-            self._json(502, {"error": "провайдер: %s" % e})
+            self._json(502, {"error": "провайдер: %s" % e,
+                             "replace_request": bool(
+                                 getattr(e, "replace_request", False))})
         except apply_mod.ApplyError as e:
             self._json(409, {"error": str(e)})
         except Exception as e:
@@ -974,7 +983,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(500, {"error": "systemd-run не запустился: %s" % (out or "rc=%s" % rc)})
         if path == "/api/automat":
             # F7: пауза автоматики из панели (FROZEN) — тот же конвейер session+CSRF
-            body = json.loads(self._body() or b"{}") or {}
+            body = Handler._json_object_body(self)
             if not isinstance(body.get("frozen"), bool):
                 return self._json(400, {"error": "ожидаю {frozen: true|false}"})
             with _DB_LOCK:
@@ -984,7 +993,7 @@ class Handler(BaseHTTPRequestHandler):
                                    src_ip=self._client_ip())
             return self._json(200, {"ok": True, "frozen": body["frozen"]})
         if path == "/api/emergency":
-            body = json.loads(self._body() or b"{}") or {}
+            body = Handler._json_object_body(self)
             on = bool(body.get("on"))
             rc, out = _run_agent(["emergency", "on" if on else "off"])
             with _DB_LOCK:
@@ -993,7 +1002,7 @@ class Handler(BaseHTTPRequestHandler):
                                    result="on" if on else "off", src_ip=self._client_ip())
             return self._json(200, {"ok": rc == 0, "state": st, "on": on, "output": (out or "")[-600:]})
         if path == "/api/dns-rescue":
-            body = json.loads(self._body() or b"{}") or {}
+            body = Handler._json_object_body(self)
             action = body.get("action")
             if action not in ("observe", "activate", "deactivate", "reconcile"):
                 return self._json(400, {"error": "неизвестное действие DNS Rescue"})
@@ -1027,14 +1036,15 @@ class Handler(BaseHTTPRequestHandler):
             uid, action = unquote(parts[2]), parts[3]
             with _DB_LOCK:
                 row = APP.pool.get(uid)
+            if action == "prolong":
+                return self._do_prolong(
+                    row, uid, Handler._json_object_body(self))
             if not row:
                 return self._json(404, {"error": "uid не найден"})
-            if action == "prolong":
-                return self._do_prolong(row)
             if action == "delete":
                 return self._do_delete(row)
             if action == "role":
-                role = (json.loads(self._body() or b"{}") or {}).get("role")
+                role = Handler._json_object_body(self).get("role")
                 with _DB_LOCK:
                     APP.pool.set_role(uid, role)
                     APP.pool.log_event("role", actor="user", to_uid=uid, result=role, src_ip=self._client_ip())
@@ -1048,7 +1058,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._do_apply(row)
         # --- клиентские WireGuard-конфиги (панель = root, правит wg0) ---
         if path == "/api/clients":
-            body = json.loads(self._body() or b"{}") or {}
+            body = Handler._json_object_body(self)
             try:
                 r = clients_mod.add_client(
                     APP.cfg, (body.get("name") or "").strip(),
@@ -1061,9 +1071,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, r)
         if len(parts) == 4 and parts[1] == "clients" and parts[3] == "delete":
             name = unquote(parts[2])
+            body = Handler._json_object_body(self)
             try:
                 r = clients_mod.delete_client(
-                    APP.cfg, name, dns_pool=APP.saga_pool)
+                    APP.cfg, name, pubkey=body.get("pubkey"),
+                    dns_pool=APP.saga_pool)
             except clients_mod.ClientError as e:
                 return self._json(400, {"error": str(e)})
             with _DB_LOCK:
@@ -1071,13 +1083,13 @@ class Handler(BaseHTTPRequestHandler):
                                    detail=name, src_ip=self._client_ip())
             return self._json(200, r)
         if path == "/api/buy":
-            return self._do_buy(json.loads(self._body() or b"{}") or {})
+            return self._do_buy(Handler._json_object_body(self))
         if path == "/api/key":
-            return self._do_key(json.loads(self._body() or b"{}") or {})
+            return self._do_key(Handler._json_object_body(self))
         if path == "/api/key/check":
-            return self._do_key_check(json.loads(self._body() or b"{}") or {})
+            return self._do_key_check(Handler._json_object_body(self))
         if path == "/api/strategy":
-            return self._do_strategy(json.loads(self._body() or b"{}") or {})
+            return self._do_strategy(Handler._json_object_body(self))
         if path == "/api/update/check":
             # Отдельным процессом vpn-agent (как rotate): та же кодовая дорожка, что у
             # крона, свой conn к БД; заодно агент сам напишет событие/письмо при новинке.
@@ -1088,7 +1100,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/update/apply":
             return self._do_update_apply()
         if path == "/api/update/config":
-            body = json.loads(self._body() or b"{}") or {}
+            body = Handler._json_object_body(self)
             if not isinstance(body.get("auto"), bool):
                 return self._json(400, {"error": "ожидаю {auto: true|false}"})
             APP.save_update_auto(body["auto"])
@@ -1110,10 +1122,7 @@ class Handler(BaseHTTPRequestHandler):
         дочитает исход после своего рестарта."""
         if os.name != "posix":
             return self._json(400, {"error": "обновление применяется только на сервере"})
-        try:
-            body = json.loads(self._body() or b"{}") or {}
-        except ValueError:
-            body = {}
+        body = Handler._json_object_body(self)
         force = bool(body.get("force"))
         st = self._update_status()
         if st.get("applying"):
@@ -1481,23 +1490,65 @@ class Handler(BaseHTTPRequestHandler):
     def _do_buy(self, body):
         """POST /api/buy {country?, period?} — гейты §6.2 + идемпотентность +
         постфактум-проба страны выхода §6.1. Те же гейты, что и у agent.py buy."""
+        request_id = str(body.get("request_id") or "").strip()
+        if not request_id:
+            return self._json(400, {"error": "нужно поле request_id для безопасного повтора"})
+        try:
+            with _DB_LOCK:
+                bound = money_mod.bound_spend_request(APP.pool, request_id)
+        except money_mod.SpendDenied as error:
+            return self._json(400, {"error": str(error)})
+        lim = money_mod.limits(APP.cfg)
+        bound_request = ((bound or {}).get("request") or {}
+                         if (bound or {}).get("kind") == "buy" else {})
+        country = str(body.get("country") or "").strip().lower()
+        if bound_request and not country:
+            country = str(bound_request.get("country") or "").lower()
+        try:
+            period = int(body.get("period") if body.get("period") is not None
+                         else bound_request.get("period") or lim["buy_period_days"])
+        except (TypeError, ValueError):
+            return self._json(400, {"error": "period должен быть числом"})
+        version = int(bound_request.get("version") or lim["buy_version"])
+
+        # A stored result is immutable: replay it before current provider,
+        # market, blacklist or price state can veto observation/ACK.
+        if bound and bound.get("phase") in ("committed", "acknowledged"):
+            expected = {"count": int(bound_request.get("count") or 1),
+                        "period": period, "country": country,
+                        "version": version}
+            try:
+                with _DB_LOCK:
+                    r = money_mod.replay_completed_request(
+                        APP.pool, request_id, "buy", expected=expected)
+            except money_mod.SpendDenied as error:
+                return self._json(409, {"error": "гейт трат: %s" % error,
+                                        "replace_request": bool(error.replace_request)})
+            return self._json(200, {"ok": True, "warning": "",
+                                    "recovered": r["recovered"], "price": r["price"],
+                                    "currency": r["currency"],
+                                    "balance_after": r.get("balance_after"),
+                                    "order_id": r.get("order_id"),
+                                    "country": r.get("country"),
+                                    "request_id": r["request_id"],
+                                    "uids": ["%s:%s" % (x["provider"], x["ext_id"])
+                                             for x in r["proxies"]],
+                                    "postcheck": []})
+        if bound and bound.get("phase") == "failed":
+            return self._json(409, {
+                "error": "request_id завершён ошибкой; нужен новый ID",
+                "replace_request": True})
+
         prov = APP.providers.get("proxy6")
         if prov is None:
             return self._json(400, {"error": "нет ключа PROXY6 — покупка недоступна"})
-        lim = money_mod.limits(APP.cfg)
-        country = str(body.get("country") or "").strip().lower()
         # чёрный список — «нет» всегда; страна с низкой оценкой — можно, но человек
         # должен видеть, на что идёт (предупреждение уедет в ответ и в журнал).
-        if country and country_mod.is_blocked(country, APP.cfg):
+        if bound is None and country and country_mod.is_blocked(country, APP.cfg):
             return self._json(400, {"error": "страна %s в чёрном списке — не покупаем никогда" % country})
         warn = ""
-        if country and not country_mod.auto_allowed(country, True, APP.cfg):
+        if bound is None and country and not country_mod.auto_allowed(country, True, APP.cfg):
             warn = "%s: %s" % (country, country_mod.explain(country))
-        try:
-            period = int(body.get("period") or lim["buy_period_days"])
-        except (TypeError, ValueError):
-            return self._json(400, {"error": "period должен быть числом"})
-        version = int(lim["buy_version"])
         # страну назвали — берём её; нет — идём по умной оценке (репутация +
         # выученная стабильность F8, лучшие страны первыми)
         if country:
@@ -1505,33 +1556,37 @@ class Handler(BaseHTTPRequestHandler):
         else:
             with _DB_LOCK:
                 cands = money_mod.buy_candidates(APP.cfg, pool=APP.pool)
-        pick = None
-        for cc in cands:
-            try:
-                if prov.getcount(cc, version) > 0:
-                    pick = cc
-                    break
-            except ProviderError:
-                continue
-        if not pick:
+        pick = country if bound is not None else None
+        if bound is None:
+            for cc in cands:
+                try:
+                    if prov.getcount(cc, version) > 0:
+                        pick = cc
+                        break
+                except ProviderError:
+                    continue
+        if bound is None and not pick:
             return self._json(409, {"error": "нет прокси version=%d в наличии среди подходящих стран" % version})
         try:
             with _DB_LOCK:   # покупка под общим локом: атомарность суточных лимитов
                 r = money_mod.plan_and_buy(APP.pool, prov, APP.cfg, country=pick, period=period,
                                            count=1, version=version, server=APP.cfg.get("server"),
                                            actor="user", src_ip=self._client_ip(),
-                                           auto=False)   # покупает человек из панели
+                                           auto=False, request_id=request_id)
+                                           # покупает человек из панели
         except money_mod.SpendDenied as e:
             with _DB_LOCK:
                 APP.pool.log_event("buy", actor="user", result="denied", detail=str(e),
                                    src_ip=self._client_ip())
-            return self._json(409, {"error": "гейт трат: %s" % e})
+            return self._json(409, {"error": "гейт трат: %s" % e,
+                                    "replace_request": bool(e.replace_request)})
         # §6.1 постфактум: реальная страна выхода (пробы — ВНЕ лока, они долгие)
         post = self._postbuy(prov, r["proxies"])
         return self._json(200, {"ok": True, "warning": warn,
                                 "recovered": r["recovered"], "price": r["price"],
                                 "currency": r["currency"], "balance_after": r["balance_after"],
                                 "order_id": r["order_id"], "country": r["country"],
+                                "request_id": r["request_id"],
                                 "uids": ["%s:%s" % (x["provider"], x["ext_id"]) for x in r["proxies"]],
                                 "postcheck": post})
 
@@ -1567,24 +1622,60 @@ class Handler(BaseHTTPRequestHandler):
                          "blocked": blocked})
         return post
 
-    def _do_prolong(self, row):
-        prov = APP.providers.get(row["provider"])
-        if prov is None or not prov.caps.get("prolong"):
-            return self._json(400, {"error": "провайдер %s не умеет продление" % row["provider"]})
-        body = json.loads(self._body() or b"{}") or {}
+    def _do_prolong(self, row, uid, body):
+        request_id = str(body.get("request_id") or "").strip()
+        if not request_id:
+            return self._json(400, {"error": "нужно поле request_id для безопасного повтора"})
         try:
             days = int(body.get("days"))
         except (TypeError, ValueError):
             return self._json(400, {"error": "нужно поле days (целое)"})
         try:
             with _DB_LOCK:
+                bound = money_mod.bound_spend_request(APP.pool, request_id)
+        except money_mod.SpendDenied as error:
+            return self._json(400, {"error": str(error)})
+        if bound and bound.get("phase") in ("committed", "acknowledged"):
+            expected = {"ext_id": str((bound.get("request") or {}).get("ext_id") or ""),
+                        "days": days}
+            try:
+                with _DB_LOCK:
+                    r = money_mod.replay_completed_request(
+                        APP.pool, request_id, "prolong", expected=expected, uid=uid)
+            except money_mod.SpendDenied as error:
+                return self._json(409, {"error": "гейт трат: %s" % error,
+                                        "replace_request": bool(error.replace_request)})
+            return self._json(200, {"ok": True, "uid": r["uid"],
+                                    "days": r["days"], "price": r["price"],
+                                    "currency": r["currency"],
+                                    "balance_after": r.get("balance_after"),
+                                    "date_end": r.get("date_end"),
+                                    "request_id": r["request_id"]})
+        if bound and bound.get("phase") == "failed":
+            return self._json(409, {
+                "error": "request_id завершён ошибкой; нужен новый ID",
+                "replace_request": True})
+        if row is None and bound and bound.get("kind") == "prolong":
+            request = bound.get("request") or {}
+            row = {"provider": bound.get("provider"), "ext_id": request.get("ext_id"),
+                   "uid": bound.get("uid"), "descr": bound.get("descr"),
+                   "date_end": request.get("date_before")}
+        if row is None:
+            return self._json(404, {"error": "uid не найден"})
+        prov = APP.providers.get(row["provider"])
+        if prov is None or not prov.caps.get("prolong"):
+            return self._json(400, {"error": "провайдер %s не умеет продление" % row["provider"]})
+        try:
+            with _DB_LOCK:
                 r = money_mod.prolong_with_limits(APP.pool, prov, APP.cfg, row=row, days=days,
-                                                  actor="user", src_ip=self._client_ip())
+                                                  actor="user", src_ip=self._client_ip(),
+                                                  request_id=request_id)
         except money_mod.SpendDenied as e:
-            return self._json(409, {"error": "гейт трат: %s" % e})
+            return self._json(409, {"error": "гейт трат: %s" % e,
+                                    "replace_request": bool(e.replace_request)})
         return self._json(200, {"ok": True, "uid": r["uid"], "days": r["days"], "price": r["price"],
                                 "currency": r["currency"], "balance_after": r["balance_after"],
-                                "date_end": r["date_end"]})
+                                "date_end": r["date_end"], "request_id": r["request_id"]})
 
     def _do_delete(self, row):
         """§6.4: полный набор гейтов (тумблер, роль, не текущий upstream, проба
@@ -1670,8 +1761,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif otp and APP.secrets_path and auth.consume_recovery_code(
                         None, APP.secrets_path, otp):
                     # recovery-код одноразовый: перечитать секреты (список изменился)
-                    APP.secrets, _ = load_secrets()
-                    APP.admin = APP.secrets.get("admin")
+                    APP.reload_secrets()
                     ok = True
         finally:
             _AUTH_SLOTS.release()
@@ -1681,9 +1771,15 @@ class Handler(BaseHTTPRequestHandler):
                 APP.pool.log_event("login", actor="user", result="fail",
                                    detail="fails=%d ban=%ds" % (fails, banned), src_ip=ip)
             return self._send(401, views.login_page(error="Неверный пароль или код второго фактора."))
+        try:
+            with _DB_LOCK:
+                token, csrf = APP.store.create_session(
+                    ip, expected_epoch=APP.admin_epoch)
+                APP.store.record_success(ip)
+        except auth.CredentialEpochChanged:
+            return self._send(
+                401, views.login_page(error="Учётные данные изменились во время входа. Повтори попытку."))
         with _DB_LOCK:
-            APP.store.record_success(ip)
-            token, csrf = APP.store.create_session(ip)
             APP.pool.log_event("login", actor="user", result="ok", src_ip=ip)
         cookie = "%s=%s; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=%d" % (
             auth.COOKIE_NAME, token, auth.SESSION_TTL)
@@ -1694,11 +1790,9 @@ class Handler(BaseHTTPRequestHandler):
         if APP.provisioned:
             return self._json(403, {"error": "панель уже настроена"})
         try:
-            body = json.loads(self._body(limit=32768) or b"{}") or {}
-        except (TypeError, ValueError):
-            return self._json(400, {"error": "тело должно быть JSON-объектом"})
-        if not isinstance(body, dict):
-            return self._json(400, {"error": "тело должно быть JSON-объектом"})
+            body = Handler._json_object_body(self, limit=32768)
+        except RequestBodyError as error:
+            return self._json(error.status, {"error": error.message})
         if path == "/api/setup/claim":
             token = APP.claim_setup(str(body.get("secret") or ""))
             if not token:
@@ -1911,7 +2005,11 @@ class Handler(BaseHTTPRequestHandler):
             data[name] = {"api_key": key}
         if st.get("smtp"):
             data["smtp"] = st["smtp"]
-        APP.write_secrets(data)
+        with _DB_LOCK:
+            auth.write_admin_credentials_atomic(
+                APP.secrets_path or ETC_SECRETS, data, APP.store,
+                force=False, replace_all=True)
+        APP.reload_secrets()
         try:
             auth.consume_bootstrap_secret(APP.bootstrap_path)
         except OSError as exc:

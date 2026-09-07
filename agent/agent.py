@@ -682,55 +682,102 @@ def _postbuy_check(cfg, p, providers, bought):
 def cmd_buy(cfg, args):
     providers, p = _providers_and_pool(cfg)
     prov = providers.get("proxy6")
+    if args.yes and not args.request_id:
+        request_id = os.urandom(16).hex()
+        print("Покупка НЕ выполнена. Повтори команду с --request-id %s --yes; "
+              "сохрани этот ID для безопасного повтора после сбоя." % request_id)
+        p.close()
+        return 2
+    try:
+        bound = (money_mod.bound_spend_request(p, args.request_id)
+                 if args.request_id else None)
+    except money_mod.SpendDenied as error:
+        print("❌ request-id: %s" % error)
+        p.close()
+        return 1
+    lim = money_mod.limits(cfg)
+    bound_request = ((bound or {}).get("request") or {}
+                     if (bound or {}).get("kind") == "buy" else {})
+    period = (args.period if args.period is not None else
+              bound_request.get("period") or lim["buy_period_days"])
+    version = int(bound_request.get("version") or lim["buy_version"])
+    country = (args.country or "").strip().lower()
+    if not country and bound_request:
+        country = str(bound_request.get("country") or "").strip().lower()
+    if bound and bound.get("phase") in ("committed", "acknowledged"):
+        expected = {"count": int(bound_request.get("count") or 1),
+                    "period": int(period), "country": country,
+                    "version": version}
+        try:
+            r = money_mod.replay_completed_request(
+                p, args.request_id, "buy", expected=expected)
+        except money_mod.SpendDenied as error:
+            print("❌ request-id: %s" % error)
+            p.close()
+            return 1
+        uids = ", ".join("%s:%s" % (x["provider"], x["ext_id"])
+                         for x in r["proxies"])
+        print("✅ Сохранённый результат покупки: %s · цена %.2f %s · "
+              "order=%s · баланс=%s"
+              % (uids, r["price"], r["currency"], r.get("order_id"),
+                 r.get("balance_after")))
+        p.close()
+        return 0
+    if bound and bound.get("phase") == "failed":
+        print("❌ request-id завершён ошибкой; повтори с новым --request-id")
+        p.close()
+        return 1
     if prov is None:
         print("Нет ключа PROXY6 — покупка недоступна")
         p.close()
         return 1
-    lim = money_mod.limits(cfg)
-    period = args.period or lim["buy_period_days"]
-    version = int(lim["buy_version"])
-    country = (args.country or "").strip().lower()
     # страну назвали руками — запрещаем только чёрный список; не назвали — идём по оценке
-    if country and country_mod.is_blocked(country, cfg):
+    if bound is None and country and country_mod.is_blocked(country, cfg):
         print("Страна %s в чёрном списке — не покупаем никогда (§6.1)" % country)
         p.close()
         return 1
-    if country and not country_mod.auto_allowed(country, True, cfg):
+    if bound is None and country and not country_mod.auto_allowed(country, True, cfg):
         print("⚠️ %s: %s. Покупаю, потому что страну указал ты явно."
               % (country, country_mod.explain(country)))
     chosen = [country] if country else money_mod.buy_candidates(cfg, pool=p)
 
     # рынок: первая страна белого списка с наличием (getcount), цена — getprice
-    pick = avail = None
-    for cc in chosen:
-        try:
-            n = prov.getcount(cc, version)
-        except ProviderError as e:
-            print("  getcount %s: %s" % (cc, e))
-            continue
-        if n > 0:
-            pick, avail = cc, n
-            break
-        print("  %s: нет в наличии (0)" % cc)
-    if not pick:
+    pick = country if bound is not None else None
+    avail = "durable retry" if bound is not None else None
+    if bound is None:
+        for cc in chosen:
+            try:
+                n = prov.getcount(cc, version)
+            except ProviderError as e:
+                print("  getcount %s: %s" % (cc, e))
+                continue
+            if n > 0:
+                pick, avail = cc, n
+                break
+            print("  %s: нет в наличии (0)" % cc)
+    if bound is None and not pick:
         print("Нет прокси version=%d в наличии ни в одной стране белого списка" % version)
         p.close()
         return 1
 
-    try:
-        pre = money_mod.preflight_buy(p, prov, cfg, country=pick, period=period,
-                                      count=1, version=version)
-    except money_mod.SpendDenied as e:
-        print("❌ Гейт трат: %s" % e)
-        p.close()
-        return 1
-    bal = pre["balance_before"]
-    print("Выбрано: %s (в наличии %s), период %d дн, version=%d" % (pick, avail, period, version))
-    print("Цена: %.2f %s · баланс %s -> ~%.2f · лимиты: ≤%.0f/покупка, ≤%.0f/сутки, остаток ≥%.0f"
-          % (pre["price"], pre["currency"], bal, (bal or 0) - pre["price"],
-             lim["max_price_per_buy"], lim["max_spend_per_day"], lim["min_balance_reserve"]))
+    if bound is None:
+        try:
+            pre = money_mod.preflight_buy(p, prov, cfg, country=pick, period=period,
+                                          count=1, version=version)
+        except money_mod.SpendDenied as e:
+            print("❌ Гейт трат: %s" % e)
+            p.close()
+            return 1
+        bal = pre["balance_before"]
+        print("Выбрано: %s (в наличии %s), период %d дн, version=%d" % (pick, avail, period, version))
+        print("Цена: %.2f %s · баланс %s -> ~%.2f · лимиты: ≤%.0f/покупка, ≤%.0f/сутки, остаток ≥%.0f"
+              % (pre["price"], pre["currency"], bal, (bal or 0) - pre["price"],
+                 lim["max_price_per_buy"], lim["max_spend_per_day"], lim["min_balance_reserve"]))
+    else:
+        print("Повтор durable request %s: рынок и новый quote не запрашиваются."
+              % args.request_id)
     if args.dry_run:
-        print("[dry-run] гейты пройдены, покупка НЕ выполнена.")
+        print("[dry-run] покупка НЕ выполнена; durable retry будет проверен только при --yes.")
         p.close()
         return 0
     if not args.yes:
@@ -739,7 +786,8 @@ def cmd_buy(cfg, args):
         return 2
     try:
         r = money_mod.plan_and_buy(p, prov, cfg, country=pick, period=period, count=1,
-                                   version=version, server=cfg.get("server"), actor="user")
+                                   version=version, server=cfg.get("server"), actor="user",
+                                   request_id=args.request_id)
     except money_mod.SpendDenied as e:
         print("❌ Гейт трат: %s" % e)
         p.close()
@@ -760,7 +808,45 @@ def cmd_buy(cfg, args):
 
 def cmd_prolong(cfg, args):
     providers, p = _providers_and_pool(cfg)
+    if args.yes and not args.request_id:
+        request_id = os.urandom(16).hex()
+        print("Продление НЕ выполнено. Повтори команду с --request-id %s --yes; "
+              "сохрани этот ID для безопасного повтора после сбоя." % request_id)
+        p.close()
+        return 2
+    try:
+        bound = (money_mod.bound_spend_request(p, args.request_id)
+                 if args.request_id else None)
+    except money_mod.SpendDenied as error:
+        print("❌ request-id: %s" % error)
+        p.close()
+        return 1
+    if bound and bound.get("phase") in ("committed", "acknowledged"):
+        expected = {"ext_id": str((bound.get("request") or {}).get("ext_id") or ""),
+                    "days": int(args.days)}
+        try:
+            r = money_mod.replay_completed_request(
+                p, args.request_id, "prolong", expected=expected, uid=args.uid)
+        except money_mod.SpendDenied as error:
+            print("❌ request-id: %s" % error)
+            p.close()
+            return 1
+        print("✅ Сохранённый результат продления %s на %d дн · цена %s %s · "
+              "баланс=%s · date_end=%s"
+              % (r["uid"], r["days"], r["price"], r["currency"],
+                 r.get("balance_after"), r.get("date_end")))
+        p.close()
+        return 0
+    if bound and bound.get("phase") == "failed":
+        print("❌ request-id завершён ошибкой; повтори с новым --request-id")
+        p.close()
+        return 1
     row = p.get(args.uid)
+    if row is None and bound and bound.get("kind") == "prolong":
+        request = bound.get("request") or {}
+        row = {"provider": bound.get("provider"), "ext_id": request.get("ext_id"),
+               "uid": bound.get("uid"), "descr": bound.get("descr"),
+               "date_end": request.get("date_before")}
     if not row:
         print("uid %s не найден в пуле" % args.uid)
         p.close()
@@ -775,7 +861,9 @@ def cmd_prolong(cfg, args):
         p.close()
         return 2
     try:
-        r = money_mod.prolong_with_limits(p, prov, cfg, row=row, days=args.days, actor="user")
+        r = money_mod.prolong_with_limits(
+            p, prov, cfg, row=row, days=args.days, actor="user",
+            request_id=args.request_id)
     except money_mod.SpendDenied as e:
         print("❌ Гейт трат: %s" % e)
         p.close()
@@ -784,6 +872,46 @@ def cmd_prolong(cfg, args):
           % (r["uid"], r["days"], r["price"], r["currency"], r["balance_after"], r["date_end"]))
     p.close()
     return 0
+
+
+def cmd_spend_resume(cfg, args):
+    """Inspect or explicitly acknowledge one exact durable spend result."""
+    _, p = _providers_and_pool(cfg)
+    try:
+        if not args.operation:
+            if args.ack:
+                raise money_mod.SpendDenied("--ack требует --operation <ID>")
+            rows = money_mod.outstanding_spend_operations(p)
+            if not rows:
+                print("Незавершённых денежных операций нет.")
+                return 0
+            for op in rows:
+                print("%s phase=%s kind=%s provider=%s request=%s idempotency=%s"
+                      % (op.get("id"), op.get("phase"), op.get("kind"),
+                         op.get("provider"),
+                         json.dumps(op.get("request"), ensure_ascii=False,
+                                    sort_keys=True),
+                         op.get("idempotency_key")))
+            print("Для legacy committed результата: spend-resume --operation <ID> --ack")
+            return 0
+        result = money_mod.resume_spend_operation(
+            p, args.operation, acknowledge=args.ack)
+        print(json.dumps({"operation_id": result["operation"].get("id"),
+                          "phase": result["operation"].get("phase"),
+                          "kind": result["operation"].get("kind"),
+                          "provider": result["operation"].get("provider"),
+                          "request": result["operation"].get("request"),
+                          "result": result["result"],
+                          "acknowledged": result["acknowledged"]},
+                         ensure_ascii=False, sort_keys=True, indent=2))
+        if not args.ack and not result["acknowledged"]:
+            print("Результат только показан. После проверки повтори с --ack.")
+        return 0
+    except money_mod.SpendDenied as error:
+        print("❌ spend-resume: %s" % error)
+        return 1
+    finally:
+        p.close()
 
 
 def cmd_drop(cfg, args):
@@ -1163,10 +1291,17 @@ def main(argv=None):
     sp.add_argument("--period", type=int, help="период, дней (дефолт из config.money.buy_period_days)")
     sp.add_argument("--dry-run", action="store_true", help="показать рынок+гейты, не покупать")
     sp.add_argument("--yes", action="store_true", help="подтвердить РЕАЛЬНУЮ трату")
+    sp.add_argument("--request-id", help="durable ID намерения для безопасного повтора")
     sp = sub.add_parser("prolong", help="⚠️ продлить прокси (деньги §6.3)")
     sp.add_argument("uid", help="uid=provider:id")
     sp.add_argument("--days", type=int, required=True, help="на сколько дней")
     sp.add_argument("--yes", action="store_true", help="подтвердить РЕАЛЬНУЮ трату")
+    sp.add_argument("--request-id", help="durable ID намерения для безопасного повтора")
+    sp = sub.add_parser("spend-resume",
+                        help="показать/подтвердить незавершённый денежный результат")
+    sp.add_argument("--operation", help="точный spend operation ID; без него — список")
+    sp.add_argument("--ack", action="store_true",
+                    help="после проверки явно подтвердить committed результат")
     sp = sub.add_parser("drop", help="⚠️ удалить прокси (необратимо, гейты §6.4)")
     sp.add_argument("uid", help="uid=provider:id")
     sp.add_argument("--yes", action="store_true", help="подтвердить необратимое удаление")
@@ -1220,7 +1355,8 @@ def main(argv=None):
     handlers = {"status": cmd_status, "list": cmd_list, "pool-refresh": cmd_pool_refresh,
                 "probe": cmd_probe, "apply": cmd_apply, "strategy-apply": cmd_strategy_apply,
                 "rollback": cmd_rollback,
-                "buy": cmd_buy, "prolong": cmd_prolong, "drop": cmd_drop,
+                "buy": cmd_buy, "prolong": cmd_prolong,
+                "spend-resume": cmd_spend_resume, "drop": cmd_drop,
                 "rotate": cmd_rotate, "emergency": cmd_emergency,
                 "dns-rescue": cmd_dns_rescue,
                 "switch-provider": cmd_switch_provider,

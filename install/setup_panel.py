@@ -15,6 +15,7 @@
 import argparse
 import contextlib
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -136,6 +137,35 @@ def sh(cmd, check=False):
     return (p.stdout + p.stderr).strip()
 
 
+@contextlib.contextmanager
+def panel_config_upgrade_barrier(enabled):
+    """Quiesce a legacy panel that does not yet honor config_store's lock."""
+    state = sh("systemctl is-active vpn-panel") if enabled else ""
+    was_running = state.strip() in ("active", "activating")
+    if was_running:
+        sh("systemctl stop vpn-panel", check=True)
+    try:
+        yield
+    finally:
+        if was_running:
+            sh("systemctl start vpn-panel", check=True)
+
+
+def legacy_panel_writer_installed():
+    """Whether a dormant or running installed panel still uses the old writer."""
+    server_path = os.path.join(OPT, "webpanel", "server.py")
+    load_state = sh("systemctl show -p LoadState --value vpn-panel").strip()
+    installed = load_state == "loaded" or os.path.isfile(server_path)
+    if not installed:
+        return False
+    try:
+        with open(server_path, encoding="utf-8") as source:
+            panel_source = source.read()
+    except OSError:
+        return True
+    return "config_store.save_update_auto" not in panel_source
+
+
 def detect_net():
     route = sh("ip route show default")
     m = re.search(r"default via (\S+) dev (\S+)", route or "")
@@ -192,24 +222,26 @@ def write_config(name, net, port, subnet, wg_port, dnsmasq):
     }
     cfg.update(DEFAULTS)
     path = os.path.join(ETC, "config.json")
-    if os.path.isfile(path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                old = json.load(f)
-            for k in ("money", "countries", "auto_prolong", "update", "stability", "learning",
-                      "dns_rescue"):
-                if isinstance(old.get(k), dict) and old[k]:
-                    cfg[k] = old[k]
-                    print("  config.json: сохранён настроенный блок '%s'" % k)
-        except (ValueError, OSError):
-            pass
-    # Атомарно (tmp + replace): kill/питание посреди записи оставили бы усечённый
-    # config.json — не стартует ни панель, ни агент, ни самообновление (ревью 17.08).
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, path)
+    store_path = os.path.join(OPT, "config_store.py")
+    spec = importlib.util.spec_from_file_location("redut_installer_config_store", store_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("не удалось загрузить общий writer config.json")
+    store = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(store)
+    preserved = []
+
+    def merge_owner_settings(old):
+        result = dict(cfg)
+        for key in ("money", "countries", "auto_prolong", "update", "stability", "learning",
+                    "dns_rescue"):
+            if isinstance(old.get(key), dict) and old[key]:
+                result[key] = old[key]
+                preserved.append(key)
+        return result
+
+    store.update({"_source": path}, merge_owner_settings, create=True)
+    for key in preserved:
+        print("  config.json: сохранён настроенный блок '%s'" % key)
 
 
 @contextlib.contextmanager
@@ -405,6 +437,12 @@ def main():
             sys.exit("vpn-agent занят; установка панели отложена")
     with_panel = not a.no_panel
 
+    # Agent-only upgrade must not revive a running pre-lock panel.  Refuse
+    # before touching installation paths; rerun with the panel payload so both
+    # config writers cross the compatibility boundary together.
+    if not with_panel and legacy_panel_writer_installed():
+        sys.exit("работает старая vpn-panel; повтори установку без --no-panel")
+
     for d in (OPT, os.path.join(OPT, "providers"), os.path.join(OPT, "webpanel"),
               ETC, os.path.join(VAR, "cfg")):
         os.makedirs(d, exist_ok=True)
@@ -415,7 +453,13 @@ def main():
     n = copy_files(a.src, with_panel)
     ver = copy_version(a.src)
     print("  скопировано файлов: %d%s" % (n, ("  (сборка Редут %s)" % ver) if ver else ""))
-    write_config(a.name, net, a.port, a.subnet, a.wg_port, a.dnsmasq)
+    # The running v1.13.1 panel has an old config writer that does not know the
+    # new interprocess lock.  Stop it only around the first cross-version merge.
+    # Even an on-disk compatible panel may still be an old in-memory process
+    # after a prior interrupted upgrade.  Quiesce/restart it for the merge;
+    # the preflight above already rejects incompatible dormant payloads.
+    with panel_config_upgrade_barrier(True):
+        write_config(a.name, net, a.port, a.subnet, a.wg_port, a.dnsmasq)
     fresh = ensure_secrets()
     bootstrap_secret = create_bootstrap_secret(fresh)
 

@@ -13,6 +13,7 @@ secrets.json блок "admin" (pw=scrypt-хеш, totp=base32-seed, recovery=sha2
 import argparse
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 
@@ -21,6 +22,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from webpanel import auth  # noqa: E402
 
 DEFAULT_SECRETS = "/etc/vpn-panel/secrets.json"
+DEFAULT_CONFIG = "/etc/vpn-panel/config.json"
+DEFAULT_STATE_DB = "/var/lib/vpn-panel/state.db"
 PANEL_UNIT = "vpn-panel"
 
 
@@ -49,6 +52,29 @@ def restart_panel(secrets_path):
         return False
 
 
+def resolve_state_db(secrets_path, explicit=None):
+    if explicit:
+        return os.path.abspath(explicit)
+    candidates = []
+    env_config = os.environ.get("VPN_PANEL_CONFIG")
+    if env_config:
+        candidates.append(env_config)
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(secrets_path)), "config.json"))
+    if os.path.realpath(secrets_path) == os.path.realpath(DEFAULT_SECRETS):
+        candidates.append(DEFAULT_CONFIG)
+    for path in candidates:
+        try:
+            with open(path, encoding="utf-8") as source:
+                value = json.load(source).get("db")
+            if isinstance(value, str) and value.strip():
+                return os.path.abspath(value)
+        except (OSError, ValueError, AttributeError):
+            pass
+    if os.path.realpath(secrets_path) == os.path.realpath(DEFAULT_SECRETS):
+        return DEFAULT_STATE_DB
+    return os.path.join(os.path.dirname(os.path.abspath(secrets_path)), "state.db")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -56,6 +82,7 @@ def main(argv=None):
     ap.add_argument("--label", default="vpn-panel", help="метка для TOTP (обычно имя сервера)")
     ap.add_argument("--password", help="задать пароль (иначе сгенерируется)")
     ap.add_argument("--force", action="store_true", help="перезаписать существующего админа")
+    ap.add_argument("--state-db", help="точный state.db панели (по умолчанию из config.json)")
     a = ap.parse_args(argv)
 
     import secrets as _s
@@ -64,21 +91,16 @@ def main(argv=None):
     recovery_plain, recovery_hashes = auth.gen_recovery_codes(10)
     password_hash = auth.hash_password(password)
 
-    def replace_admin(data):
-        if data.get("admin") and not a.force:
-            raise SystemExit("Админ уже настроен в %s. Перезаписать: --force" % a.secrets)
-        data = dict(data)
-        data["admin"] = {
-            "pw": password_hash,
-            "totp": seed,
-            "recovery": recovery_hashes,
-        }
-        return data
-
-    # Same cross-process writer lock as login recovery-code consumption and
-    # provider-key changes.  Resetting the admin can no longer resurrect a
-    # concurrently consumed recovery-code snapshot.
-    auth.update_secrets_atomic(a.secrets, replace_admin)
+    state_db = resolve_state_db(a.secrets, a.state_db)
+    os.makedirs(os.path.dirname(state_db) or ".", exist_ok=True)
+    conn = sqlite3.connect(state_db, timeout=30)
+    try:
+        store = auth.AuthStore(conn)
+        auth.write_admin_credentials_atomic(a.secrets, {"admin": {
+            "pw": password_hash, "totp": seed, "recovery": recovery_hashes,
+        }}, store, force=a.force)
+    finally:
+        conn.close()
     auth.consume_bootstrap_secret(
         os.path.join(os.path.dirname(os.path.abspath(a.secrets)), "bootstrap.json"))
 

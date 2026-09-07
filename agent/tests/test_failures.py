@@ -321,10 +321,19 @@ class TestManualEmergencySticks(_DbBase):
         super().setUp()
         self.on_patcher = mock.patch.object(states, "emergency_on", return_value=True)
         self.off_patcher = mock.patch.object(states, "emergency_off", return_value=True)
+        self.dns_exit_patcher = mock.patch.object(
+            states, "_prepare_dns_emergency_exit", return_value={"ok": True})
+        self.verify_patcher = mock.patch.object(
+            states.apply_mod, "verify_egress",
+            return_value={"ok": True, "egress_ip": "198.51.100.9", "exit_cc": "FI"})
         self.on = self.on_patcher.start()
         self.off = self.off_patcher.start()
+        self.dns_exit_patcher.start()
+        self.verify_patcher.start()
 
     def tearDown(self):
+        self.verify_patcher.stop()
+        self.dns_exit_patcher.stop()
         self.off_patcher.stop()
         self.on_patcher.stop()
         super().tearDown()
@@ -383,15 +392,18 @@ class TestLeaveDirect(_DbBase):
     def setUp(self):
         super().setUp()
         self._orig = (states.emergency_off, states.apply_mod.load_json,
-                      states.apply_mod.current_upstream)
+                      states.apply_mod.current_upstream,
+                      states._prepare_dns_emergency_exit)
         self.off_calls = []
         states.emergency_off = lambda cfg, log=print: self.off_calls.append(1) or True
         states.apply_mod.load_json = lambda p: {}
         states.apply_mod.current_upstream = lambda sb: "1.1.1.1"
+        states._prepare_dns_emergency_exit = lambda *_a, **_k: {"ok": True}
 
     def tearDown(self):
         (states.emergency_off, states.apply_mod.load_json,
-         states.apply_mod.current_upstream) = self._orig
+         states.apply_mod.current_upstream,
+         states._prepare_dns_emergency_exit) = self._orig
         super().tearDown()
 
     def test_emergency_leave_sends_recovered(self):

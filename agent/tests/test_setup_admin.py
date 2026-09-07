@@ -80,10 +80,13 @@ class TestMainWiring(unittest.TestCase):
         fd, self.path = tempfile.mkstemp(suffix=".json")
         os.close(fd)
         os.unlink(self.path)
+        self.state_db = self.path + ".state.db"
 
     def tearDown(self):
         if os.path.isfile(self.path):
             os.unlink(self.path)
+        if os.path.isfile(self.state_db):
+            os.unlink(self.state_db)
 
     def _run_main(self, restarted):
         seen = {}
@@ -96,7 +99,8 @@ class TestMainWiring(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.object(setup_admin, "restart_panel", side_effect=fake_restart), \
              contextlib.redirect_stdout(out):
-            rc = setup_admin.main(["--secrets", self.path, "--password", "pw"])
+            rc = setup_admin.main(["--secrets", self.path, "--state-db", self.state_db,
+                                   "--password", "pw"])
         self.assertEqual(rc, 0)
         return seen, out.getvalue()
 
@@ -110,3 +114,32 @@ class TestMainWiring(unittest.TestCase):
     def test_fallback_reminder_kept(self):
         _, out = self._run_main(False)
         self.assertIn("Перезапусти vpn-panel, если работает.", out)
+
+    def test_force_reset_revokes_existing_session_and_persists_matching_epoch(self):
+        self._run_main(False)
+        conn = setup_admin.sqlite3.connect(self.state_db)
+        store = setup_admin.auth.AuthStore(conn)
+        with open(self.path, encoding="utf-8") as handle:
+            first = json.load(handle)
+        old_epoch = first["admin"]["credential_epoch"]
+        token, _ = store.create_session("127.0.0.1", expected_epoch=old_epoch)
+        conn.close()
+
+        with mock.patch.object(setup_admin, "restart_panel", return_value=False), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = setup_admin.main([
+                "--secrets", self.path, "--state-db", self.state_db,
+                "--password", "new-password", "--force"])
+        self.assertEqual(rc, 0)
+        conn = setup_admin.sqlite3.connect(self.state_db)
+        try:
+            store = setup_admin.auth.AuthStore(conn)
+            with open(self.path, encoding="utf-8") as handle:
+                second = json.load(handle)
+            self.assertNotEqual(second["admin"]["credential_epoch"], old_epoch)
+            self.assertEqual(store.credential_epoch(), second["admin"]["credential_epoch"])
+            self.assertIsNone(store.get_session(token))
+            self.assertTrue(setup_admin.auth.verify_password(
+                "new-password", second["admin"]["pw"]))
+        finally:
+            conn.close()

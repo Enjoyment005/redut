@@ -238,10 +238,12 @@ class ProviderError(Exception):
     network — True, если это сетевая недоступность (для перебора запасных доменов);
     unsent  — True, если запрос заведомо НЕ был доставлен (ошибка соединения/TLS/отправки):
               такой вызов безопасно повторить другим транспортом даже для денег.
+    definitive — True только когда полученный ответ доказывает, что мутация
+                 отвергнута (например HTTP 4xx или provider status=no).
     """
 
     def __init__(self, message, code=None, network=False, unsent=False,
-                 kind=None, retry_after=None):
+                 kind=None, retry_after=None, definitive=False):
         super().__init__(message)
         self.code = code
         try:
@@ -251,6 +253,7 @@ class ProviderError(Exception):
             self.kind = ProviderErrorKind.UNKNOWN
         self.network = bool(network or self.kind == ProviderErrorKind.NETWORK)
         self.unsent = bool(unsent)
+        self.definitive = bool(definitive)
         try:
             retry_after = float(retry_after) if retry_after is not None else None
             self.retry_after = (retry_after if retry_after is None
@@ -312,7 +315,8 @@ def _http_error(host_label, status, body, headers=None):
              429: ProviderErrorKind.RATE_LIMIT}
     return ProviderError("%s: %s" % (host_label or "API", msg), code=status,
                          kind=kinds.get(status, ProviderErrorKind.UNKNOWN),
-                         retry_after=_retry_after(headers) if status == 429 else None)
+                         retry_after=_retry_after(headers) if status == 429 else None,
+                         definitive=400 <= int(status) < 500)
 
 
 def _urlopen_json(req, host_label, timeout):
@@ -561,14 +565,15 @@ class Provider:
         """-> {"balance": float|str, "currency": str, ...}"""
         raise NotImplementedError
 
-    def buy(self, count, period, country, version=4, descr=None, allow_cc=None):
+    def buy(self, count, period, country, version=4, descr=None, allow_cc=None,
+            on_submit=None):
         raise NotImplementedError("%s.buy не поддерживается" % self.name)
 
     def delete(self, ids):
         # delete по descr запрещён навсегда (§5) — сигнатура принимает только ids.
         raise NotImplementedError("%s.delete не поддерживается" % self.name)
 
-    def prolong(self, ids, period):
+    def prolong(self, ids, period, on_submit=None):
         raise NotImplementedError("%s.prolong не поддерживается" % self.name)
 
     def check(self, ext_id):

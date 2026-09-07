@@ -114,6 +114,36 @@ class _BodyHarness:
         self.close_connection = False
 
 
+class _AuthorizedRouteHarness(_BodyHarness):
+    do_POST = server.Handler.do_POST
+    _do_POST_inner = server.Handler._do_POST_inner
+    _api_post = server.Handler._api_post
+    _body = server.Handler._body
+    _json_object_body = server.Handler._json_object_body
+
+    def __init__(self, headers, body=b"", path="/api/clients"):
+        super().__init__(headers, body)
+        self.path = path
+        self.response = None
+
+    def _require_session(self):
+        return {"token": "synthetic", "csrf": "csrf"}
+
+    def _check_csrf(self, _session):
+        return True
+
+    def _json(self, status, payload, extra=None):
+        self.response = (status, payload)
+        return self.response
+
+
+class _SetupRouteHarness(_AuthorizedRouteHarness):
+    _do_setup = server.Handler._do_setup
+
+    def __init__(self, headers, body=b""):
+        super().__init__(headers, body, path="/api/setup/claim")
+
+
 class TestBoundedHTTPBody(unittest.TestCase):
     def test_valid_body_is_read_exactly(self):
         handler = _BodyHarness([("Content-Length", "3")], b"abc")
@@ -135,6 +165,36 @@ class TestBoundedHTTPBody(unittest.TestCase):
                     server.Handler._body(handler, limit=8)
                 self.assertEqual(caught.exception.status, status)
                 self.assertTrue(handler.close_connection)
+
+    def test_authorized_route_preserves_body_reader_status(self):
+        cases = [
+            ([('Content-Length', '70000')], b'', 413),
+            ([], b'', 411),
+            ([('Content-Length', '-1')], b'', 400),
+        ]
+        for headers, body, expected in cases:
+            with self.subTest(headers=headers):
+                handler = _AuthorizedRouteHarness(headers, body)
+                handler.do_POST()
+                self.assertEqual(handler.response[0], expected)
+
+    def test_authorized_route_rejects_invalid_or_non_object_json_as_400(self):
+        for body in (b'{', b'[]', b'null', b'"text"'):
+            with self.subTest(body=body):
+                handler = _AuthorizedRouteHarness(
+                    [("Content-Length", str(len(body)))], body)
+                handler.do_POST()
+                self.assertEqual(handler.response[0], 400)
+
+    def test_setup_route_rejects_every_falsy_non_object_json_root(self):
+        app = mock.Mock(provisioned=False)
+        app.claim_setup.return_value = None
+        for body in (b'[]', b'null', b'false', b'0', b'""'):
+            with self.subTest(body=body), mock.patch.object(server, "APP", app):
+                handler = _SetupRouteHarness(
+                    [("Content-Length", str(len(body)))], body)
+                handler.do_POST()
+                self.assertEqual(handler.response[0], 400)
 
 
 class TestDNSWireDeadline(unittest.TestCase):
@@ -171,6 +231,52 @@ class TestUpdateDataPlane(unittest.TestCase):
             ok, why = update.dns_update_preflight({})
         self.assertFalse(ok)
         self.assertIn("DNS Rescue", why)
+
+    def test_unreadable_dns_unit_state_blocks_update_preflight(self):
+        with mock.patch.object(update, "_dns_phase", return_value="idle"), \
+                mock.patch.object(update, "_unit_active_state", return_value="unknown"):
+            ok, why = update.dns_update_preflight({})
+        self.assertFalse(ok)
+        self.assertIn("unreadable", why)
+
+    def test_transitional_dns_unit_state_blocks_update_preflight(self):
+        for state in ("activating", "deactivating"):
+            with mock.patch.object(update, "_dns_phase", return_value="idle"), \
+                    mock.patch.object(update, "_unit_active_state", return_value=state):
+                ok, why = update.dns_update_preflight({})
+            self.assertFalse(ok, state)
+            self.assertIn("transitional", why)
+
+    def test_unreadable_dns_database_blocks_update_preflight(self):
+        with mock.patch.object(update, "_unit_active_state", return_value="inactive"), \
+                mock.patch.object(update, "_dns_phase", side_effect=OSError("synthetic")):
+            ok, why = update.dns_update_preflight({})
+        self.assertFalse(ok)
+        self.assertIn("database", why)
+
+    def test_real_dns_state_table_blocks_probing_and_recovering(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database = os.path.join(tmp, "state.db")
+            pool = pool_mod.Pool(database, server="test")
+            try:
+                with mock.patch.object(update, "_unit_active_state",
+                                       return_value="inactive"):
+                    for phase in ("probing", "recovering", "active_proxy", "failed"):
+                        pool.set_dns_state(phase=phase)
+                        ok, _why = update.dns_update_preflight({"db": database})
+                        self.assertFalse(ok, phase)
+            finally:
+                pool.close()
+
+    def test_legacy_missing_dns_table_is_allowed_only_when_unit_not_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database = os.path.join(tmp, "legacy.db")
+            import sqlite3
+            sqlite3.connect(database).close()
+            with mock.patch.object(update, "_unit_active_state", return_value="not-found"):
+                self.assertTrue(update.dns_update_preflight({"db": database})[0])
+            with mock.patch.object(update, "_unit_active_state", return_value="inactive"):
+                self.assertFalse(update.dns_update_preflight({"db": database})[0])
 
 
 class TestStaticInstallerContracts(unittest.TestCase):

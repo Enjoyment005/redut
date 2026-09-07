@@ -53,6 +53,13 @@ class SpendDenied(Exception):
     """Гейт трат отказал (тумблер / лимит / баланс / страна). Это НЕ ошибка API —
     отличается от ProviderError, чтобы вызывающий показал причину, а не «провайдер лёг»."""
 
+    def __init__(self, message, *, replace_request=False):
+        super().__init__(message)
+        # True means the durable operation is terminal and the caller may
+        # safely discard this request_id. Ambiguous submitted operations
+        # deliberately never set it.
+        self.replace_request = bool(replace_request)
+
 
 # --- Обучение стабильности (F8, П6): история -> решения о покупке -----------------
 # Порог обучения — не календарный, а по ОБЪЁМУ данных: до min_probes/min_days вклад
@@ -168,10 +175,17 @@ def limits(cfg):
 # the Linux node and is released automatically after kill/reboot.
 _SPEND_LOCKS = {}
 _SPEND_LOCKS_GUARD = threading.Lock()
-# Volatile proof that a committed result reached the return boundary in this
-# process.  It intentionally disappears on kill/reboot: then SQLite result_json
-# is replayed instead of risking a second remote mutation.
-_DELIVERED_SPEND_OPS = set()
+_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}\Z")
+
+
+def _request_identity(request_id):
+    """Return a durable caller ID and its globally unique ledger key."""
+    value = ("ephemeral-" + _secrets.token_hex(16)
+             if request_id is None else str(request_id).strip())
+    if not _REQUEST_ID_RE.fullmatch(value):
+        raise SpendDenied(
+            "request_id должен содержать 8..128 символов: латиница, цифры, . _ : -")
+    return value, "request-v1:" + value
 
 
 @contextlib.contextmanager
@@ -182,6 +196,7 @@ def _spend_lock(pool):
     if not thread_lock.acquire(False):
         raise SpendDenied("другая операция покупки/продления уже выполняется на этом узле")
     fh = None
+    windows_locked = False
     try:
         if os.name == "posix":
             import fcntl
@@ -197,12 +212,34 @@ def _spend_lock(pool):
                 fh = None
                 raise SpendDenied(
                     "другая операция покупки/продления уже выполняется на этом узле")
+        elif os.name == "nt":
+            import msvcrt
+            try:
+                fh = open(path, "a+b")
+                fh.seek(0, os.SEEK_END)
+                if fh.tell() == 0:
+                    fh.write(b"\0")
+                    fh.flush()
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                windows_locked = True
+            except OSError:
+                if fh is not None:
+                    fh.close()
+                    fh = None
+                raise SpendDenied(
+                    "другая операция покупки/продления уже выполняется на этом узле")
         yield
     finally:
         if fh is not None:
             try:
-                import fcntl
-                fcntl.flock(fh, fcntl.LOCK_UN)
+                if os.name == "posix":
+                    import fcntl
+                    fcntl.flock(fh, fcntl.LOCK_UN)
+                elif windows_locked:
+                    import msvcrt
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
             except OSError:
                 pass
             fh.close()
@@ -380,7 +417,6 @@ def _finalize_buy(pool, op, proxies, response, *, actor, src_ip, recovered):
                            "balance_after": (response or {}).get("balance"),
                            "descr": op.get("descr"), "uids": uids,
                            "response_discrepancy": discrepancy}, ensure_ascii=False))
-    _DELIVERED_SPEND_OPS.add(op["id"])
     return output
 
 
@@ -439,7 +475,6 @@ def _finalize_prolong(pool, op, response, new_end, *, actor, src_ip, recovered):
                            "balance_after": (response or {}).get("balance"),
                            "date_end": new_end,
                            "response_discrepancy": discrepancy}, ensure_ascii=False))
-    _DELIVERED_SPEND_OPS.add(op["id"])
     return output
 
 
@@ -461,33 +496,113 @@ def _recover_prolong(pool, op, provider, *, actor="auto", src_ip=""):
                              actor=actor, src_ip=src_ip, recovered=True)
 
 
+def _validate_bound_request(op, kind, provider, expected, uid=None):
+    if (op.get("kind") != kind or op.get("provider") != provider
+            or (uid is not None and op.get("uid") != uid)
+            or op.get("request_invalid") or not isinstance(op.get("request"), dict)):
+        raise SpendDenied("request_id уже связан с другой денежной операцией")
+    request = op["request"]
+    if any(request.get(key) != value for key, value in expected.items()):
+        raise SpendDenied("request_id уже связан с другими параметрами денежной операции")
+
+
+@contextlib.contextmanager
+def _retire_planned_on_denial(pool, op):
+    """Make a pre-submit terminal rejection replaceable instead of wedging spend."""
+    try:
+        yield
+    except SpendDenied as error:
+        if op is not None and op.get("phase") == "planned":
+            pool.transition_spend_operation(op["id"], "failed", str(error))
+            raise SpendDenied(str(error), replace_request=True) from error
+        raise
+
+
+def _stored_result(op, *, recovered=True):
+    if op.get("result_invalid") or not isinstance(op.get("result"), dict):
+        raise SpendDenied("сохранённый результат денежной операции повреждён")
+    result = dict(op["result"])
+    result["recovered"] = bool(recovered or result.get("recovered"))
+    result["replayed_request"] = True
+    return result
+
+
+def _deliver_result(pool, result, request_id):
+    """Durably acknowledge the exact result before crossing the return boundary."""
+    op_id = (result or {}).get("spend_operation_id")
+    op = pool.get_spend_operation(op_id) if op_id else None
+    if not op or op.get("phase") not in ("committed", "acknowledged"):
+        raise SpendDenied("результат денежной операции не подтверждён durable ledger")
+    if op["phase"] == "committed":
+        pool.acknowledge_spend_operation(op_id)
+    delivered = dict(result)
+    delivered["request_id"] = request_id
+    return delivered
+
+
+def _resume_bound_request(pool, provider, key, request_id, kind, expected,
+                          *, uid=None, actor="auto", src_ip=""):
+    op = pool.get_spend_operation_by_idempotency(key)
+    if not op:
+        return None, None
+    _validate_bound_request(op, kind, str(getattr(provider, "name", "") or ""),
+                            expected, uid=uid)
+    if op["phase"] in ("committed", "acknowledged"):
+        return _deliver_result(pool, _stored_result(op), request_id), op
+    if op["phase"] == "submitted":
+        result = (_recover_buy(pool, op, provider, actor=actor, src_ip=src_ip)
+                  if kind == "buy" else
+                  _recover_prolong(pool, op, provider, actor=actor, src_ip=src_ip))
+        return _deliver_result(pool, result, request_id), op
+    if op["phase"] == "planned":
+        return None, op
+    raise SpendDenied(
+        "request_id относится к завершившейся ошибкой операции; нужен новый ID",
+        replace_request=True)
+
+
+def _guard_new_request(pool, providers, *, actor="auto", src_ip=""):
+    committed = pool.unacknowledged_spend_operations()
+    if committed:
+        op = committed[0]
+        legacy = not str(op.get("idempotency_key") or "").startswith("request-v1:")
+        hint = ("legacy operation %s: используй spend-resume --operation %s"
+                % (op.get("kind"), op.get("id")) if legacy else
+                "request %s ожидает повтор с тем же request_id"
+                % str(op.get("idempotency_key"))[len("request-v1:"):])
+        raise SpendDenied("предыдущий committed результат не подтверждён caller: " + hint)
+    recovered = _reconcile_pending_locked(
+        pool, providers, actor=actor, src_ip=src_ip, replay_committed=False)
+    if recovered:
+        raise SpendDenied(
+            "предыдущая submitted операция восстановлена; повтори её request_id до новой траты")
+    pending = pool.pending_spend_operations()
+    if pending:
+        op = pending[0]
+        key = str(op.get("idempotency_key") or "")
+        hint = ("request %s" % key[len("request-v1:"):]
+                if key.startswith("request-v1:") else "operation %s" % op.get("id"))
+        raise SpendDenied(
+            "предыдущее planned намерение ожидает точного повтора: %s" % hint)
+
+
 def _reconcile_pending_locked(pool, providers, *, actor="auto", src_ip="",
                               replay_committed=True, expected_kind=None):
     results = []
     if replay_committed:
         for op in pool.unacknowledged_spend_operations():
-            if op["id"] in _DELIVERED_SPEND_OPS:
-                pool.acknowledge_spend_operation(op["id"])
-                _DELIVERED_SPEND_OPS.discard(op["id"])
-                continue
-            if expected_kind and op.get("kind") != expected_kind:
-                raise SpendDenied(
-                    "committed результат %s ожидает возврата через соответствующую операцию; "
-                    "%s пока заблокирована" % (op.get("kind"), expected_kind))
-            if op.get("result_invalid") or not isinstance(op.get("result"), dict):
-                raise SpendDenied(
-                    "committed результат денежной операции повреждён — новая трата заблокирована")
-            replay = dict(op["result"])
-            replay["recovered"] = True
-            replay["replayed_committed"] = True
-            pool.log_event("spend-replay", actor=actor, result="recovered", src_ip=src_ip,
-                           detail="committed результат воспроизведён без вызова провайдера")
-            _DELIVERED_SPEND_OPS.add(op["id"])
-            return [replay]
+            raise SpendDenied(
+                "committed результат %s требует точного request_id или явного spend-resume; "
+                "новая трата заблокирована" % op.get("kind"))
     for op in pool.pending_spend_operations():
         if op["phase"] == "planned":
-            pool.transition_spend_operation(op["id"], "failed",
-                                            "abandoned before provider submission")
+            # No provider submit callback ran. Keep the exact caller request
+            # retryable; unrelated intents are blocked by _guard_new_request.
+            key = str(op.get("idempotency_key") or "")
+            if not key.startswith("request-v1:"):
+                pool.transition_spend_operation(
+                    op["id"], "failed",
+                    "legacy planned intent has no caller request_id for exact retry")
             continue
         provider = (providers or {}).get(op["provider"])
         if provider is None:
@@ -500,7 +615,6 @@ def _reconcile_pending_locked(pool, providers, *, actor="auto", src_ip="",
         else:
             raise SpendDenied("неизвестная незавершённая денежная операция")
         if expected_kind and op["kind"] != expected_kind:
-            _DELIVERED_SPEND_OPS.discard(result.get("spend_operation_id"))
             raise SpendDenied(
                 "предыдущая операция %s восстановлена, но её результат ожидает "
                 "соответствующего вызова; %s пока заблокирована"
@@ -515,9 +629,50 @@ def reconcile_pending_spend(pool, providers, *, actor="auto", src_ip=""):
         results = _reconcile_pending_locked(pool, providers, actor=actor, src_ip=src_ip,
                                             replay_committed=False)
         # Startup observer did not deliver these values to the money caller.
-        for result in results:
-            _DELIVERED_SPEND_OPS.discard(result.get("spend_operation_id"))
         return results
+
+
+def outstanding_spend_operations(pool):
+    """Show durable operations that still need recovery or explicit caller ACK."""
+    rows = list(pool.pending_spend_operations())
+    rows.extend(pool.unacknowledged_spend_operations())
+    return rows
+
+
+def bound_spend_request(pool, request_id):
+    """Return the durable operation bound to a caller request ID, if any."""
+    _, key = _request_identity(request_id)
+    return pool.get_spend_operation_by_idempotency(key)
+
+
+def replay_completed_request(pool, request_id, kind, *, expected=None, uid=None):
+    """Replay committed/acknowledged output without mutable provider/policy gates."""
+    rid, key = _request_identity(request_id)
+    with _spend_lock(pool):
+        op = pool.get_spend_operation_by_idempotency(key)
+        if not op or op.get("phase") not in ("committed", "acknowledged"):
+            return None
+        wanted = op.get("request") if expected is None else expected
+        _validate_bound_request(op, kind, op.get("provider"), wanted, uid=uid)
+        return _deliver_result(pool, _stored_result(op), rid)
+
+
+def resume_spend_operation(pool, operation_id, *, acknowledge=False):
+    """Inspect/ACK one exact legacy result without making a provider API call."""
+    with _spend_lock(pool):
+        op = pool.get_spend_operation(operation_id)
+        if not op:
+            raise SpendDenied("денежная операция не найдена")
+        if op.get("phase") not in ("committed", "acknowledged"):
+            raise SpendDenied(
+                "операция %s ещё не имеет committed результата; сначала нужен recovery"
+                % op.get("id"))
+        result = _stored_result(op, recovered=False)
+        if acknowledge and op["phase"] == "committed":
+            pool.acknowledge_spend_operation(op["id"])
+            op = pool.get_spend_operation(op["id"])
+        return {"operation": op, "result": result,
+                "acknowledged": op.get("phase") == "acknowledged"}
 
 
 # --------------------------------------------------------------------- покупка
@@ -591,7 +746,7 @@ def preflight_buy(pool, provider, cfg, *, country, period=None, count=1, version
 
 
 def plan_and_buy(pool, provider, cfg, *, country, period=None, count=1, version=None,
-                 server=None, actor="auto", src_ip="", auto=True):
+                 server=None, actor="auto", src_ip="", auto=True, request_id=None):
     """Гейты §6.2 -> идемпотентная покупка -> запись в money+журнал.
 
     ВАЖНО: постфактум-проба на реальную страну выхода (§6.1) — на вызывающем
@@ -605,46 +760,80 @@ def plan_and_buy(pool, provider, cfg, *, country, period=None, count=1, version=
     with _spend_lock(pool):
         return _plan_and_buy_locked(
             pool, provider, cfg, country=country, period=period, count=count,
-            version=version, server=server, actor=actor, src_ip=src_ip, auto=auto)
+            version=version, server=server, actor=actor, src_ip=src_ip, auto=auto,
+            request_id=request_id)
 
 
 def _plan_and_buy_locked(pool, provider, cfg, *, country, period=None, count=1,
-                         version=None, server=None, actor="auto", src_ip="", auto=True):
+                         version=None, server=None, actor="auto", src_ip="", auto=True,
+                         request_id=None):
     pname = str(getattr(provider, "name", "") or "")
-    recovered = _reconcile_pending_locked(
-        pool, {pname: provider}, actor=actor, src_ip=src_ip, expected_kind="buy")
-    if recovered:
-        # Один пользовательский вызов не превращается в две покупки: сначала
-        # возвращаем результат прежнего durable intent.
-        return recovered[0]
-    pre = preflight_buy(pool, provider, cfg, country=country, period=period,
-                        count=count, version=version, auto=auto)
-    server = server or (cfg or {}).get("server") or "srv"
-    descr = gen_descr(server)
-    request = {"count": pre["count"], "period": pre["period"],
-               "country": pre["country"], "version": pre["version"]}
-    op, created = pool.begin_spend_operation(
-        "buy", pname, request, "buy:%s" % descr, descr=descr,
-        quote_price=pre["price"], currency=pre["currency"],
-        balance_before=pre["balance_before"])
-    if not created:
-        raise SpendDenied("другая незавершённая денежная операция блокирует покупку")
-    pool.transition_spend_operation(op["id"], "submitted")
-    op = pool.get_spend_operation(op["id"])
+    lim = limits(cfg)
+    try:
+        expected = {"count": int(count),
+                    "period": int(period or lim["buy_period_days"]),
+                    "country": str(country or "").strip().lower(),
+                    "version": int(version or lim["buy_version"])}
+    except (TypeError, ValueError, OverflowError) as error:
+        raise SpendDenied("параметры покупки некорректны") from error
+    rid, request_key = _request_identity(request_id)
+    replay, existing = _resume_bound_request(
+        pool, provider, request_key, rid, "buy", expected,
+        actor=actor, src_ip=src_ip)
+    if replay is not None:
+        return replay
+    if existing is None:
+        _guard_new_request(pool, {pname: provider}, actor=actor, src_ip=src_ip)
+    with _retire_planned_on_denial(pool, existing):
+        pre = preflight_buy(pool, provider, cfg, country=country, period=period,
+                            count=count, version=version, auto=auto)
+        if any(pre.get(key) != value for key, value in expected.items()):
+            raise SpendDenied("нормализованные параметры покупки не совпали с request intent")
+        if existing is not None:
+            if (_num(existing.get("quote_price")) != _num(pre.get("price"))
+                    or existing.get("currency") != pre.get("currency")):
+                raise SpendDenied(
+                    "quote изменился до submit; повтори покупку с новым request_id")
+            op = existing
+            descr = op.get("descr")
+    if existing is None:
+        server = server or (cfg or {}).get("server") or "srv"
+        descr = gen_descr(server)
+        request = dict(expected)
+        op, created = pool.begin_spend_operation(
+            "buy", pname, request, request_key, descr=descr,
+            quote_price=pre["price"], currency=pre["currency"],
+            balance_before=pre["balance_before"])
+        if not created:
+            raise SpendDenied("request_id был занят конкурентной денежной операцией")
+    submitted = False
+
+    def on_submit():
+        nonlocal submitted, op
+        if not submitted:
+            pool.transition_spend_operation(op["id"], "submitted")
+            op = pool.get_spend_operation(op["id"])
+            submitted = True
     try:
         # allow_cc=None: страну уже одобрили гейты выше (чёрный список + оценка).
         # Слой провайдера всё равно перепроверит чёрный список независимо.
         resp = provider.buy(pre["count"], pre["period"], pre["country"],
-                            version=pre["version"], descr=descr, allow_cc=None)
+                            version=pre["version"], descr=descr, allow_cc=None,
+                            on_submit=on_submit)
     except ProviderError as e:
-        ambiguous = (getattr(e, "network", False)
-                     or getattr(e, "kind", None) == ProviderErrorKind.PROTOCOL)
+        if not submitted:
+            pool.transition_spend_operation(op["id"], "failed", str(e))
+            e.replace_request = True
+            raise
+        ambiguous = not bool(getattr(e, "definitive", False))
         if not ambiguous:
             pool.transition_spend_operation(op["id"], "failed", str(e))
+            e.replace_request = True
             raise
         # Сеть оборвалась. buy НЕ повторяем — проверяем, не прошла ли она (§6.2).
         try:
-            return _recover_buy(pool, op, provider, actor=actor, src_ip=src_ip)
+            recovered = _recover_buy(pool, op, provider, actor=actor, src_ip=src_ip)
+            return _deliver_result(pool, recovered, rid)
         except ProviderError:
             # Защитный fallback для нестандартного адаптера; intent остаётся submitted.
             pass
@@ -654,17 +843,25 @@ def _plan_and_buy_locked(pool, provider, cfg, *, country, period=None, count=1,
             "покупка НЕ подтверждена (descr=%s); durable intent блокирует повтор (§6.2)"
             % descr)
 
+    if not submitted:
+        pool.transition_spend_operation(
+            op["id"], "submitted", "provider returned without on_submit callback")
+        raise SpendDenied(
+            "адаптер не подтвердил границу отправки; результат заблокирован для ручной проверки")
+
     proxies = _valid_proxies((resp or {}).get("proxies"), pname)
     if not proxies or len(proxies) != pre["count"]:
         pool.log_event("buy", actor=actor, result="unconfirmed", src_ip=src_ip,
                        detail="ответ buy не содержит подтверждённых proxy id; intent сохранён")
         raise SpendDenied("ответ buy не подтверждает купленные proxy id; повтор заблокирован")
-    return _finalize_buy(pool, op, proxies, resp, actor=actor,
-                         src_ip=src_ip, recovered=False)
+    result = _finalize_buy(pool, op, proxies, resp, actor=actor,
+                           src_ip=src_ip, recovered=False)
+    return _deliver_result(pool, result, rid)
 
 
 # ------------------------------------------------------------------- продление
-def prolong_with_limits(pool, provider, cfg, *, row, days, actor="auto", src_ip=""):
+def prolong_with_limits(pool, provider, cfg, *, row, days, actor="auto", src_ip="",
+                        request_id=None):
     """Продлить один прокси на days (§6.3) под гейтами трат + запись в money.
 
     row — запись пула (provider, ext_id, uid, descr). Для PROXY6 сверяем цену
@@ -672,17 +869,16 @@ def prolong_with_limits(pool, provider, cfg, *, row, days, actor="auto", src_ip=
     цену из ответа /renew/ (валюта USD)."""
     with _spend_lock(pool):
         return _prolong_with_limits_locked(
-            pool, provider, cfg, row=row, days=days, actor=actor, src_ip=src_ip)
+            pool, provider, cfg, row=row, days=days, actor=actor, src_ip=src_ip,
+            request_id=request_id)
 
 
 def _prolong_with_limits_locked(pool, provider, cfg, *, row, days,
-                                actor="auto", src_ip=""):
+                                actor="auto", src_ip="", request_id=None):
     lim = limits(cfg)
     days = int(days)
     if not (1 <= days <= 365):
         raise SpendDenied("period=%d вне 1..365 дней" % days)
-    if not lim["buy_enabled"]:
-        raise SpendDenied("траты выключены тумблером buy_enabled — продление недоступно (§6.2)")
 
     pname, ext_id, uid = row["provider"], row["ext_id"], row["uid"]
     # Пояс безопасности (ревью 1.3.0): адаптер обязан совпадать с провайдером строки —
@@ -690,71 +886,116 @@ def _prolong_with_limits_locked(pool, provider, cfg, *, row, days,
     if getattr(provider, "name", None) != pname:
         raise SpendDenied("адаптер %r не совпадает с провайдером строки %r — продление отклонено"
                           % (getattr(provider, "name", None), pname))
-    recovered = _reconcile_pending_locked(
-        pool, {pname: provider}, actor=actor, src_ip=src_ip, expected_kind="prolong")
-    if recovered:
-        return recovered[0]
+    expected = {"ext_id": str(ext_id), "days": days}
+    rid, request_key = _request_identity(request_id)
+    replay, existing = _resume_bound_request(
+        pool, provider, request_key, rid, "prolong", expected, uid=uid,
+        actor=actor, src_ip=src_ip)
+    if replay is not None:
+        return replay
+
+    def pre_submit_denial(message):
+        if existing is not None and existing.get("phase") == "planned":
+            pool.transition_spend_operation(existing["id"], "failed", message)
+            return SpendDenied(message, replace_request=True)
+        return SpendDenied(message)
+
+    if not lim["buy_enabled"]:
+        raise pre_submit_denial(
+            "траты выключены тумблером buy_enabled — продление недоступно (§6.2)")
+    if existing is None:
+        _guard_new_request(pool, {pname: provider}, actor=actor, src_ip=src_ip)
     price = None
     bal = None
     currency = _currency(lim["currency"] if pname == "proxy6" else "USD")
     if currency is None:
-        raise SpendDenied("валюта денежного лимита некорректна — продление отменено")
+        raise pre_submit_denial(
+            "валюта денежного лимита некорректна — продление отменено")
     if pname == "proxy6":
         pr = provider.getprice(1, days, int(lim["buy_version"]))
         price = _num(pr.get("price"))
         bal = _num(pr.get("balance"))
         quoted_currency = _currency(pr.get("currency"))
         if price is None or price <= 0:
-            raise SpendDenied("getprice вернул некорректную цену продления %r"
-                              % pr.get("price"))
+            raise pre_submit_denial(
+                "getprice вернул некорректную цену продления %r" % pr.get("price"))
         if quoted_currency != currency:
-            raise SpendDenied("getprice вернул валюту %r вместо %s — продление отменено"
-                              % (pr.get("currency"), currency))
+            raise pre_submit_denial(
+                "getprice вернул валюту %r вместо %s — продление отменено"
+                % (pr.get("currency"), currency))
         if bal is None or bal < 0:
-            raise SpendDenied("getprice вернул некорректный остаток %r — продление отменено"
-                              % pr.get("balance"))
+            raise pre_submit_denial(
+                "getprice вернул некорректный остаток %r — продление отменено"
+                % pr.get("balance"))
         if price > lim["max_price_per_buy"]:
-            raise SpendDenied("цена продления %.2f %s > лимита %.2f/покупка (§6.2)"
-                              % (price, currency, lim["max_price_per_buy"]))
+            raise pre_submit_denial(
+                "цена продления %.2f %s > лимита %.2f/покупка (§6.2)"
+                % (price, currency, lim["max_price_per_buy"]))
         if _safe_spent_today(pool, currency) + price > lim["max_spend_per_day"]:
-            raise SpendDenied("суточный лимит трат превышен продлением (§6.2)")
+            raise pre_submit_denial("суточный лимит трат превышен продлением (§6.2)")
         if (bal - price) < lim["min_balance_reserve"]:
-            raise SpendDenied("продление опустит баланс ниже неснижаемого остатка (§6.2)")
+            raise pre_submit_denial(
+                "продление опустит баланс ниже неснижаемого остатка (§6.2)")
     else:
         # У ProxyLine нет доверенной preflight-цены: резервируем верхний лимит,
         # чтобы malformed ответ не превратил продление в бесплатное для ledger.
         price = _num(lim["max_price_per_buy"])
         if price is None or price <= 0:
-            raise SpendDenied("max_price_per_buy некорректен — продление отменено")
+            raise pre_submit_denial(
+                "max_price_per_buy некорректен — продление отменено")
         if _safe_spent_today(pool, currency) + price > lim["max_spend_per_day"]:
-            raise SpendDenied("суточный лимит трат превышен продлением (§6.2)")
+            raise pre_submit_denial("суточный лимит трат превышен продлением (§6.2)")
 
     date_before = row.get("date_end")
     if _date_value(date_before) is None:
         remote_before = _find_remote_proxy(provider, ext_id)
         date_before = (remote_before or {}).get("date_end")
     if _date_value(date_before) is None:
-        raise SpendDenied("не удалось зафиксировать date_end до продления — трата отменена")
+        raise pre_submit_denial(
+            "не удалось зафиксировать date_end до продления — трата отменена")
 
-    request = {"ext_id": str(ext_id), "days": days,
-               "date_before": str(date_before).replace(" ", "T")}
-    idem = "prolong:%s:%s" % (uid, _secrets.token_hex(8))
-    op, created = pool.begin_spend_operation(
-        "prolong", pname, request, idem, uid=uid, descr=row.get("descr"),
-        quote_price=price, currency=currency, balance_before=bal)
-    if not created:
-        raise SpendDenied("другая незавершённая денежная операция блокирует продление")
-    pool.transition_spend_operation(op["id"], "submitted")
-    op = pool.get_spend_operation(op["id"])
+    request = dict(expected, date_before=str(date_before).replace(" ", "T"))
+    if existing is not None:
+        if ((existing.get("request") or {}).get("date_before") != request["date_before"]
+                or _num(existing.get("quote_price")) != _num(price)
+                or existing.get("currency") != currency):
+            raise pre_submit_denial(
+                "состояние продления изменилось до submit; нужен новый request_id")
+        op = existing
+    else:
+        op, created = pool.begin_spend_operation(
+            "prolong", pname, request, request_key, uid=uid, descr=row.get("descr"),
+            quote_price=price, currency=currency, balance_before=bal)
+        if not created:
+            raise SpendDenied("request_id был занят конкурентной денежной операцией")
+    submitted = False
+
+    def on_submit():
+        nonlocal submitted, op
+        if not submitted:
+            pool.transition_spend_operation(op["id"], "submitted")
+            op = pool.get_spend_operation(op["id"])
+            submitted = True
     try:
-        resp = provider.prolong(ext_id, days)
+        resp = provider.prolong(ext_id, days, on_submit=on_submit)
     except ProviderError as error:
-        ambiguous = (getattr(error, "network", False)
-                     or getattr(error, "kind", None) == ProviderErrorKind.PROTOCOL)
+        if not submitted:
+            pool.transition_spend_operation(op["id"], "failed", str(error))
+            error.replace_request = True
+            raise
+        ambiguous = not bool(getattr(error, "definitive", False))
         if not ambiguous:
             pool.transition_spend_operation(op["id"], "failed", str(error))
+            error.replace_request = True
             raise
-        return _recover_prolong(pool, op, provider, actor=actor, src_ip=src_ip)
+        recovered = _recover_prolong(pool, op, provider, actor=actor, src_ip=src_ip)
+        return _deliver_result(pool, recovered, rid)
+
+    if not submitted:
+        pool.transition_spend_operation(
+            op["id"], "submitted", "provider returned without on_submit callback")
+        raise SpendDenied(
+            "адаптер не подтвердил границу отправки; результат заблокирован для ручной проверки")
 
     new_end = None
     if pname == "proxy6":
@@ -776,8 +1017,9 @@ def _prolong_with_limits_locked(pool, provider, cfg, *, row, days,
                            src_ip=src_ip,
                            detail="ответ prolong не подтверждает proxy id; intent сохранён")
             raise SpendDenied("ответ prolong не подтверждает proxy id; повтор заблокирован")
-    return _finalize_prolong(pool, op, resp, new_end, actor=actor,
-                             src_ip=src_ip, recovered=False)
+    result = _finalize_prolong(pool, op, resp, new_end, actor=actor,
+                               src_ip=src_ip, recovered=False)
+    return _deliver_result(pool, result, rid)
 
 
 # -------------------------------------------------------------------- удаление

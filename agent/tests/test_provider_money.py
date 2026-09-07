@@ -27,10 +27,12 @@ class StubProxy6(Proxy6):
         self.responses = responses or {}
         self.calls = []
 
-    def _api(self, method, params=None, mutating=False):
+    def _api(self, method, params=None, mutating=False, on_submit=None):
         if method == "ipauth":
             raise RuntimeError("ipauth запрещён")
         self.calls.append((method, dict(params or {}), mutating))
+        if mutating and on_submit is not None:
+            on_submit()
         if method not in self.responses:
             raise AssertionError("неожиданный вызов _api(%r)" % method)
         return self.responses[method]

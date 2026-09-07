@@ -3,6 +3,7 @@
 остаток, идемпотентность покупки (восстановление по descr, без двойной покупки),
 запись в money+журнал, гейты удаления §6.4. БЕЗ реальных трат — провайдер фейковый."""
 import os
+import multiprocessing
 import tempfile
 import threading
 import unittest
@@ -38,7 +39,10 @@ class FakeProxy6:
                 "country": country, "ip_version": 4, "kind": "dedicated",
                 "date_end": "2026-08-21T10:00:00", "descr": descr}
 
-    def buy(self, count, period, country, version=4, descr=None, allow_cc=None):
+    def buy(self, count, period, country, version=4, descr=None, allow_cc=None,
+            on_submit=None):
+        if on_submit is not None:
+            on_submit()
         self.buy_calls += 1
         self.attempted_descr = descr
         if self.buy_network_fail:
@@ -52,7 +56,9 @@ class FakeProxy6:
         self.find_descr = descr
         return [dict(x, descr=descr) for x in self.found]
 
-    def prolong(self, ids, period):
+    def prolong(self, ids, period, on_submit=None):
+        if on_submit is not None:
+            on_submit()
         ext = str(ids if isinstance(ids, (str, int)) else ids[0])
         return {"order_id": 778, "price": self.price, "count": 1, "period": period,
                 "balance": self.balance_val - self.price, "currency": "RUB",
@@ -77,6 +83,28 @@ def cfg(**money_over):
     return {"server": "node1", "money": m,
             "countries": {"strategy": "reputation",
                           "whitelist": ["fi", "de", "ru"]}}   # ru нарочно — должен вычищаться
+
+
+def _parallel_buy_worker(db_path, start, calls, results, request_id):
+    class SharedFake(FakeProxy6):
+        def buy(self, *args, **kwargs):
+            with calls.get_lock():
+                calls.value += 1
+            return super().buy(*args, **kwargs)
+
+    pool = pool_mod.Pool(db_path, server="node1")
+    try:
+        start.wait(10)
+        try:
+            money.plan_and_buy(
+                pool, SharedFake(price=100),
+                cfg(max_buys_per_day=1, max_spend_per_day=100),
+                country="fi", request_id=request_id)
+            results.put("ok")
+        except money.SpendDenied:
+            results.put("denied")
+    finally:
+        pool.close()
 
 
 class Base(unittest.TestCase):
@@ -284,6 +312,232 @@ class TestBuyGates(Base):
 
 
 class TestIdempotency(Base):
+    def test_independent_request_ids_each_execute_once(self):
+        prov = FakeProxy6(price=20)
+        first = money.plan_and_buy(
+            self.pool, prov, cfg(), country="fi", request_id="request-independent-fi")
+        second = money.plan_and_buy(
+            self.pool, prov, cfg(), country="de", request_id="request-independent-de")
+        self.assertEqual(first["country"], "fi")
+        self.assertEqual(second["country"], "de")
+        self.assertNotEqual(first["spend_operation_id"], second["spend_operation_id"])
+        self.assertEqual(prov.buy_calls, 2)
+        self.assertEqual(len(self.money_rows("buy")), 2)
+
+    def test_same_request_id_cannot_change_intent_or_provider(self):
+        prov = FakeProxy6(price=20)
+        request_id = "request-bound-to-fi"
+        money.plan_and_buy(
+            self.pool, prov, cfg(), country="fi", request_id=request_id)
+        with self.assertRaises(money.SpendDenied):
+            money.plan_and_buy(
+                self.pool, prov, cfg(), country="de", request_id=request_id)
+        other = FakeProxy6(price=20)
+        other.name = "other"
+        with self.assertRaises(money.SpendDenied):
+            money.plan_and_buy(
+                self.pool, other, cfg(), country="fi", request_id=request_id)
+        self.assertEqual(prov.buy_calls, 1)
+        self.assertEqual(other.buy_calls, 0)
+
+    def test_buy_then_legitimate_prolong_uses_new_request(self):
+        prov = FakeProxy6(price=20)
+        bought = money.plan_and_buy(
+            self.pool, prov, cfg(), country="fi", request_id="request-buy-before-prolong")
+        proxy = dict(bought["proxies"][0])
+        proxy["uid"] = "proxy6:50"
+        prolonged = money.prolong_with_limits(
+            self.pool, prov, cfg(), row=proxy, days=30,
+            request_id="request-legitimate-prolong")
+        self.assertTrue(prolonged["ok"])
+        self.assertEqual(len(self.money_rows("buy")), 1)
+        self.assertEqual(len(self.money_rows("prolong")), 1)
+
+    def test_acknowledged_request_replays_after_reopen_without_spend(self):
+        prov = FakeProxy6(price=20)
+        request_id = "request-acked-before-caller-kill"
+        first = money.plan_and_buy(
+            self.pool, prov, cfg(), country="fi", request_id=request_id)
+        self.assertEqual(self.pool.get_spend_operation(
+            first["spend_operation_id"])["phase"], "acknowledged")
+        self.pool.close()
+        self.pool = pool_mod.Pool(self.db, server="node1")
+        replay = money.plan_and_buy(
+            self.pool, prov, cfg(), country="fi", request_id=request_id)
+        self.assertTrue(replay["replayed_request"])
+        self.assertEqual(replay["spend_operation_id"], first["spend_operation_id"])
+        self.assertEqual(prov.buy_calls, 1)
+
+    def test_planned_request_resumes_exact_intent(self):
+        request_id = "request-killed-before-submit"
+        op, created = self.pool.begin_spend_operation(
+            "buy", "proxy6", {"count": 1, "period": 7, "country": "fi", "version": 4},
+            "request-v1:" + request_id, descr="vpnbuy-planned",
+            quote_price=20, currency="RUB", balance_before=928)
+        self.assertTrue(created)
+        prov = FakeProxy6(price=20)
+        result = money.plan_and_buy(
+            self.pool, prov, cfg(), country="fi", request_id=request_id)
+        self.assertEqual(result["spend_operation_id"], op["id"])
+        self.assertEqual(prov.buy_calls, 1)
+        self.assertEqual(self.pool.get_spend_operation(op["id"])["phase"], "acknowledged")
+
+    def test_kill_before_provider_submit_keeps_planned_request_retryable(self):
+        class KillBeforeSubmit(FakeProxy6):
+            def __init__(inner_self):
+                super().__init__(price=20)
+                inner_self.kill_once = True
+
+            def buy(inner_self, count, period, country, version=4, descr=None,
+                    allow_cc=None, on_submit=None):
+                if inner_self.kill_once:
+                    inner_self.kill_once = False
+                    raise SystemExit("kill before provider submit callback")
+                return super().buy(count, period, country, version, descr, allow_cc,
+                                   on_submit=on_submit)
+
+        prov = KillBeforeSubmit()
+        request_id = "request-kill-before-remote-submit"
+        with self.assertRaises(SystemExit):
+            money.plan_and_buy(
+                self.pool, prov, cfg(), country="fi", request_id=request_id)
+        op = money.bound_spend_request(self.pool, request_id)
+        self.assertEqual(op["phase"], "planned")
+        result = money.plan_and_buy(
+            self.pool, prov, cfg(), country="fi", request_id=request_id)
+        self.assertTrue(result["ok"])
+        self.assertEqual(prov.buy_calls, 1)
+        self.assertEqual(len(self.money_rows("buy")), 1)
+
+    def test_startup_reconcile_preserves_exact_planned_request(self):
+        request_id = "request-planned-across-startup"
+        self.pool.begin_spend_operation(
+            "buy", "proxy6", {"count": 1, "period": 7, "country": "fi", "version": 4},
+            "request-v1:" + request_id, descr="vpnbuy-startup-planned",
+            quote_price=20, currency="RUB", balance_before=928)
+        self.assertEqual(money.reconcile_pending_spend(
+            self.pool, {"proxy6": FakeProxy6(price=20)}), [])
+        self.assertEqual(money.bound_spend_request(
+            self.pool, request_id)["phase"], "planned")
+        prov = FakeProxy6(price=20)
+        result = money.plan_and_buy(
+            self.pool, prov, cfg(), country="fi", request_id=request_id)
+        self.assertTrue(result["ok"])
+        self.assertEqual(prov.buy_calls, 1)
+
+    def test_planned_quote_drift_becomes_terminal_and_fresh_request_can_spend(self):
+        request_id = "request-planned-price-drift"
+        op, _created = self.pool.begin_spend_operation(
+            "buy", "proxy6", {"count": 1, "period": 7,
+                                "country": "fi", "version": 4},
+            "request-v1:" + request_id, descr="vpnbuy-price-drift",
+            quote_price=20, currency="RUB", balance_before=928)
+        prov = FakeProxy6(price=25)
+        with self.assertRaises(money.SpendDenied) as caught:
+            money.plan_and_buy(
+                self.pool, prov, cfg(), country="fi", request_id=request_id)
+        self.assertTrue(caught.exception.replace_request)
+        self.assertEqual(self.pool.get_spend_operation(op["id"])["phase"], "failed")
+        result = money.plan_and_buy(
+            self.pool, prov, cfg(), country="fi",
+            request_id="request-after-planned-price-drift")
+        self.assertTrue(result["ok"])
+        self.assertEqual(prov.buy_calls, 1)
+
+    def test_post_submit_http_5xx_stays_ambiguous_and_blocks_new_spend(self):
+        class AcceptedThen500(FakeProxy6):
+            def __init__(inner_self):
+                super().__init__(price=20)
+                inner_self.remote_spends = 0
+
+            def buy(inner_self, count, period, country, version=4, descr=None,
+                    allow_cc=None, on_submit=None):
+                if on_submit is not None:
+                    on_submit()
+                inner_self.remote_spends += 1
+                raise ProviderError("HTTP 500", code=500)
+
+        prov = AcceptedThen500()
+        with self.assertRaises(money.SpendDenied) as caught:
+            money.plan_and_buy(
+                self.pool, prov, cfg(), country="fi",
+                request_id="request-accepted-then-http500")
+        self.assertFalse(caught.exception.replace_request)
+        op = money.bound_spend_request(self.pool, "request-accepted-then-http500")
+        self.assertEqual(op["phase"], "submitted")
+        with self.assertRaises(money.SpendDenied):
+            money.plan_and_buy(
+                self.pool, prov, cfg(), country="fi",
+                request_id="request-after-ambiguous-http500")
+        self.assertEqual(prov.remote_spends, 1)
+        self.assertEqual(self.money_rows("buy"), [])
+
+    def test_explicit_definitive_rejection_allows_replacement_request(self):
+        class DefinitiveReject(FakeProxy6):
+            def buy(inner_self, count, period, country, version=4, descr=None,
+                    allow_cc=None, on_submit=None):
+                if on_submit is not None:
+                    on_submit()
+                raise ProviderError("provider rejected", code=400, definitive=True)
+
+        prov = DefinitiveReject(price=20)
+        with self.assertRaises(ProviderError) as caught:
+            money.plan_and_buy(
+                self.pool, prov, cfg(), country="fi",
+                request_id="request-definitive-reject")
+        self.assertTrue(caught.exception.replace_request)
+        self.assertEqual(money.bound_spend_request(
+            self.pool, "request-definitive-reject")["phase"], "failed")
+
+    def test_legacy_planned_without_exact_request_is_retired_on_reconcile(self):
+        op, _created = self.pool.begin_spend_operation(
+            "buy", "proxy6", {"count": 1, "period": 7,
+                                "country": "fi", "version": 4},
+            "legacy-buy-key", descr="vpnbuy-legacy-planned",
+            quote_price=20, currency="RUB", balance_before=928)
+        self.assertEqual(money.reconcile_pending_spend(
+            self.pool, {"proxy6": FakeProxy6(price=20)}), [])
+        self.assertEqual(self.pool.get_spend_operation(op["id"])["phase"], "failed")
+        result = money.plan_and_buy(
+            self.pool, FakeProxy6(price=20), cfg(), country="fi",
+            request_id="request-after-legacy-planned")
+        self.assertTrue(result["ok"])
+
+    def test_completed_result_replays_without_current_provider_or_policy(self):
+        prov = FakeProxy6(price=20)
+        request_id = "request-replay-without-provider"
+        first = money.plan_and_buy(
+            self.pool, prov, cfg(), country="fi", request_id=request_id)
+        replay = money.replay_completed_request(
+            self.pool, request_id, "buy",
+            expected={"count": 1, "period": 7, "country": "fi", "version": 4})
+        self.assertEqual(replay["spend_operation_id"], first["spend_operation_id"])
+        self.assertTrue(replay["replayed_request"])
+        self.assertEqual(prov.buy_calls, 1)
+
+    @unittest.skipUnless(os.name == "posix", "flock process gate is a Linux contract")
+    def test_parallel_processes_do_not_bypass_daily_limit(self):
+        self.pool.close()
+        ctx = multiprocessing.get_context("fork")
+        start = ctx.Event()
+        calls = ctx.Value("i", 0)
+        results = ctx.Queue()
+        workers = [ctx.Process(target=_parallel_buy_worker,
+                               args=(self.db, start, calls, results,
+                                     "parallel-request-%d" % index))
+                   for index in range(2)]
+        for worker in workers:
+            worker.start()
+        start.set()
+        for worker in workers:
+            worker.join(15)
+            self.assertEqual(worker.exitcode, 0)
+        outcomes = sorted(results.get(timeout=2) for _ in workers)
+        self.assertEqual(outcomes, ["denied", "ok"])
+        self.assertEqual(calls.value, 1)
+        self.pool = pool_mod.Pool(self.db, server="node1")
+        self.assertEqual(len(self.money_rows("buy")), 1)
+
     def test_recovered_by_descr_no_double_buy(self):
         # buy оборвался сетью, но прокси нашёлся по descr -> покупка засчитана,
         # buy НЕ повторяется, запись одна
@@ -317,14 +571,17 @@ class TestIdempotency(Base):
                 inner_self.kill_once = True
 
             def buy(inner_self, count, period, country, version=4, descr=None,
-                    allow_cc=None):
+                    allow_cc=None, on_submit=None):
                 inner_self.buy_calls += 1
                 inner_self.attempted_descr = descr
                 inner_self.accepted = [inner_self._mk(country, descr)]
                 if inner_self.kill_once:
                     inner_self.kill_once = False
+                    if on_submit is not None:
+                        on_submit()
                     raise SystemExit("simulated kill after provider acceptance")
-                return super().buy(count, period, country, version, descr, allow_cc)
+                return super().buy(count, period, country, version, descr, allow_cc,
+                                   on_submit=on_submit)
 
             def find_by_descr(inner_self, descr, state="all"):
                 inner_self.find_calls += 1
@@ -333,22 +590,26 @@ class TestIdempotency(Base):
                         if item.get("descr") == descr]
 
         prov = KillAfterAccept()
+        request_id = "kill-after-provider-acceptance"
         with self.assertRaises(SystemExit):
-            money.plan_and_buy(self.pool, prov, cfg(), country="fi")
+            money.plan_and_buy(self.pool, prov, cfg(), country="fi",
+                               request_id=request_id)
         first_descr = prov.attempted_descr
         self.pool.close()
         self.pool = pool_mod.Pool(self.db, server="node1")
-        result = money.plan_and_buy(self.pool, prov, cfg(), country="fi")
+        result = money.plan_and_buy(self.pool, prov, cfg(), country="fi",
+                                    request_id=request_id)
         self.assertTrue(result["recovered"])
         self.assertEqual(result["descr"], first_descr)
         self.assertEqual(prov.buy_calls, 1)
         self.assertEqual(len(self.money_rows("buy")), 1)
         phase = self.pool.conn.execute(
             "SELECT phase FROM spend_operation").fetchone()[0]
-        self.assertEqual(phase, "committed")
+        self.assertEqual(phase, "acknowledged")
 
     def test_kill_after_ledger_commit_replays_result_without_second_buy(self):
         prov = FakeProxy6(price=20)
+        request_id = "kill-after-ledger-commit"
         original_log = self.pool.log_event
 
         def kill_on_event(*args, **kwargs):
@@ -356,21 +617,24 @@ class TestIdempotency(Base):
 
         self.pool.log_event = kill_on_event
         with self.assertRaises(SystemExit):
-            money.plan_and_buy(self.pool, prov, cfg(), country="fi")
+            money.plan_and_buy(self.pool, prov, cfg(), country="fi",
+                               request_id=request_id)
         self.pool.log_event = original_log
         self.assertEqual(len(self.money_rows("buy")), 1)
         self.assertEqual(self.pool.conn.execute(
             "SELECT phase FROM spend_operation").fetchone()[0], "committed")
         self.pool.close()
         self.pool = pool_mod.Pool(self.db, server="node1")
-        replay = money.plan_and_buy(self.pool, prov, cfg(), country="fi")
+        replay = money.plan_and_buy(self.pool, prov, cfg(), country="fi",
+                                    request_id=request_id)
         self.assertTrue(replay["recovered"])
-        self.assertTrue(replay["replayed_committed"])
+        self.assertTrue(replay["replayed_request"])
         self.assertEqual(prov.buy_calls, 1)
         self.assertEqual(len(self.money_rows("buy")), 1)
         # После наблюдаемого replay следующий вызов в том же живом процессе —
         # уже отдельное намерение и может создать новую покупку.
-        fresh = money.plan_and_buy(self.pool, prov, cfg(), country="fi")
+        fresh = money.plan_and_buy(self.pool, prov, cfg(), country="fi",
+                                   request_id="independent-fresh-buy")
         self.assertTrue(fresh["ok"])
         self.assertFalse(fresh["recovered"])
         self.assertEqual(prov.buy_calls, 2)
@@ -398,18 +662,19 @@ class TestIdempotency(Base):
             money.plan_and_buy(self.pool, prov, cfg(), country="fi")
         self.assertIn("prolong", str(caught.exception))
         self.assertEqual(prov.buy_calls, 0)
-        replay = money.prolong_with_limits(
-            self.pool, prov, cfg(),
-            row={"provider": "proxy6", "ext_id": "50", "uid": "proxy6:50",
-                 "date_end": "2026-08-21T10:00:00", "descr": ""}, days=30)
-        self.assertTrue(replay["replayed_committed"])
-        self.assertEqual(replay["uid"], "proxy6:50")
+        shown = money.resume_spend_operation(self.pool, op["id"])
+        self.assertFalse(shown["acknowledged"])
+        self.assertEqual(shown["result"]["uid"], "proxy6:50")
+        acknowledged = money.resume_spend_operation(
+            self.pool, op["id"], acknowledge=True)
+        self.assertTrue(acknowledged["acknowledged"])
 
     def test_corrupt_post_mutation_response_uses_quote_currency_and_positive_price(self):
         class CorruptResponse(FakeProxy6):
             def buy(inner_self, count, period, country, version=4, descr=None,
-                    allow_cc=None):
-                result = super().buy(count, period, country, version, descr, allow_cc)
+                    allow_cc=None, on_submit=None):
+                result = super().buy(count, period, country, version, descr, allow_cc,
+                                     on_submit=on_submit)
                 result.update(price=-100, currency="USD")
                 return result
 
@@ -429,7 +694,9 @@ class TestIdempotency(Base):
     def test_empty_success_response_stays_unresolved_and_blocks_repeat(self):
         class EmptyResponse(FakeProxy6):
             def buy(inner_self, count, period, country, version=4, descr=None,
-                    allow_cc=None):
+                    allow_cc=None, on_submit=None):
+                if on_submit is not None:
+                    on_submit()
                 inner_self.buy_calls += 1
                 inner_self.attempted_descr = descr
                 return {"proxies": [], "order_id": 7, "price": 100,
@@ -496,7 +763,9 @@ class TestProlong(Base):
                 inner_self.prolong_calls = 0
                 inner_self.remote_end = "2026-08-21T10:00:00"
 
-            def prolong(inner_self, ids, period):
+            def prolong(inner_self, ids, period, on_submit=None):
+                if on_submit is not None:
+                    on_submit()
                 inner_self.prolong_calls += 1
                 inner_self.remote_end = "2026-09-20T10:00:00"
                 raise SystemExit("simulated kill after prolong acceptance")
@@ -507,6 +776,7 @@ class TestProlong(Base):
                 return [item]
 
         prov = KillAfterAccept()
+        request_id = "kill-after-prolong-acceptance"
         self.pool.upsert_proxy({"provider": "proxy6", "ext_id": "50", "ip": "1.2.3.4",
                                 "host": "1.2.3.4", "port_http": 8000,
                                 "port_socks5": 8000, "user": "u", "password": "p",
@@ -515,12 +785,12 @@ class TestProlong(Base):
         row = self.pool.get("proxy6:50")
         with self.assertRaises(SystemExit):
             money.prolong_with_limits(self.pool, prov, cfg(max_price_per_buy=200),
-                                      row=row, days=30)
+                                      row=row, days=30, request_id=request_id)
         self.pool.close()
         self.pool = pool_mod.Pool(self.db, server="node1")
         result = money.prolong_with_limits(
             self.pool, prov, cfg(max_price_per_buy=200),
-            row=self.pool.get("proxy6:50"), days=30)
+            row=self.pool.get("proxy6:50"), days=30, request_id=request_id)
         self.assertTrue(result["recovered"])
         self.assertEqual(prov.prolong_calls, 1)
         self.assertEqual(len(self.money_rows("prolong")), 1)

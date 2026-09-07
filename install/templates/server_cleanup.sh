@@ -1,4 +1,5 @@
 #!/bin/bash
+# REDUT_BASE_CONTRACT=2
 # server_cleanup.sh — bounded cleanup of Redut-owned artifacts only.
 # Cron: 0 */3 * * *
 #

@@ -1406,6 +1406,12 @@ class Pool:
             "SELECT * FROM spend_operation WHERE id=?", (str(op_id),)).fetchone()
         return self._spend_item(row) if row else None
 
+    def get_spend_operation_by_idempotency(self, idempotency_key):
+        row = self.conn.execute(
+            "SELECT * FROM spend_operation WHERE idempotency_key=?",
+            (str(idempotency_key),)).fetchone()
+        return self._spend_item(row) if row else None
+
     def transition_spend_operation(self, op_id, phase, error=""):
         phase = str(phase or "").strip().lower()
         if phase not in ("submitted", "failed"):
@@ -1823,6 +1829,26 @@ class Pool:
 
     def set_setting(self, key, value):
         self.set_settings({key: value})
+
+    def get_or_create_setting(self, key, value):
+        """Atomically create caller state once and return the winning value."""
+        def write(conn):
+            conn.execute(
+                "INSERT OR IGNORE INTO setting(key,value) VALUES(?,?)",
+                (str(key), None if value is None else str(value)))
+            row = conn.execute(
+                "SELECT value FROM setting WHERE key=?", (str(key),)).fetchone()
+            return row[0] if row else None
+        return self.run_transaction(write)
+
+    def compare_and_delete_setting(self, key, expected):
+        """Delete exactly the caller state observed by this workflow."""
+        def write(conn):
+            cur = conn.execute(
+                "DELETE FROM setting WHERE key=? AND value=?",
+                (str(key), str(expected)))
+            return cur.rowcount == 1
+        return self.run_transaction(write)
 
     def set_settings(self, values):
         """Атомарно записать несколько ключей состояния одним commit.

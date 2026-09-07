@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 
 import apply as apply_mod
@@ -343,16 +344,6 @@ def _listener_tcp_packet_rate_limit(cfg, scope):
                 "g" if scope == "all" else "s"), "-j", "DROP"]
 
 
-def _query_rate_limit(cfg, scope, protocol):
-    return ["-s", _scope_source(cfg, scope), "-p", protocol, "--dport", "53",
-            "-m", "hashlimit", "--hashlimit-above",
-            "%s/second" % int(cfg["dns_rescue"]["qps_per_peer"]),
-            "--hashlimit-burst", str(cfg["dns_rescue"]["qps_burst_per_peer"]),
-            "--hashlimit-mode", "srcip", "--hashlimit-name",
-            "rd_n_%s_%s" % ("g" if scope == "all" else "s", protocol[0]),
-            "-j", "DROP"]
-
-
 def _jump(table, parent, protocol, target, cfg):
     if parent == "PREROUTING":
         return ["-i", "wg0", "-p", protocol, "--dport", "53", "-j", target]
@@ -420,16 +411,90 @@ def _ensure_jump(table, parent, rule, label, deadline_monotonic=None):
         raise DNSRuntimeError("%s failed: %s" % (label, str(out)[:200]))
 
 
+def _conntrack_cmd(command, deadline_monotonic=None):
+    """Run conntrack with separate streams and stable diagnostic language."""
+    env = dict(os.environ, LC_ALL="C", LANG="C")
+    try:
+        process = subprocess.run(
+            list(command), capture_output=True, text=True,
+            timeout=_remaining_timeout(deadline_monotonic, 5.0), env=env)
+        return (process.returncode, (process.stdout or "").strip(),
+                (process.stderr or "").strip())
+    except (subprocess.TimeoutExpired, OSError) as error:
+        return -1, "", str(error)
+
+
+def _empty_conntrack_xml(text):
+    payload = str(text or "").strip()
+    if not payload:
+        raise DNSRuntimeError("conntrack verification XML is empty")
+    try:
+        root = ET.fromstring(payload)
+    except (ET.ParseError, ValueError) as error:
+        raise DNSRuntimeError("conntrack returned malformed XML") from error
+    tag = str(root.tag).rsplit("}", 1)[-1].lower()
+    if tag != "conntrack":
+        raise DNSRuntimeError("conntrack XML has an unexpected root")
+    if any(str(node.tag).rsplit("}", 1)[-1].lower() == "flow"
+           for node in root.iter()):
+        return False
+    if list(root):
+        raise DNSRuntimeError("conntrack XML does not prove an empty flow set")
+    return True
+
+
+def _zero_conntrack_summary(text, action):
+    """Accept only conntrack-tools' normal zero-row stderr summary."""
+    payload = str(text or "").strip()
+    if not payload:
+        return True
+    return bool(re.fullmatch(
+        r"(?:conntrack(?:\s+v[0-9][A-Za-z0-9._+-]*)?"
+        r"(?:\s+\(conntrack-tools\))?:\s*)?"
+        r"0 flow entries have been %s\.?" % re.escape(action),
+        payload, flags=re.IGNORECASE))
+
+
 def _drain_dns_conntrack(cfg, scope, deadline_monotonic=None):
-    """Delete only pre-cutover IPv4 DNS flows for the declared WG source."""
+    """Delete and prove absence of scoped pre-cutover IPv4 DNS flows.
+
+    conntrack rc=1 is ambiguous (both an empty delete and netlink/permission
+    failures use it), so deletion status alone is never evidence of drain.
+    """
     source = _scope_source(cfg, scope)
     for protocol in _PROTOCOLS:
-        rc, out = _cmd([CONNTRACK, "-D", "-f", "ipv4", "-p", protocol,
-                        "-s", source, "--dport", "53"], deadline_monotonic)
-        # conntrack exits 1 when no matching entry existed; that is drained.
-        if rc not in (0, 1):
-            raise DNSRuntimeError("cannot drain %s DNS conntrack: %s"
-                                  % (protocol, str(out)[:200]))
+        delete_rc, delete_out, delete_err = _conntrack_cmd([
+            CONNTRACK, "-D", "-f", "ipv4", "-p", protocol,
+            "-s", source, "--dport", "53"], deadline_monotonic)
+        zero_delete = re.fullmatch(
+            r"(?:conntrack[^:]*:\s*)?0 flow entries have been deleted\.?",
+            " ".join(part for part in (delete_out, delete_err) if part).strip(),
+            flags=re.IGNORECASE)
+        if delete_rc != 0 and not (delete_rc == 1 and zero_delete):
+            raise DNSRuntimeError(
+                "cannot delete %s DNS conntrack entries (rc=%s): %s"
+                % (protocol, delete_rc, str(delete_err or delete_out)[:200]))
+        list_rc, remaining, list_err = _conntrack_cmd([
+            CONNTRACK, "-L", "-f", "ipv4", "-p", protocol,
+            "-s", source, "--dport", "53", "-o", "xml"],
+            deadline_monotonic)
+        # conntrack-tools 1.4.8 emits no XML document at all for an empty
+        # filtered list; its exact zero-row stderr summary is then the proof.
+        # A non-empty stdout must be a strict empty XML tree, with stderr
+        # either absent or the same normal summary.
+        blank_dump = not str(remaining or "").strip()
+        zero_shown = _zero_conntrack_summary(list_err, "shown")
+        if (list_rc != 0 or not zero_shown
+                or (blank_dump and not str(list_err or "").strip())):
+            raise DNSRuntimeError(
+                "cannot verify %s DNS conntrack drain (delete rc=%s): %s"
+                % (protocol, delete_rc,
+                   str(list_err or remaining or delete_err or delete_out)[:200]))
+        if blank_dump:
+            continue
+        if not _empty_conntrack_xml(remaining):
+            raise DNSRuntimeError("%s DNS conntrack entries remain after drain"
+                                  % protocol)
 
 
 def _listener_acl_effective(cfg, scope, deadline_monotonic=None,
@@ -764,9 +829,6 @@ def activate_firewall(cfg, scope="all", deadline_monotonic=None):
         _create_and_flush_chain("nat", chain, deadline_monotonic)
         if not _listener_acl_effective(cfg, scope, deadline_monotonic):
             stage_listener_acl(cfg, scope, deadline_monotonic)
-        for protocol in _PROTOCOLS:
-            limited = _query_rate_limit(cfg, scope, protocol)
-            _append_rule("nat", chain, limited, "rate-limit rule", deadline_monotonic)
         _append_rule("nat", chain, _rule(cfg, scope, chain), "UDP redirect rule",
                      deadline_monotonic)
         _append_rule("nat", chain, _tcp_rule(cfg, scope, chain), "TCP redirect rule",
@@ -830,10 +892,6 @@ def _firewall_attached_strict(cfg, scope="all", deadline_monotonic=None):
             return False
         redirect = (_rule(cfg, scope, chain) if protocol == "udp"
                     else _tcp_rule(cfg, scope, chain))
-        if not _rule_present_strict(
-                "nat", chain, _query_rate_limit(cfg, scope, protocol),
-                deadline_monotonic):
-            return False
         if not _rule_present_strict("nat", chain, redirect, deadline_monotonic):
             return False
         if not _rule_present_strict(
@@ -1748,7 +1806,7 @@ def client_primary_recovery_proven(cfg, profiles, timeout,
     """Prove the original path through an exact temporary bypass.
 
     A plain query while the global REDIRECT is active would only prove rescue
-    again.  This function inserts two exact source/protocol RETURN rules for the
+    again.  This function inserts two exact source/protocol ACCEPT rules for the
     configured synthetic peer, drains that peer's DNS conntrack mappings, runs
     the external application proof, then removes and re-drains the bypass.
     """
@@ -1773,8 +1831,10 @@ def client_primary_recovery_proven(cfg, profiles, timeout,
                 cfg, scope="all", deadline_monotonic=deadline_monotonic):
             return False
         _create_and_flush_chain("nat", PRIMARY_TEST_CHAIN, deadline_monotonic)
-        _append_rule("nat", PRIMARY_TEST_CHAIN, ["-j", "RETURN"],
-                     "primary recovery RETURN", deadline_monotonic)
+        # ACCEPT is a terminating nat-table verdict. RETURN would merely
+        # continue PREROUTING at the next rule and hit the global rescue jump.
+        _append_rule("nat", PRIMARY_TEST_CHAIN, ["-j", "ACCEPT"],
+                     "primary recovery ACCEPT", deadline_monotonic)
         for protocol in _PROTOCOLS:
             rule = ["-i", "wg0", "-s", source, "-p", protocol,
                     "--dport", "53", "-j", PRIMARY_TEST_CHAIN]

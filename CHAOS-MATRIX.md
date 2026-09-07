@@ -45,7 +45,7 @@ the plan and not presented as a passed global guarantee.
 |---|---|---|
 | timeout known before send | PASS | `test_transport.TestTransport.test_mutating_unsent_may_retry_via_tun0`, `test_transport.TestUrlopenClassification.test_urlerror_is_unsent` |
 | timeout after provider may have accepted buy | PASS | `test_transport.TestTransport.test_mutating_read_timeout_never_retried`, `test_money.TestIdempotency.test_recovered_by_descr_no_double_buy`, `test_unconfirmed_no_record_no_double` |
-| parallel buy/prolong on one node | PASS | node-local cross-thread/process spend lock in `money.py`; `test_money.TestBuyGates.test_parallel_buy_is_serialized_before_daily_limit_check` |
+| parallel buy/prolong on one node and independent CLI processes | PASS | durable request id + SQLite phase journal + OS process lock in `money.py`; `test_money.TestIdempotency.test_parallel_processes_do_not_bypass_daily_limit`, `test_money.TestBuyGates.test_parallel_buy_is_serialized_before_daily_limit_check` |
 | daily count/spend limits on one node | PASS | `test_money.TestBuyGates.test_daily_count_limit`, `test_daily_spend_limit` |
 | daily count/spend limit shared by several independent nodes | BOUNDARY | The plan explicitly defers a shared control plane. Each node has its own `state.db`; the live provider balance reserve remains the cross-node safety belt. No global daily-limit claim is asserted. |
 | invalid currency, price, balance, or semantic-corrupt ledger | PASS | `test_money.TestBuyGates.test_invalid_price_balance_and_currency_fail_closed`, `test_semantically_corrupt_ledger_blocks_before_remote_mutation`, `test_money.TestProlong.test_invalid_quote_denies_prolong_before_mutation` |
@@ -63,6 +63,10 @@ the plan and not presented as a passed global guarantee.
 | old config migration, backup, dry-run, idempotency | PASS | `test_config_schema.TestConfigSchema.test_migration_dry_run_backup_and_idempotency`, `test_future_and_invalid_migrations_never_rewrite_file` |
 | old DB migration and pre-migration snapshot | PASS | `test_pool.TestRolesV2Migration.test_migrates_and_snapshots`, `test_pool_db_reliability.TestPoolDBReliability.test_roles_snapshot_contains_committed_wal_rows` |
 | update failure rollback | PASS | `test_update.TestApplyOrchestration.test_verify_fail_rolls_back`, `test_setup_rc_nonzero_rolls_back`, `test_rollback_trusts_health_not_rc` |
+| legacy 1.12.3/1.13.0 updater hands its exact kernel flock to new setup | COMPOSED | `test_legacy_lock_handoff.TestLegacyLockProof`; real tagged updater/pidfd/Yama remains a Debian release gate |
+| DNS generation becomes active between download and installer mutation | PASS | authoritative post-lock preflight/baseline in `test_update.py`; direct setup/install/bootstrap/deploy and dangling artifacts in `test_install_dns_safety.py`, `test_deploy_security.py` |
+| RU allowlist crash at forward/rollback/commit boundaries and reboot loses every kernel set | PASS | real-shell `test_ru_allowlist_recovery.TestRUAllowlistCrashRecovery`: offline recovery, ABSENT old set, create/swap/restart failures and repeated rollback crash |
+| bootstrap/deploy interrupted while staging secret data | PASS | `test_deploy_security.TestSecretStaging`, `test_bootstrap_security.TestBootstrapSecretSafety`: exclusive handle is proven `root:0600` before first byte; dry-run redacts credentials |
 
 The final release gate is one complete canonical suite, one complete sanitized-public suite,
 secret/hygiene checks, and one independent end-to-end audit after implementation and docs are

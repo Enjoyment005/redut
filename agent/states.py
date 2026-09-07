@@ -1803,14 +1803,60 @@ def _alert_once(pool, alerter, kind, period=ALERT_DEDUP_SEC, **kw):
     return True
 
 
+def _decode_money_job(pool, raw, key):
+    try:
+        job = json.loads(raw)
+    except (TypeError, ValueError, RecursionError) as error:
+        raise money_mod.SpendDenied(
+            "durable money job %s повреждён; трата заблокирована" % key) from error
+    if (not isinstance(job, dict) or job.get("version") != 1
+            or not isinstance(job.get("intent"), dict)):
+        raise money_mod.SpendDenied(
+            "durable money job %s имеет неизвестную схему" % key)
+    # Public lookup also validates request_id before the caller may spend.
+    money_mod.bound_spend_request(pool, job.get("request_id"))
+    return job
+
+
+def _load_money_job(pool, key):
+    raw = pool.get_setting(key)
+    return (_decode_money_job(pool, raw, key), raw) if raw else (None, None)
+
+
+def _begin_money_job(pool, key, intent):
+    candidate = json.dumps(
+        {"version": 1, "request_id": uuid.uuid4().hex, "intent": dict(intent)},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    raw = pool.get_or_create_setting(key, candidate)
+    return _decode_money_job(pool, raw, key), raw
+
+
+def _finish_money_job(pool, key, raw):
+    if raw and not pool.compare_and_delete_setting(key, raw):
+        raise money_mod.SpendDenied(
+            "durable money job изменился до подтверждения результата")
+
+
+def _drop_unbound_money_job(pool, key, job, raw):
+    """Drop only a terminal ledger binding, never a concurrently bindable job."""
+    if job:
+        op = money_mod.bound_spend_request(pool, job["request_id"])
+        # op=None is not proof of abandonment: another process may hold the
+        # spend lock between quote and begin_spend_operation for this same job.
+        if op is not None and op.get("phase") == "failed":
+            pool.compare_and_delete_setting(key, raw)
+
+
 def try_replenish(cfg, providers, pool, alerter, log, actor):
     # ПЕРЕД ПОКУПКОЙ — всегда выбрать из уже купленного пула (жёсткое правило владельца,
     # снос №5): покупаем ТОЛЬКО когда пригодных кандидатов в пуле не осталось. Если ROTATING
     # остановился по лимиту и в пуле ещё есть непроверенные — деньги не тратим, доберём тиком.
+    job_key = "money_request:replenish"
+    job, job_raw = _load_money_job(pool, job_key)
     sb = apply_mod.load_json(cfg["singbox_config"])
     dead_host = apply_mod.current_upstream(sb)
     still = selectable_candidates(pool, cfg, dead_host, providers)
-    if still:
+    if job is None and still:
         log("  REPLENISH: в пуле ещё %d непроверенных кандидатов — сначала пробую их, не покупаю"
             % len(still))
         return {"ok": False, "reason": "в пуле есть %d непроверенных кандидатов — покупка не нужна" % len(still),
@@ -1826,36 +1872,51 @@ def try_replenish(cfg, providers, pool, alerter, log, actor):
     wl = money_mod.buy_candidates(cfg, pool=pool)
     period = int(lim["buy_period_days"])
     version = int(lim["buy_version"])
-    if not lim.get("buy_enabled"):
+    if job is None and not lim.get("buy_enabled"):
         _alert_once(pool, alerter, "no_funds", detail="тумблер покупок buy_enabled=false — купи руками")
         return {"ok": False, "reason": "покупки выключены тумблером (§6.2)"}
 
-    # рынок: первая страна из ранжированного списка с наличием
-    pick = avail = None
-    for cc in wl:
+    # На retry используем точное durable-намерение, а не новый снимок рынка.
+    if job is not None:
+        intent = job["intent"]
         try:
-            n = prov.getcount(cc, version)
-        except ProviderError as e:
-            if e.code == 105:
-                alerter.api_105(detail=str(e))
-                return {"ok": False, "reason": "PROXY6 105 (неверный IP)", "api105": True}
-            log("  getcount %s: %s" % (cc, e))
-            continue
-        if n > 0:
-            pick, avail = cc, n
-            break
-    if not pick:
-        _alert_once(pool, alerter, "no_market", detail="проверены страны: %s" % ",".join(wl))
-        return {"ok": False, "reason": "нет прокси version=%d в наличии (§10 error 300)" % version}
+            pick = str(intent["country"])
+            period = int(intent["period"])
+            version = int(intent["version"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise money_mod.SpendDenied("durable replenish intent повреждён") from error
+        avail = "retry"
+    else:
+        pick = avail = None
+        for cc in wl:
+            try:
+                n = prov.getcount(cc, version)
+            except ProviderError as e:
+                if e.code == 105:
+                    alerter.api_105(detail=str(e))
+                    return {"ok": False, "reason": "PROXY6 105 (неверный IP)", "api105": True}
+                log("  getcount %s: %s" % (cc, e))
+                continue
+            if n > 0:
+                pick, avail = cc, n
+                break
+        if not pick:
+            _alert_once(pool, alerter, "no_market", detail="проверены страны: %s" % ",".join(wl))
+            return {"ok": False, "reason": "нет прокси version=%d в наличии (§10 error 300)" % version}
+        job, job_raw = _begin_money_job(
+            pool, job_key, {"country": pick, "period": period, "version": version})
 
     log("  REPLENISH: покупаю в %s (в наличии %s), период %d дн" % (pick, avail, period))
     try:
         r = money_mod.plan_and_buy(pool, prov, cfg, country=pick, period=period, count=1,
-                                   version=version, server=cfg.get("server"), actor=actor)
+                                   version=version, server=cfg.get("server"), actor=actor,
+                                   request_id=job["request_id"])
     except money_mod.SpendDenied as e:
+        _drop_unbound_money_job(pool, job_key, job, job_raw)
         _alert_once(pool, alerter, "no_funds", detail=str(e))
         return {"ok": False, "reason": "гейт трат: %s" % e, "denied": True}
     except ProviderError as e:
+        _drop_unbound_money_job(pool, job_key, job, job_raw)
         if e.code == 400:
             _alert_once(pool, alerter, "no_funds", detail=str(e))
             return {"ok": False, "reason": "денег не хватило (error 400)"}
@@ -1894,6 +1955,7 @@ def try_replenish(cfg, providers, pool, alerter, log, actor):
                        balance_after=r["balance_after"], country=r["country"], period=r["period"],
                        egress=ar["verify"]["egress_ip"], cc=ar["verify"]["exit_cc"],
                        recovered=r["recovered"])
+        _finish_money_job(pool, job_key, job_raw)
         return {"ok": True, "uid": uid, "new_ip": ar["new_ip"], "verify": ar["verify"],
                 "detail": "докуплен и применён %s (%s %s)" % (uid, r["price"], r["currency"])}
 
@@ -1901,6 +1963,7 @@ def try_replenish(cfg, providers, pool, alerter, log, actor):
     for uid, res, blocked in checks:
         if blocked:
             alerter.blocked_cc(uid=uid, cc=res.get("exit_cc"))
+    _finish_money_job(pool, job_key, job_raw)
     return {"ok": False, "reason": "купленный прокси непригоден (страна в блоке / не пробивается)"}
 
 
@@ -2007,14 +2070,25 @@ def auto_prolong(cfg, providers, pool, alerter, log=print, actor="auto"):
     done = []
     for row in targets:
         uid = row["uid"]
+        job_key = "money_request:auto-prolong:%s" % uid
+        job = job_raw = None
+        try:
+            job, job_raw = _load_money_job(pool, job_key)
+        except money_mod.SpendDenied as e:
+            log("  автопродление: %s durable request повреждён — %s" % (uid, e))
+            pool.log_event("auto-prolong", actor=actor, to_uid=uid,
+                           result="denied", detail=str(e))
+            alerter.prolong_failed(uid=uid, days_left=None, reason=str(e))
+            continue
         days = probe_mod.days_left(row["date_end"])
-        if days is None or days > float(ap["days_before"]):
+        if job is None and (days is None or days > float(ap["days_before"])):
             continue                      # ещё рано — не морозим деньги заранее
-        if not row["probe_ok"]:
+        if job is None and not row["probe_ok"]:
             log("  автопродление: %s не прошёл последнюю пробу — продлевать не буду, "
                 "пусть его заменит ротация" % uid)
             continue
-        if pool.prolonged_today(uid):     # защита от повторов: крон может сработать не раз
+        if job is None and pool.prolonged_today(uid):
+            # защита от повторов: крон может сработать не раз
             continue
         # C5: адаптер СТРОГО по провайдеру строки. Константа proxy6 при боевом от
         # другого провайдера дёргала бы prolong с ЧУЖИМ ext_id в кабинете PROXY6
@@ -2031,8 +2105,19 @@ def auto_prolong(cfg, providers, pool, alerter, log=print, actor="auto"):
                                           % row["provider"])
             continue
         try:
+            if job is None:
+                period_days = int(ap["period_days"])
+                job, job_raw = _begin_money_job(
+                    pool, job_key, {"uid": uid, "days": period_days})
+            else:
+                intent = job["intent"]
+                if str(intent.get("uid")) != uid:
+                    raise money_mod.SpendDenied(
+                        "durable auto-prolong intent связан с другим uid")
+                period_days = int(intent["days"])
             r = money_mod.prolong_with_limits(pool, prov, cfg, row=row,
-                                              days=int(ap["period_days"]), actor=actor)
+                                              days=period_days, actor=actor,
+                                              request_id=job["request_id"])
             log("  автопродление: %s +%s дн за %s %s (до %s)"
                 % (uid, r["days"], r["price"], r["currency"], r["date_end"]))
             alerter.prolonged(uid=uid, days=r["days"], price=r["price"], currency=r["currency"],
@@ -2040,12 +2125,15 @@ def auto_prolong(cfg, providers, pool, alerter, log=print, actor="auto"):
                               cc=row["exit_cc"] if "exit_cc" in row.keys() else row["country"])
             done.append({"uid": uid, "days": r["days"], "price": r["price"],
                          "date_end": r["date_end"]})
+            _finish_money_job(pool, job_key, job_raw)
         except money_mod.SpendDenied as e:
+            _drop_unbound_money_job(pool, job_key, job, job_raw)
             # Тихо промолчать нельзя: иначе якорь истечёт и мы получим холодный IP.
             log("  автопродление: %s ОТКАЗ гейта — %s" % (uid, e))
             pool.log_event("auto-prolong", actor=actor, to_uid=uid, result="denied", detail=str(e))
             alerter.prolong_failed(uid=uid, days_left=round(days, 1), reason=str(e))
         except Exception as e:
+            _drop_unbound_money_job(pool, job_key, job, job_raw)
             log("  автопродление: %s ошибка провайдера — %s" % (uid, e))
             pool.log_event("auto-prolong", actor=actor, to_uid=uid, result="fail", detail=str(e))
             alerter.prolong_failed(uid=uid, days_left=round(days, 1), reason=str(e))
@@ -2061,9 +2149,12 @@ def ensure_reserve(cfg, providers, pool, alerter, log, actor, min_reserve=1):
     полон). Покупаем только когда выбирать реально не из чего.
     Best-effort: ошибки/гейты глушим (докупка резерва не должна ронять цикл)."""
     pool.observe_provider_errors(providers, actor=actor)
+    job_key = "money_request:reserve"
+    job = job_raw = None
     try:
+        job, job_raw = _load_money_job(pool, job_key)
         selection = selection_state(pool, cfg)
-        if selection["mode"] == SELECTION_MANUAL:
+        if job is None and selection["mode"] == SELECTION_MANUAL:
             # В MANUAL допускаются пассивные refresh/probe уже купленного пула и
             # продление самого якоря, но стратегия не покупает ничего проактивно.
             log("  N+1: ручной канал закреплён — автоматическую докупку резерва пропускаю")
@@ -2071,31 +2162,45 @@ def ensure_reserve(cfg, providers, pool, alerter, log, actor, min_reserve=1):
         sb = apply_mod.load_json(cfg["singbox_config"])
         current = apply_mod.current_upstream(sb)
         have = len(selectable_candidates(pool, cfg, current, providers))
-        if have >= min_reserve:
+        if job is None and have >= min_reserve:
             log("  N+1: в пуле %d пригодных кандидатов (≥%d) — выбираю из пула, не покупаю" % (have, min_reserve))
             return {"ok": True, "have": have, "bought": False}
         lim = money_mod.limits(cfg)
-        if not lim.get("buy_enabled"):
+        if job is None and not lim.get("buy_enabled"):
             log("  N+1: запас=%d, но покупки выключены — пропускаю" % have)
             return {"ok": False, "have": have, "bought": False}
         log("  N+1: пригодных кандидатов в пуле %d < %d — докупаю в фоне (§6.5)" % (have, min_reserve))
         prov = providers.get("proxy6")
         if prov is None or not prov.caps.get("buy"):
             return {"ok": False, "have": have, "bought": False}
-        # порядок стран — умная оценка (репутация выхода + стабильность F8)
-        version = int(lim["buy_version"])
-        pick = None
-        for cc in money_mod.buy_candidates(cfg, pool=pool):
+        # На retry продолжаем точное сохранённое намерение, не выбираем новую страну.
+        if job is not None:
+            intent = job["intent"]
             try:
-                if prov.getcount(cc, version) > 0:
-                    pick = cc
-                    break
-            except ProviderError:
-                continue
-        if not pick:
-            return {"ok": False, "have": have, "bought": False}
-        r = money_mod.plan_and_buy(pool, prov, cfg, country=pick, period=int(lim["buy_period_days"]),
-                                   count=1, version=version, server=cfg.get("server"), actor=actor)
+                pick = str(intent["country"])
+                period = int(intent["period"])
+                version = int(intent["version"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise money_mod.SpendDenied("durable reserve intent повреждён") from error
+        else:
+            version = int(lim["buy_version"])
+            period = int(lim["buy_period_days"])
+            pick = None
+            for cc in money_mod.buy_candidates(cfg, pool=pool):
+                try:
+                    if prov.getcount(cc, version) > 0:
+                        pick = cc
+                        break
+                except ProviderError:
+                    continue
+            if not pick:
+                return {"ok": False, "have": have, "bought": False}
+            job, job_raw = _begin_money_job(
+                pool, job_key, {"country": pick, "period": period, "version": version})
+        r = money_mod.plan_and_buy(
+            pool, prov, cfg, country=pick, period=period,
+            count=1, version=version, server=cfg.get("server"), actor=actor,
+            request_id=job["request_id"])
         checks = postbuy_check(cfg, pool, providers, r["proxies"], actor, log)
         good = [uid for uid, res, blocked in checks if res.get("ok") and not blocked]
         for uid, res, blocked in checks:
@@ -2105,11 +2210,14 @@ def ensure_reserve(cfg, providers, pool, alerter, log, actor, min_reserve=1):
             alerter.bought(uid=good[0], price=r["price"], currency=r["currency"],
                            balance_after=r["balance_after"], country=r["country"],
                            period=r["period"], cc=None, recovered=r["recovered"])
+        _finish_money_job(pool, job_key, job_raw)
         return {"ok": bool(good), "have": have, "bought": True, "uids": good}
     except money_mod.SpendDenied as e:
+        _drop_unbound_money_job(pool, job_key, job, job_raw)
         log("  N+1: докупка резерва отклонена гейтом: %s" % e)
         return {"ok": False, "bought": False, "reason": str(e)}
     except Exception as e:
+        _drop_unbound_money_job(pool, job_key, job, job_raw)
         log("  N+1: докупка резерва не удалась (не критично): %s" % e)
         return {"ok": False, "bought": False, "reason": str(e)}
 

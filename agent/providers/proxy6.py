@@ -158,7 +158,7 @@ class Proxy6(Provider):
         """Ключ идёт в пути URL — в любых сообщениях/логах маскируем (§15)."""
         return str(text).replace(self.api_key, "****").replace(urllib.parse.quote(self.api_key, safe=""), "****")
 
-    def _api(self, method, params=None, mutating=False):
+    def _api(self, method, params=None, mutating=False, on_submit=None):
         """GET к API PROXY6 (все методы — GET). Ключ в пути маскируется в ошибках.
 
         mutating=True (buy/prolong/delete): при сетевой ошибке НЕ перебираем
@@ -171,19 +171,25 @@ class Proxy6(Provider):
             # SOCKS5 в Chrome-расширении владельца. Только руками, полным списком.
             raise RuntimeError("ipauth запрещён агенту навсегда (§2.2)")
         return self._guarded(
-            method, lambda: self._api_request(method, params, mutating))
+            method, lambda: self._api_request(
+                method, params, mutating, on_submit=on_submit))
 
-    def _api_request(self, method, params=None, mutating=False):
+    def _api_request(self, method, params=None, mutating=False, on_submit=None):
         qs = build_query(params)
         suffix = "/api/%s/%s/" % (urllib.parse.quote(self.api_key, safe=""), method)
         if qs:
             suffix += "?" + qs
         order = ([self._good_host] + [h for h in P6_HOSTS if h != self._good_host]) if self._good_host else list(P6_HOSTS)
         last = None
+        submitted = False
         for host in order:
             try:
                 # mutating уходит и в транспорт: повтор через канал узла (tun0) допустим для денег
                 # только если запрос заведомо не был доставлен (providers/base._request_json).
+                if mutating and not submitted:
+                    if on_submit is not None:
+                        on_submit()
+                    submitted = True
                 data = http_get_json("https://" + host + suffix, host_label=host, mutating=mutating)
             except ProviderError as e:
                 if e.network:
@@ -192,17 +198,20 @@ class Proxy6(Provider):
                         # Не перебираем домены на мутации — см. docstring.
                         raise ProviderError(self._mask(str(e)), code=e.code, network=True,
                                             unsent=e.unsent, kind=e.kind,
-                                            retry_after=e.retry_after) from None
+                                            retry_after=e.retry_after,
+                                            definitive=e.definitive) from None
                     continue  # чтение: домен недоступен — пробуем следующий
                 raise ProviderError(self._mask(str(e)), code=e.code, unsent=e.unsent,
                                     kind=e.kind,
-                                    retry_after=e.retry_after) from None
+                                    retry_after=e.retry_after,
+                                    definitive=e.definitive) from None
             if isinstance(data, dict) and data.get("status") == "no":
                 code = data.get("error_id")
                 kind = (ProviderErrorKind.AUTH if code in (100, 105)
                         else ProviderErrorKind.NOT_FOUND if code == 404
                         else ProviderErrorKind.UNKNOWN)
-                raise ProviderError(self._mask(p6_error_text(data)), code=code, kind=kind)
+                raise ProviderError(self._mask(p6_error_text(data)), code=code,
+                                    kind=kind, definitive=True)
             self._good_host = host
             return data or {}
         raise ProviderError(
@@ -211,7 +220,8 @@ class Proxy6(Provider):
             code=getattr(last, "code", None), network=True,
             unsent=bool(last and last.unsent),
             kind=getattr(last, "kind", ProviderErrorKind.NETWORK),
-            retry_after=getattr(last, "retry_after", None))
+            retry_after=getattr(last, "retry_after", None),
+            definitive=getattr(last, "definitive", False))
 
     def list(self):
         out = []
@@ -291,7 +301,8 @@ class Proxy6(Provider):
                 "PROXY6.buy: страна '%s' не в списке разрешённых — покупка запрещена (§6.1)" % country)
         return country
 
-    def buy(self, count, period, country, version=4, descr=None, allow_cc=None):
+    def buy(self, count, period, country, version=4, descr=None, allow_cc=None,
+            on_submit=None):
         """Покупка прокси. ВСЯ валидация — ДО обращения к API (§15).
 
         allow_cc — необязательное сужение списка стран (None — любая вне чёрного
@@ -317,7 +328,7 @@ class Proxy6(Provider):
         if descr:
             params["descr"] = descr
         # NB: auto_prolong СПЕЦИАЛЬНО отсутствует (§6.2).
-        r = self._api("buy", params, mutating=True)
+        r = self._api("buy", params, mutating=True, on_submit=on_submit)
         proxies = [n for n in (norm_bought(it, version, r.get("country") or country)
                                for it in (r.get("list") or {}).values()) if n]
         return {"proxies": proxies, "order_id": r.get("order_id"),
@@ -339,7 +350,7 @@ class Proxy6(Provider):
         r = self._api("getproxy", {"descr": descr, "state": state, "limit": 1000})
         return [n for n in (norm_proxy6(it) for it in (r.get("list") or {}).values()) if n]
 
-    def prolong(self, ids, period):
+    def prolong(self, ids, period, on_submit=None):
         """Продление списка прокси на period дней (prolong?ids=&period=).
 
         Возврат: dict(order_id, price, count, period, balance, currency,
@@ -348,7 +359,8 @@ class Proxy6(Provider):
         period = _as_int(period, "period")
         if not (1 <= period <= MAX_PERIOD_DAYS):
             raise ProviderError("PROXY6.prolong: period=%d вне 1..%d дней" % (period, MAX_PERIOD_DAYS))
-        r = self._api("prolong", {"ids": ids_csv, "period": period}, mutating=True)
+        r = self._api("prolong", {"ids": ids_csv, "period": period},
+                      mutating=True, on_submit=on_submit)
         got = r.get("list") or {}
         return {"order_id": r.get("order_id"), "price": r.get("price"),
                 "price_single": r.get("price_single"), "count": r.get("count"),

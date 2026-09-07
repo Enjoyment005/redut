@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import json
+import ipaddress
 import os
 import stat
 import sys
@@ -81,7 +82,8 @@ class FakeFirewall:
         command = list(command)
         self.commands.append(command)
         if command[0] == dns_runtime.CONNTRACK:
-            return (1, "0 flow entries have been deleted")
+            return ((1, "0 flow entries have been deleted")
+                    if "-D" in command else (0, ""))
         if command[0] != dns_runtime.IPTABLES or command[1:3] != ["-t", command[2]]:
             return (2, "unexpected command")
         table, action, chain = command[2], command[3], command[4]
@@ -115,6 +117,9 @@ class FakeFirewall:
         if action in ("-A", "-I"):
             if key not in self.chains:
                 return (1, "missing")
+            if (table == "nat" and "-j" in rule
+                    and rule[rule.index("-j") + 1] in ("DROP", "REJECT")):
+                return (2, "target inhibited for nat table")
             if action == "-I":
                 self.chains[key].insert(0, rule)
             else:
@@ -131,11 +136,46 @@ class FakeFirewall:
             return (0, "")
         return (2, "unsupported")
 
+    @staticmethod
+    def _matches(rule, source, protocol):
+        if "-p" in rule and rule[rule.index("-p") + 1] != protocol:
+            return False
+        if "--dport" in rule and rule[rule.index("--dport") + 1] != "53":
+            return False
+        if "-s" in rule:
+            network = ipaddress.ip_network(rule[rule.index("-s") + 1], strict=False)
+            if ipaddress.ip_address(source) not in network:
+                return False
+        return True
+
+    def trace_nat(self, source, protocol):
+        """Minimal jump/RETURN/terminating-verdict interpreter for DNS rules."""
+        def walk(chain):
+            for rule in self.chains.get(("nat", chain), ()):
+                if not self._matches(rule, source, protocol) or "-j" not in rule:
+                    continue
+                target = rule[rule.index("-j") + 1]
+                if target in ("ACCEPT", "REDIRECT", "DROP", "REJECT"):
+                    return target
+                if ("nat", target) in self.chains:
+                    verdict = walk(target)
+                    if verdict != "RETURN":
+                        return verdict
+            return "RETURN"
+        return walk("PREROUTING")
+
 
 class TestFirewallFailOpen(unittest.TestCase):
     def setUp(self):
         self.cfg = config()
         self.firewall = FakeFirewall()
+        self._conntrack = mock.patch.object(
+            dns_runtime, "_conntrack_cmd",
+            side_effect=lambda command, *_args, **_kwargs:
+            ((1, "0 flow entries have been deleted", "")
+             if "-D" in command else (0, "<conntrack />", "")))
+        self._conntrack.start()
+        self.addCleanup(self._conntrack.stop)
 
     def _activate(self, scope="all"):
         with mock.patch.object(dns_runtime.apply_mod, "run_cmd", side_effect=self.firewall):
@@ -164,8 +204,6 @@ class TestFirewallFailOpen(unittest.TestCase):
         for scope in ("all", "peer:10.77.0.9"):
             rules = [dns_runtime._listener_udp_rate_limit(self.cfg, scope),
                      dns_runtime._listener_tcp_packet_rate_limit(self.cfg, scope)]
-            rules.extend(dns_runtime._query_rate_limit(
-                self.cfg, scope, protocol) for protocol in dns_runtime._PROTOCOLS)
             for rule in rules:
                 name = rule[rule.index("--hashlimit-name") + 1]
                 self.assertLessEqual(len(name.encode("ascii")), 15)
@@ -330,6 +368,13 @@ class TestFirewallFailOpen(unittest.TestCase):
 class TestRuntimeProofs(unittest.TestCase):
     def setUp(self):
         self.cfg = config()
+        self._conntrack = mock.patch.object(
+            dns_runtime, "_conntrack_cmd",
+            side_effect=lambda command, *_args, **_kwargs:
+            ((1, "0 flow entries have been deleted", "")
+             if "-D" in command else (0, "<conntrack />", "")))
+        self._conntrack.start()
+        self.addCleanup(self._conntrack.stop)
 
     def test_service_start_requires_effective_active_state(self):
         with mock.patch.object(dns_runtime.apply_mod, "run_cmd",
@@ -467,20 +512,112 @@ class TestRuntimeProofs(unittest.TestCase):
     def test_conntrack_drain_is_dns_only_and_scope_bounded(self):
         commands = []
 
-        def run(command, timeout=40):
+        def run(command, deadline=None):
             commands.append(command)
-            return (1, "0 flow entries have been deleted")
+            return ((1, "0 flow entries have been deleted", "")
+                    if "-D" in command else (0, "<conntrack />", ""))
 
-        with mock.patch.object(dns_runtime.apply_mod, "run_cmd", side_effect=run):
+        with mock.patch.object(dns_runtime, "_conntrack_cmd", side_effect=run):
             dns_runtime._drain_dns_conntrack(
                 self.cfg, "peer:10.77.0.9", deadline_monotonic=999999999.0)
-        self.assertEqual(len(commands), 2)
+        self.assertEqual(len(commands), 4)
         for command in commands:
             self.assertEqual(command[0], dns_runtime.CONNTRACK)
             self.assertIn("10.77.0.9/32", command)
             self.assertIn("--dport", command)
             self.assertIn("53", command)
             self.assertNotIn("-F", command)
+        self.assertEqual([command[1] for command in commands],
+                         ["-D", "-L", "-D", "-L"])
+
+    def test_conntrack_rc1_error_is_not_accepted_without_empty_dump(self):
+        def run(command, *_args, **_kwargs):
+            if "-D" in command:
+                return (1, "", "Operation failed: permission denied")
+            return (1, "", "Operation failed: permission denied")
+
+        with mock.patch.object(dns_runtime, "_conntrack_cmd", side_effect=run):
+            with self.assertRaisesRegex(dns_runtime.DNSRuntimeError,
+                                        "cannot delete udp"):
+                dns_runtime._drain_dns_conntrack(self.cfg, "all")
+
+    def test_conntrack_dump_must_prove_no_remaining_flow(self):
+        def run(command, *_args, **_kwargs):
+            if "-D" in command:
+                return (0, "1 flow entries have been deleted", "")
+            return (0, '<conntrack><flow family="ipv4" /></conntrack>', "")
+
+        with mock.patch.object(dns_runtime, "_conntrack_cmd", side_effect=run):
+            with self.assertRaisesRegex(dns_runtime.DNSRuntimeError,
+                                        "entries remain"):
+                dns_runtime._drain_dns_conntrack(self.cfg, "all")
+
+    def test_conntrack_delete_error_is_not_hidden_by_empty_dump(self):
+        calls = 0
+
+        def run(command, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if "-D" in command:
+                return (1, "", "Operation failed: permission denied")
+            return (0, "", "")
+
+        with mock.patch.object(dns_runtime, "_conntrack_cmd", side_effect=run):
+            with self.assertRaisesRegex(dns_runtime.DNSRuntimeError,
+                                        "cannot delete udp"):
+                dns_runtime._drain_dns_conntrack(self.cfg, "all")
+        self.assertEqual(calls, 1, "ошибка delete блокирует ложную empty verification")
+
+    def test_conntrack_delete_timeout_is_fail_closed(self):
+        with mock.patch.object(dns_runtime, "_conntrack_cmd",
+                               return_value=(-1, "", "timeout")):
+            with self.assertRaisesRegex(dns_runtime.DNSRuntimeError,
+                                        "cannot delete udp"):
+                dns_runtime._drain_dns_conntrack(self.cfg, "all")
+
+    def test_conntrack_empty_dump_rejects_stderr_and_malformed_xml(self):
+        cases = ((0, "", "permission denied"),
+                 (0, "<conntrack><flow", ""),
+                 (0, "", ""))
+        for list_result in cases:
+            with self.subTest(result=list_result):
+                def run(command, *_args, **_kwargs):
+                    return ((0, "0 flow entries have been deleted", "")
+                            if "-D" in command else list_result)
+                with mock.patch.object(dns_runtime, "_conntrack_cmd", side_effect=run):
+                    with self.assertRaises(dns_runtime.DNSRuntimeError):
+                        dns_runtime._drain_dns_conntrack(self.cfg, "all")
+
+    def test_conntrack_empty_xml_accepts_normal_zero_shown_stderr(self):
+        def run(command, *_args, **_kwargs):
+            if "-D" in command:
+                return (1, "", "conntrack v1.4.8 (conntrack-tools): "
+                        "0 flow entries have been deleted.")
+            return (0, "<conntrack />",
+                    "conntrack v1.4.8 (conntrack-tools): "
+                    "0 flow entries have been shown.")
+
+        with mock.patch.object(dns_runtime, "_conntrack_cmd", side_effect=run):
+            dns_runtime._drain_dns_conntrack(self.cfg, "all")
+
+    def test_conntrack_real_empty_dump_accepts_exact_zero_shown_stderr(self):
+        def run(command, *_args, **_kwargs):
+            if "-D" in command:
+                return (1, "", "conntrack v1.4.8 (conntrack-tools): "
+                        "0 flow entries have been deleted.")
+            return (0, "", "conntrack v1.4.8 (conntrack-tools): "
+                    "0 flow entries have been shown.")
+
+        with mock.patch.object(dns_runtime, "_conntrack_cmd", side_effect=run):
+            dns_runtime._drain_dns_conntrack(self.cfg, "all")
+
+    def test_nat_model_rejects_drop_target(self):
+        firewall = FakeFirewall()
+        command = [dns_runtime.IPTABLES, "-t", "nat", "-A", "PREROUTING",
+                   "-p", "udp", "--dport", "53", "-j", "DROP"]
+        rc, why = firewall(command)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("inhibited", why)
 
     def test_external_runner_correlates_challenge_profiles_and_both_protocols(self):
         info = SimpleNamespace(st_mode=stat.S_IFREG | 0o700, st_uid=0)
@@ -620,6 +757,13 @@ class TestRuntimeProofs(unittest.TestCase):
         info = SimpleNamespace(st_mode=stat.S_IFREG | 0o700, st_uid=0)
         with mock.patch.object(dns_runtime.apply_mod, "run_cmd", side_effect=firewall):
             dns_runtime.activate_firewall(self.cfg, "all")
+        def original_path_runner(command, **_kwargs):
+            self.assertEqual(firewall.trace_nat("10.77.0.9", "udp"), "ACCEPT")
+            self.assertEqual(firewall.trace_nat("10.77.0.9", "tcp"), "ACCEPT")
+            self.assertEqual(firewall.trace_nat("10.77.0.10", "udp"), "REDIRECT")
+            self.assertEqual(firewall.trace_nat("10.77.0.10", "tcp"), "REDIRECT")
+            return self._successful_runner(command, **_kwargs)
+
         with mock.patch.object(dns_runtime.apply_mod, "run_cmd", side_effect=firewall), \
                 mock.patch.object(dns_runtime.os, "stat", return_value=info), \
                 mock.patch.object(dns_runtime.os, "access", return_value=True), \
@@ -627,7 +771,7 @@ class TestRuntimeProofs(unittest.TestCase):
                 mock.patch.object(dns_runtime, "wireguard_scope_ready", return_value=True), \
                 mock.patch.object(dns_runtime, "wireguard_scope_identity", return_value="route-v1"), \
                 mock.patch.object(dns_runtime.subprocess, "run",
-                                  side_effect=self._successful_runner):
+                                  side_effect=original_path_runner):
             self.assertTrue(dns_runtime.client_primary_recovery_proven(
                 self.cfg, ("wg-ip", "external-ip"), 5))
         self.assertNotIn(("nat", dns_runtime.PRIMARY_TEST_CHAIN), firewall.chains)
@@ -637,7 +781,7 @@ class TestRuntimeProofs(unittest.TestCase):
 
     def test_crash_residue_primary_bypass_is_neutralized_and_removed(self):
         firewall = FakeFirewall()
-        firewall.chains[("nat", dns_runtime.PRIMARY_TEST_CHAIN)] = [("-j", "RETURN")]
+        firewall.chains[("nat", dns_runtime.PRIMARY_TEST_CHAIN)] = [("-j", "ACCEPT")]
         firewall.chains[("nat", "PREROUTING")].append((
             "-i", "wg0", "-s", "10.77.0.9/32", "-p", "udp", "--dport", "53",
             "-j", dns_runtime.PRIMARY_TEST_CHAIN))

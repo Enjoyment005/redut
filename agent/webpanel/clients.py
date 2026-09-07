@@ -8,6 +8,7 @@
 /etc/wireguard/clients/<name>.conf (0600) — источник для скачивания/QR.
 """
 import ipaddress
+import hashlib
 import json
 import os
 import re
@@ -132,24 +133,44 @@ def _wg_dump():
 def list_clients(cfg):
     p = server_params(cfg)
     dump = _wg_dump()
-    stored = set()
-    if os.path.isdir(CLIENTS_DIR):
-        stored = {fn[:-5] for fn in os.listdir(CLIENTS_DIR) if fn.endswith(".conf")}
     out = []
     for peer in _parse_peers(p["text"]):
-        ip = (peer["allowed_ips"] or "").split("/")[0]
+        ip = ""
+        try:
+            subnet = ipaddress.ip_network(cfg.get("subnet") or "10.8.0.0/24",
+                                           strict=False)
+            addresses = [ipaddress.ip_network(value, strict=False)
+                         for value in _peer_allowed_ips(peer)]
+            matches = [network for network in addresses
+                       if network.version == 4 and network.prefixlen == 32
+                       and network.subnet_of(subnet)]
+            if len(matches) == 1:
+                ip = str(matches[0].network_address)
+        except (ClientError, ValueError):
+            pass
+        unsupported_reason = ""
+        try:
+            _exact_peer_ipv4(cfg, peer)
+        except ClientError as error:
+            unsupported_reason = str(error)
         d = dump.get(peer["pubkey"] or "", {})
         name = peer["name"]
-        # если имени в конфиге нет, но есть сохранённый .conf с этим ip — подставим
-        if not name:
-            for s in stored:
-                if _stored_ip(s) == ip:
-                    name = s
-                    break
+        try:
+            conf_name = _stored_conf_for_peer(peer)
+        except ClientError as error:
+            conf_name = None
+            unsupported_reason = "; ".join(
+                item for item in (unsupported_reason, str(error)) if item)
+        # An unnamed legacy peer may list IPv6 first or use multiple lines.
+        # Bind its saved profile by exact peer membership, not display order.
+        if not name and conf_name:
+            name = conf_name
         out.append({"name": name or ("peer-" + ip.replace(".", "-") if ip else "peer"),
                     "ip": ip, "pubkey": peer["pubkey"],
                     "handshake": d.get("handshake", 0), "rx": d.get("rx", 0),
-                    "tx": d.get("tx", 0), "has_conf": (name in stored) if name else False})
+                    "tx": d.get("tx", 0), "has_conf": bool(conf_name),
+                    "unsupported": bool(unsupported_reason),
+                    "unsupported_reason": unsupported_reason})
     return out
 
 
@@ -174,7 +195,31 @@ def _used_ips(cfg, peers, net):
     return used
 
 
-def _set_live_peer(pubkey, psk, address):
+def _normalise_allowed_ips(values):
+    """Validate a non-empty WireGuard AllowedIPs collection for exact restore."""
+    out = []
+    for value in values or ():
+        try:
+            out.append(str(ipaddress.ip_network(str(value).strip(), strict=False)))
+        except ValueError as error:
+            raise ClientError("peer AllowedIPs имеет неверный формат") from error
+    if not out:
+        raise ClientError("peer не содержит AllowedIPs для безопасного отката")
+    if len(set(out)) != len(out):
+        raise ClientError("peer AllowedIPs содержит дубликаты")
+    return out
+
+
+def _peer_allowed_ips(target):
+    lines = (target or {}).get("allowed_ips_lines")
+    if lines is None:
+        lines = [(target or {}).get("allowed_ips") or ""]
+    values = [item.strip() for line in lines for item in str(line).split(",")
+              if item.strip()]
+    return _normalise_allowed_ips(values)
+
+
+def _set_live_peer_allowed_ips(pubkey, psk, allowed_ips):
     command = ["wg", "set", "wg0", "peer", pubkey]
     pskfile = None
     try:
@@ -185,7 +230,7 @@ def _set_live_peer(pubkey, psk, address):
                 handle.write(psk + "\n")
                 pskfile = handle.name
             command.extend(["preshared-key", pskfile])
-        command.extend(["allowed-ips", address + "/32"])
+        command.extend(["allowed-ips", ",".join(_normalise_allowed_ips(allowed_ips))])
         _run(command)
     finally:
         if pskfile:
@@ -195,14 +240,26 @@ def _set_live_peer(pubkey, psk, address):
                 pass
 
 
-def _live_peer_matches(pubkey, address):
+def _set_live_peer(pubkey, psk, address):
+    _set_live_peer_allowed_ips(pubkey, psk, [address + "/32"])
+
+
+def _live_peer_allowed_ips_match(pubkey, allowed_ips):
     output = _run(["wg", "show", "wg0", "allowed-ips"])
-    expected = address + "/32"
+    expected = set(_normalise_allowed_ips(allowed_ips))
     for line in output.splitlines():
         parts = line.split(None, 1)
         if len(parts) == 2 and parts[0] == pubkey:
-            return {item.strip() for item in parts[1].split(",")} == {expected}
+            try:
+                actual = set(_normalise_allowed_ips(parts[1].split(",")))
+            except ClientError:
+                return False
+            return actual == expected
     return False
+
+
+def _live_peer_matches(pubkey, address):
+    return _live_peer_allowed_ips_match(pubkey, [address + "/32"])
 
 
 def _exact_peer_ipv4(cfg, target):
@@ -358,22 +415,41 @@ def _load_client_operation(cfg):
         return None
     except (OSError, ValueError) as error:
         raise ClientError("pending WireGuard client operation повреждена: %s" % error)
-    required = ("kind", "name", "pubkey", "address", "wg_config")
+    required = ("kind", "name", "pubkey", "wg_config")
     if (not isinstance(operation, dict)
             or not all(operation.get(key) for key in required)
             or operation.get("kind") not in ("add", "delete")
             or not valid_name(operation.get("name"))):
         raise ClientError("pending WireGuard client operation имеет неверную форму")
-    try:
-        address = ipaddress.ip_address(operation["address"])
-        subnet = ipaddress.ip_network(cfg.get("subnet") or "10.8.0.0/24",
-                                       strict=False)
-    except ValueError as error:
-        raise ClientError("pending WireGuard client address неверен") from error
-    if address.version != 4 or address not in subnet:
-        raise ClientError("pending WireGuard client address вне подсети")
-    if operation["kind"] == "add" and not operation.get("client_conf"):
-        raise ClientError("pending WireGuard add не содержит client config")
+    if operation["kind"] == "add":
+        try:
+            address = ipaddress.ip_address(operation.get("address") or "")
+            subnet = ipaddress.ip_network(cfg.get("subnet") or "10.8.0.0/24",
+                                           strict=False)
+        except ValueError as error:
+            raise ClientError("pending WireGuard client address неверен") from error
+        if address.version != 4 or address not in subnet:
+            raise ClientError("pending WireGuard client address вне подсети")
+        if not operation.get("client_conf"):
+            raise ClientError("pending WireGuard add не содержит client config")
+    elif operation.get("address"):
+        # Accept v1.13.1 delete markers while validating the legacy field.
+        try:
+            address = ipaddress.ip_address(operation["address"])
+            subnet = ipaddress.ip_network(cfg.get("subnet") or "10.8.0.0/24",
+                                           strict=False)
+        except ValueError as error:
+            raise ClientError("pending WireGuard client address неверен") from error
+        if address.version != 4 or address not in subnet:
+            raise ClientError("pending WireGuard client address вне подсети")
+    if operation["kind"] == "delete":
+        rollback_allowed = operation.get("rollback_allowed_ips")
+        if rollback_allowed is None and operation.get("address"):
+            rollback_allowed = [str(operation["address"]) + "/32"]
+        if (not isinstance(rollback_allowed, list)
+                or not all(isinstance(item, str) for item in rollback_allowed)):
+            raise ClientError("pending WireGuard delete не содержит rollback AllowedIPs")
+        _normalise_allowed_ips(rollback_allowed)
     resolution = operation.get("resolution") or "forward"
     if resolution not in ("forward", "rollback"):
         raise ClientError("pending WireGuard client resolution неверен")
@@ -402,7 +478,7 @@ def reconcile_client_operation(cfg, _locked=False, dns_pool=None):
         cfg, dns_pool=dns_pool, allow_existing_resume=True)
     name = operation["name"]
     pubkey = operation["pubkey"]
-    address = operation["address"]
+    address = operation.get("address")
     client_path = os.path.join(CLIENTS_DIR, name + ".conf")
     resolution = operation.get("resolution") or "forward"
     try:
@@ -418,8 +494,10 @@ def reconcile_client_operation(cfg, _locked=False, dns_pool=None):
                         or os.path.exists(client_path)):
                     raise ClientError("pending durable add rollback не подтверждён")
             else:
-                _set_live_peer(pubkey, operation.get("rollback_psk"), address)
-                if not _live_peer_matches(pubkey, address):
+                rollback_allowed = operation.get("rollback_allowed_ips") or [address + "/32"]
+                _set_live_peer_allowed_ips(
+                    pubkey, operation.get("rollback_psk"), rollback_allowed)
+                if not _live_peer_allowed_ips_match(pubkey, rollback_allowed):
                     raise ClientError("pending live peer restore не подтверждён")
                 saved = operation.get("rollback_client_conf")
                 if saved is not None:
@@ -473,6 +551,17 @@ def next_free_ip(cfg, params=None):
         if s not in used:
             return s
     raise ClientError("свободных адресов в подсети нет")
+
+
+def client_inventory(cfg):
+    """Return readable peers even when strict allocation is currently unavailable."""
+    rows = list_clients(cfg)
+    try:
+        next_ip = next_free_ip(cfg)
+    except ClientError as error:
+        return {"clients": rows, "next_ip": None, "can_add": False,
+                "add_error": str(error)}
+    return {"clients": rows, "next_ip": next_ip, "can_add": True, "add_error": ""}
 
 
 # ─────────────────────────── создать / удалить ──────────────────────────
@@ -547,30 +636,65 @@ def add_client(cfg, name, _locked=False, dns_pool=None):
             "recovery_pending": pending}
 
 
-def delete_client(cfg, name, _locked=False, dns_pool=None):
+def _stored_conf_for_peer(target):
+    """Resolve at most one stored client profile by its exact peer IPv4."""
+    matches = []
+    if os.path.isdir(CLIENTS_DIR):
+        for filename in os.listdir(CLIENTS_DIR):
+            if not filename.endswith(".conf"):
+                continue
+            candidate = filename[:-5]
+            if not valid_name(candidate):
+                continue
+            address = _stored_ip(candidate)
+            if address and _peer_mentions_ip(target, address):
+                matches.append(candidate)
+    if len(matches) > 1:
+        raise ClientError("несколько сохранённых профилей соответствуют одному peer")
+    return matches[0] if matches else None
+
+
+def delete_client(cfg, name, pubkey=None, _locked=False, dns_pool=None):
     if not _locked:
         try:
             with apply_mod.Flock(cfg.get("lock") or "/run/vpn-agent.lock"):
-                return delete_client(cfg, name, _locked=True, dns_pool=dns_pool)
+                return delete_client(
+                    cfg, name, pubkey=pubkey, _locked=True, dns_pool=dns_pool)
         except apply_mod.ApplyError as error:
             raise ClientError(str(error))
     reconcile_client_operation(cfg, _locked=True, dns_pool=dns_pool)
     _dns_membership_guard(cfg, dns_pool=dns_pool)
-    if not valid_name(name):
+    if pubkey is None and not valid_name(name):
         raise ClientError("плохое имя")
     p = server_params(cfg)
     peers = _parse_peers(p["text"])
-    target = next((c for c in peers if (c["name"] or "") == name), None)
-    pub = target["pubkey"] if target else None
-    if not pub:                                   # имени нет в конфиге — попробуем по .conf
-        ip = _stored_ip(name)
-        target = next((c for c in peers if ip and _peer_mentions_ip(c, ip)), None)
-        pub = target["pubkey"] if target else None
-    cf = os.path.join(CLIENTS_DIR, name + ".conf")
+    if pubkey is not None:
+        if not isinstance(pubkey, str) or not pubkey or len(pubkey) > 128:
+            raise ClientError("неверный PublicKey клиента")
+        matched = [peer for peer in peers if peer.get("pubkey") == pubkey]
+        if len(matched) != 1:
+            raise ClientError("peer с указанным PublicKey не найден или неоднозначен")
+        target = matched[0]
+    else:
+        matched = [peer for peer in peers if (peer.get("name") or "") == name]
+        if len(matched) > 1:
+            raise ClientError("имя клиента неоднозначно; нужен точный PublicKey")
+        target = matched[0] if matched else None
+        if target is None:                       # попробуем по адресу сохранённого .conf
+            ip = _stored_ip(name)
+            matched = [peer for peer in peers if ip and _peer_mentions_ip(peer, ip)]
+            if len(matched) > 1:
+                raise ClientError("профиль клиента соответствует нескольким peers")
+            target = matched[0] if matched else None
+    pub = target.get("pubkey") if target else None
+    conf_name = _stored_conf_for_peer(target) if pub else (name if valid_name(name) else None)
+    operation_name = conf_name or ("peer-" + hashlib.sha256(
+        pub.encode("utf-8")).hexdigest()[:16] if pub else name)
+    cf = os.path.join(CLIENTS_DIR, (conf_name or operation_name) + ".conf")
     had_conf = os.path.isfile(cf)
     if not pub and not had_conf:
         raise ClientError("клиент '%s' не найден" % name)
-    address = _exact_peer_ipv4(cfg, target) if pub else None
+    rollback_allowed = _peer_allowed_ips(target) if pub else None
     original = p["text"]
     replacement = _remove_peer_block_text(original, pub) if pub else original
     saved_conf = None
@@ -582,8 +706,8 @@ def delete_client(cfg, name, _locked=False, dns_pool=None):
             raise ClientError(str(error))
     if pub:
         operation = {
-            "kind": "delete", "name": name, "pubkey": pub,
-            "address": address,
+            "kind": "delete", "name": operation_name, "pubkey": pub,
+            "rollback_allowed_ips": rollback_allowed,
             "wg_config": replacement, "rollback_wg_config": original,
             "rollback_psk": target.get("psk"),
             "rollback_client_conf": saved_conf}
@@ -627,7 +751,8 @@ def delete_client(cfg, name, _locked=False, dns_pool=None):
             _clear_client_operation()
         except OSError:
             pending = True
-    return {"name": name, "removed_peer": bool(pub),
+    return {"name": name or operation_name, "pubkey": pub,
+            "removed_peer": bool(pub), "removed_conf": had_conf,
             "recovery_pending": pending}
 
 
@@ -644,7 +769,9 @@ def _remove_peer_block_text(text, pubkey):
                     and not re.match(r"(?i)^\s*\[Interface\]\s*$", lines[j]):
                 block.append(lines[j])
                 j += 1
-            if any(re.match(r"(?i)^\s*PublicKey\s*=\s*" + re.escape(pubkey), b) for b in block):
+            if any((lambda match: match is not None and match.group(1) == pubkey)(
+                    re.match(r"(?i)^\s*PublicKey\s*=\s*(\S+)\s*$", b))
+                    for b in block):
                 # пропустить блок (и ведущие комментарии-имя прямо перед ним)
                 while out and re.match(r"(?m)^\s*#", out[-1]):
                     out.pop()

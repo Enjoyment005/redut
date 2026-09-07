@@ -138,6 +138,70 @@ class TestCleanInstallAndReinstall(unittest.TestCase):
                 open(os.path.join(PANEL_SRC, "metrics.py"), encoding="utf-8") as source_file:
             self.assertEqual(installed_file.read(), source_file.read())
 
+    def test_agent_only_upgrade_refuses_dormant_legacy_panel_before_mutation(self):
+        events = []
+
+        os.makedirs(os.path.join(self.installer.OPT, "webpanel"))
+        with open(os.path.join(self.installer.OPT, "webpanel", "server.py"), "w",
+                  encoding="utf-8") as handle:
+            handle.write("def old_config_writer(): pass\n")
+
+        def fake_sh(command, check=False):
+            events.append(command)
+            return ""
+
+        self.installer.sh = fake_sh
+        with mock.patch.object(sys, "argv", ["setup_panel.py", "--src", PANEL_SRC,
+                                              "--no-panel"]), \
+                mock.patch.object(self.installer.os, "geteuid", create=True, return_value=0), \
+                self.assertRaises(SystemExit) as caught:
+            self.installer.main()
+        self.assertIn("без --no-panel", str(caught.exception))
+        self.assertEqual(events, ["systemctl show -p LoadState --value vpn-panel"])
+        with open(os.path.join(self.installer.OPT, "webpanel", "server.py"),
+                  encoding="utf-8") as handle:
+            self.assertIn("old_config_writer", handle.read())
+
+    def test_panel_upgrade_stops_legacy_writer_around_config_merge(self):
+        events = []
+        original_write = self.installer.write_config
+
+        def fake_sh(command, check=False):
+            if command == "systemctl is-active vpn-panel":
+                return "active"
+            if command in ("systemctl stop vpn-panel", "systemctl start vpn-panel"):
+                events.append(command)
+            return ""
+
+        def observed_write(*args, **kwargs):
+            events.append("write_config")
+            return original_write(*args, **kwargs)
+
+        self.installer.sh = fake_sh
+        self.installer.write_config = observed_write
+        self.run_installer("--name", "node-a", "--port", "8443")
+        self.assertEqual(events[:3], ["systemctl stop vpn-panel", "write_config",
+                                      "systemctl start vpn-panel"])
+
+    def test_agent_only_upgrade_allows_already_compatible_panel_payload(self):
+        events = []
+        os.makedirs(os.path.join(self.installer.OPT, "webpanel"))
+        with open(os.path.join(self.installer.OPT, "webpanel", "server.py"), "w",
+                  encoding="utf-8") as handle:
+            handle.write("config_store.save_update_auto(cfg, on)\n")
+        def fake_sh(command, check=False):
+            if command == "systemctl show -p LoadState --value vpn-panel":
+                return "loaded"
+            if command == "systemctl is-active vpn-panel":
+                return "active"
+            if command in ("systemctl stop vpn-panel", "systemctl start vpn-panel"):
+                events.append(command)
+            return ""
+
+        self.installer.sh = fake_sh
+        self.run_installer("--name", "node-a", "--no-panel")
+        self.assertEqual(events, ["systemctl stop vpn-panel", "systemctl start vpn-panel"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

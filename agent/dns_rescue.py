@@ -249,6 +249,8 @@ def _allowed(cfg, automatic=False, continuation=False):
         raise DNSRescueError("DNS Rescue activation is disabled")
     if not block.get("owner_approved"):
         raise DNSRescueError("owner approval is absent")
+    if not block.get("active_probes"):
+        raise DNSRescueError("active DNS probes are disabled")
     if automatic and (mode != "automatic_last_resort"
                       or (not continuation and not block.get("automatic_ready"))):
         raise DNSRescueError("automatic last-resort gate is closed")
@@ -1332,7 +1334,7 @@ def _reconcile_locked(cfg, pool, actor):
     # Resume only after every interrupted journal row is terminal and main NAT
     # is proven absent. This avoids recursive reconcile when a crash happened
     # between publishing idle state and committing the deactivation operation.
-    if (not attached and not unfinished and not auxiliary_errors
+    if (not attached and not _active(state) and not unfinished and not auxiliary_errors
             and pool.get_setting("dns_exit_resume")):
         resumed = _resume_after_exit_failure_locked(cfg, pool, actor)
         return resumed.get("state") or pool.dns_state()
@@ -1382,6 +1384,11 @@ def _reconcile_locked(cfg, pool, actor):
     service_state = None
     base_consistent = False
     ownership_inspection_unknown = False
+    identity_state = {"status": "unknown", "identity": None}
+    route_state = "unknown"
+    firewall_ok = False
+    boot_matches = False
+    node_wide = False
     if (attached and not isolated_expired
             and state.get("phase") in ACTIVE_PHASES and _active(state)
             and _state_shape_valid(cfg, state)):
@@ -1435,6 +1442,35 @@ def _reconcile_locked(cfg, pool, actor):
         # The health tick applies the durable failure threshold. Reconcile must
         # not tear down a guarded live path on one ip/wg inspection timeout.
         return pool.set_dns_state(last_error="ownership-inspection-unknown")
+    # A positively owned generation with either a dead listener or exact route
+    # drift needs fail-open teardown, but it must not lose the incident/scope/
+    # TTL identity needed for bounded repair. Publish the continuation before
+    # touching NAT so a kill at any later point is recoverable by reconcile.
+    resume_published = False
+    repairable_failure = (
+        attached and not isolated_expired and not unfinished and not auxiliary_errors
+        and state.get("phase") in ACTIVE_PHASES and _active(state)
+        and _state_shape_valid(cfg, state)
+        and bool((cfg.get("dns_rescue") or {}).get("active_probes"))
+        # A transient boot-id read failure is not evidence that this exact
+        # owned generation belongs to another boot.  Publish the descriptor,
+        # detach the dead path, and let the continuation wait until boot
+        # identity is readable; cross-boot isolated resumes are still rejected
+        # and node-wide resumes are converted to the stricter boot contract.
+        and firewall_ok and (boot_matches or current_boot is None)
+        and identity_state.get("status") == "valid"
+        and identity_state.get("identity") == state.get("scope_identity")
+        and ((service_state == "inactive"
+              and route_state in ("ready", "unknown", "mismatch"))
+             or (node_wide and route_state == "mismatch"
+                 and service_state in ("active", "inactive", "unknown"))))
+    if (repairable_failure and not pool.get_setting("dns_exit_resume")
+            and not pool.get_setting("dns_boot_resume")):
+        descriptor = _new_exit_resume_descriptor(pool, state)
+        if descriptor is not None:
+            pool.set_setting("dns_exit_resume", json.dumps(
+                descriptor, ensure_ascii=True, sort_keys=True))
+            resume_published = True
     if not attached:
         try:
             if not dns_runtime.service_inactive(deadline):
@@ -1501,13 +1537,17 @@ def _reconcile_locked(cfg, pool, actor):
             cfg, runtime_scope, deadline)
         for op in unfinished:
             _mark_operation_failed(pool, op, op.get("phase"), "crash-recovery")
-        return pool.set_dns_state(
+        safe_state = pool.set_dns_state(
             phase="idle" if state.get("active_kind") == "isolated_manual" else "failed",
             active_scope=None, active_slot=None, activated_at=None, active_kind=None,
             expires_at=None, active_failures=0, active_last_check=None,
             last_error="recovered-after-crash", backend_last_ok=None,
             client_path_last_ok=None, scope_identity=None, boot_id=None,
             expires_monotonic=None)
+        if resume_published:
+            resumed = _resume_after_exit_failure_locked(cfg, pool, actor)
+            return resumed.get("state") or pool.dns_state()
+        return safe_state
     except Exception as error:
         # Redirect is already proven absent. Never recreate the listener merely
         # because service/ACL cleanup is incomplete.
@@ -1932,7 +1972,8 @@ def _align_new_automatic_incident(cfg, pool, state, automat_state,
         and automat_state == "EMERGENCY" and not manual_emergency
         and pool.get_setting("automat_frozen") != "1"
         and block.get("mode") == "automatic_last_resort"
-        and block.get("owner_approved") and block.get("automatic_ready")
+        and block.get("owner_approved") and block.get("active_probes")
+        and block.get("automatic_ready")
         and pool.get_setting("dns_recovery_exhausted") == "1"
         and incident)
     if eligible_context and state.get("incident_id") != incident:
@@ -2041,6 +2082,18 @@ def _automatic_tick_locked(cfg, pool, automat_state, manual_emergency, log):
                 or not state.get("scope_identity")
                 or current_identity != state.get("scope_identity")):
             return _deactivate_locked(cfg, pool, "auto", "wireguard-scope-drift")
+        if not block.get("active_probes"):
+            # Disabling probes is not cleanup authority.  Keep a proven live
+            # generation serving, but still detach a listener which systemd
+            # proves dead; explicit/manual deactivation remains available.
+            runtime_state = dns_runtime.service_state()
+            if runtime_state == "inactive":
+                return _deactivate_locked(
+                    cfg, pool, "auto", "active-probes-disabled-backend-inactive")
+            if runtime_state == "unknown":
+                return _hold_active_inspection_unknown(
+                    cfg, pool, state, "service")
+            return {"ok": True, "action": "active-probes-disabled", "state": state}
         active_slot = next((item for item in _slots(cfg)
                             if item.get("id") == state.get("active_slot")), None)
         if active_slot is None or not _is_future(active_slot.get("not_after")):
@@ -2128,7 +2181,8 @@ def _automatic_tick_locked(cfg, pool, automat_state, manual_emergency, log):
     eligible = (automat_state == "EMERGENCY" and not manual_emergency
                 and pool.get_setting("automat_frozen") != "1"
                 and block.get("mode") == "automatic_last_resort"
-                and block.get("owner_approved") and block.get("automatic_ready")
+                and block.get("owner_approved") and block.get("active_probes")
+                and block.get("automatic_ready")
                 and pool.get_setting("dns_recovery_exhausted") == "1"
                 and not state.get("attempt_used"))
     if not eligible:

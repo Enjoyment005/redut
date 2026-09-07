@@ -31,7 +31,9 @@ class FakeProv:
     def getprice(self, count, days, version):
         return {"price": 4.0 * days, "balance": 800.0, "currency": "RUB"}
 
-    def prolong(self, ext_id, days):
+    def prolong(self, ext_id, days, on_submit=None):
+        if on_submit is not None:
+            on_submit()
         self.calls.append((ext_id, days))
         return {"price": 4.0 * days, "balance": 800.0 - 4.0 * days, "currency": "RUB",
                 "proxies": {str(ext_id): {"date_end": _in(days)}}, "order_id": "o1"}
@@ -174,6 +176,15 @@ class TestTiming(Base):
 
 
 class TestIdempotency(Base):
+    def test_unbound_shared_job_is_not_deleted_without_terminal_ledger(self):
+        key = "money_request:auto-prolong:proxy6:1"
+        job, raw = states_mod._begin_money_job(
+            self.pool, key, {"uid": "proxy6:1", "days": 30})
+        self.assertIsNone(states_mod.money_mod.bound_spend_request(
+            self.pool, job["request_id"]))
+        states_mod._drop_unbound_money_job(self.pool, key, job, raw)
+        self.assertEqual(self.pool.get_setting(key), raw)
+
     def test_not_twice_a_day(self):
         self.run_it()
         self.run_it()      # второй запуск крона в те же сутки
@@ -184,6 +195,63 @@ class TestIdempotency(Base):
         self.run_it()
         self.assertTrue(self.pool.prolonged_today("proxy6:1"))
         self.assertFalse(self.pool.prolonged_today("proxy6:2"))
+
+    def test_durable_job_recovers_after_provider_acceptance_kill(self):
+        class KillOnce(FakeProv):
+            def __init__(inner_self):
+                super().__init__()
+                inner_self.remote_end = _in(2)
+                inner_self.kill_once = True
+
+            def prolong(inner_self, ext_id, days, on_submit=None):
+                inner_self.calls.append((ext_id, days))
+                inner_self.remote_end = _in(days)
+                if inner_self.kill_once:
+                    inner_self.kill_once = False
+                    if on_submit is not None:
+                        on_submit()
+                    raise SystemExit("kill after provider acceptance")
+                raise AssertionError("provider prolong must not be repeated")
+
+            def list(inner_self):
+                return [{"ext_id": "1", "date_end": inner_self.remote_end}]
+
+        self.prov = KillOnce()
+        with self.assertRaises(SystemExit):
+            self.run_it()
+        self.assertIsNotNone(
+            self.pool.get_setting("money_request:auto-prolong:proxy6:1"))
+        result = self.run_it()
+        self.assertEqual(len(self.prov.calls), 1)
+        self.assertEqual(result["prolonged"][0]["uid"], "proxy6:1")
+        self.assertIsNone(
+            self.pool.get_setting("money_request:auto-prolong:proxy6:1"))
+        self.assertEqual(self.pool.conn.execute(
+            "SELECT COUNT(*) FROM money WHERE op='prolong'").fetchone()[0], 1)
+
+    def test_durable_job_replays_after_ack_before_caller_processing(self):
+        class KillAlerter(FakeAlerter):
+            def __init__(inner_self):
+                super().__init__()
+                inner_self.kill_once = True
+
+            def prolonged(inner_self, **kw):
+                if inner_self.kill_once:
+                    inner_self.kill_once = False
+                    raise SystemExit("kill after durable money acknowledgement")
+                super().prolonged(**kw)
+
+        self.alerter = KillAlerter()
+        with self.assertRaises(SystemExit):
+            self.run_it()
+        self.assertEqual(len(self.prov.calls), 1)
+        self.assertIsNotNone(
+            self.pool.get_setting("money_request:auto-prolong:proxy6:1"))
+        result = self.run_it()
+        self.assertEqual(len(self.prov.calls), 1)
+        self.assertEqual(result["prolonged"][0]["uid"], "proxy6:1")
+        self.assertIsNone(
+            self.pool.get_setting("money_request:auto-prolong:proxy6:1"))
 
 
 class TestGatesAndAlerts(Base):

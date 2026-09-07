@@ -337,7 +337,8 @@ TARBALL_URL = "https://codeload.github.com/%s/tar.gz/refs/tags/v%s"
 MAX_TARBALL_BYTES = 50 * 1024 * 1024   # защита от «архива-переростка»
 SETUP_TIMEOUT = 20 * 60                # полный setup.sh с apt обычно 1-3 мин
 VERIFY_WAIT_S = 90                     # даём сервисам встать после установки
-UNITS = ("wg-quick@wg0", "sing-box", "vpn-boot-setup", "microsocks", "vpn-panel")
+UNITS = ("wg-quick@wg0", "sing-box", "vpn-boot-setup", "microsocks", "vpn-panel",
+         "redut-dns-rescue-watchdog.timer")
 
 
 def _run(cmd, timeout=60, env=None, pass_fds=()):
@@ -500,7 +501,7 @@ def _kernel_path_state():
     }
 
 
-def _db_setting(cfg, key):
+def _db_setting(cfg, key, strict=False):
     path = (cfg or {}).get("db") or "/var/lib/vpn-panel/state.db"
     try:
         import sqlite3
@@ -511,14 +512,70 @@ def _db_setting(cfg, key):
         finally:
             conn.close()
     except Exception:
+        if strict:
+            raise
         return None
 
 
-def _dns_update_state(cfg):
-    phase = _db_setting(cfg, "dns_rescue_phase") or "idle"
+def _unit_active_state(unit):
+    rc, out, err = _run(["systemctl", "is-active", unit], timeout=10)
+    state = (out or err or "").strip().splitlines()[-1:] or [""]
+    state = state[0]
+    if state in ("active", "inactive", "failed", "activating", "deactivating"):
+        return state
+    rc_load, load_out, _ = _run(
+        ["systemctl", "show", unit, "-p", "LoadState", "--value"], timeout=10)
+    if (load_out or "").strip() == "not-found":
+        return "not-found"
+    return "unknown"
+
+
+def _dns_phase(cfg, strict=False):
+    path = (cfg or {}).get("db") or "/var/lib/vpn-panel/state.db"
+    try:
+        import sqlite3
+        conn = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=2.0)
+        try:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='dns_rescue_state'").fetchone()
+            if not exists:
+                return None
+            row = conn.execute(
+                "SELECT phase FROM dns_rescue_state WHERE singleton=1").fetchone()
+            if not row or not isinstance(row[0], str) or not row[0].strip():
+                if strict:
+                    raise ValueError("dns_rescue_state singleton/phase is missing")
+                return None
+            return row[0]
+        finally:
+            conn.close()
+    except Exception:
+        if strict:
+            raise
+        return None
+
+
+def _dns_update_state(cfg, strict=False):
+    rescue_state = _unit_active_state("redut-dns-rescue")
+    if strict and rescue_state not in ("active", "inactive", "failed", "not-found"):
+        raise UpdateError("DNS Rescue unit state is unreadable or transitional: %s"
+                          % rescue_state)
+    try:
+        phase = _dns_phase(cfg, strict=strict)
+    except Exception as error:
+        if strict:
+            raise UpdateError("DNS state database is unreadable: %s"
+                              % type(error).__name__) from error
+        phase = None
+    if phase is None:
+        if strict and rescue_state != "not-found":
+            raise UpdateError("DNS Rescue state table is missing for an installed unit")
+        phase = "idle"
     return {"phase": phase,
             "dnsmasq": (_is_active("dnsmasq") if (cfg or {}).get("has_dnsmasq") else None),
-            "rescue_unit": _is_active("redut-dns-rescue")}
+            "rescue_unit": rescue_state == "active",
+            "rescue_unit_state": rescue_state}
 
 
 def _network_intent_state(cfg):
@@ -528,7 +585,10 @@ def _network_intent_state(cfg):
 
 
 def dns_update_preflight(cfg):
-    state = _dns_update_state(cfg)
+    try:
+        state = _dns_update_state(cfg, strict=True)
+    except UpdateError as error:
+        return False, str(error)
     if state["phase"] != "idle" or state["rescue_unit"]:
         return False, ("активно/не очищено поколение DNS Rescue (phase=%s unit=%s); "
                        "сначала выполни dns-rescue reconcile/deactivate"
@@ -673,6 +733,63 @@ def _tree_can_update(tree):
     return "UPDATE" in head and os.path.isfile(os.path.join(tree, "install", "install.sh"))
 
 
+def _cancel_boot_setup_before_rollback(log):
+    """Prove that no target-version boot reconciler can outlive rollback.
+
+    setup.sh deliberately queues this unit when it inherits vpn-agent.lock from
+    the updater.  A later health failure must synchronously stop that queued or
+    running job before the target tree (including its boot script) is moved.
+    """
+    # Stop every repository-owned activation source in one synchronous systemd
+    # transaction.  Stopping only vpn-boot-setup is racy: the 5-second DNS
+    # watchdog timer Wants= it and can reactivate the target script between a
+    # successful is-active check and the tree swap.
+    sources = ("redut-dns-rescue-watchdog.timer",
+               "redut-dns-rescue-watchdog.service")
+    rc, out, err = _run(["systemctl", "stop", *sources], timeout=30)
+    if rc != 0:
+        log("не удалось остановить vpn-boot-setup перед откатом: %s"
+            % ((err or out or "rc=%s" % rc).strip()[:300]))
+        return False
+    for unit in sources:
+        rc_state, state_out, state_err = _run(
+            ["systemctl", "is-active", unit], timeout=10)
+        state = (state_out or state_err or "").strip().splitlines()[-1:] or [""]
+        state = state[0]
+        if state not in ("inactive", "failed", "unknown"):
+            log("%s не остановлен перед откатом: state=%s rc=%s"
+                % (unit, state or "?", rc_state))
+            return False
+    # RemainAfterExit active/exited has no process capable of running target
+    # payload. Preserve it: stopping it would make rollback verification wait
+    # forever for a new boot job which itself waits on our inherited flock.
+    rc_show, show_out, show_err = _run([
+        "systemctl", "show", "vpn-boot-setup", "-p", "ActiveState",
+        "-p", "SubState", "-p", "MainPID"], timeout=10)
+    props = {}
+    for line in (show_out or "").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            props[key] = value
+    if (rc_show == 0 and props.get("ActiveState") == "active"
+            and props.get("SubState") == "exited" and props.get("MainPID") == "0"):
+        return True
+    rc, out, err = _run(["systemctl", "stop", "vpn-boot-setup"], timeout=30)
+    if rc != 0:
+        log("не удалось остановить vpn-boot-setup перед откатом: %s"
+            % ((err or out or show_err or "rc=%s" % rc).strip()[:300]))
+        return False
+    rc_state, state_out, state_err = _run(
+        ["systemctl", "is-active", "vpn-boot-setup"], timeout=10)
+    state = (state_out or state_err or "").strip().splitlines()[-1:] or [""]
+    state = state[0]
+    if state not in ("inactive", "failed", "unknown"):
+        log("vpn-boot-setup не остановлен перед откатом: state=%s rc=%s"
+            % (state or "?", rc_state))
+        return False
+    return True
+
+
 def _event(pool, action, result, detail=""):
     if pool is not None:
         pool.log_event(action, actor="agent", result=result, detail=detail)
@@ -737,21 +854,6 @@ def _apply_locked(cfg, pool, alerter, log, target, manual, res, force=False):
         log(res["why"])
         return res
 
-    dns_ok, dns_why = dns_update_preflight(cfg)
-    if not dns_ok:
-        res["why"] = dns_why
-        status_write("error", why=res["why"])
-        log(res["why"])
-        return res
-
-    baseline = baseline_health(cfg)
-    if not manual and not hard_ok(baseline):
-        res["why"] = ("узел нездоров и до обновления (%s) — автоматика не рискует; "
-                      "почини или обнови руками" % _brief_health(baseline))
-        status_write("error", why=res["why"])
-        log(res["why"])
-        return res
-
     log("Обновление Редут %s -> %s (репозиторий %s)" % (local or "?", target, u["repo"]))
     status_write("download", to=target, frm=local)
     try:
@@ -774,6 +876,25 @@ def _apply_locked(cfg, pool, alerter, log, target, manual, res, force=False):
     import apply as apply_mod
     try:
         with apply_mod.Flock((cfg or {}).get("lock") or "/run/vpn-agent.lock") as network_lock:
+            # Download can take minutes.  DNS generation, peers and owner
+            # intent may legitimately change meanwhile, so the only
+            # authoritative preflight/baseline is sampled under the network
+            # lock immediately before the first backup/install mutation.
+            dns_ok, dns_why = dns_update_preflight(cfg)
+            if not dns_ok:
+                res["why"] = dns_why
+                status_write("error", why=res["why"], to=target)
+                _rmtree(REDUT_NEW)
+                log(res["why"])
+                return res
+            baseline = baseline_health(cfg)
+            if not manual and not hard_ok(baseline):
+                res["why"] = ("узел нездоров и до обновления (%s) — автоматика не рискует; "
+                              "почини или обнови руками" % _brief_health(baseline))
+                status_write("error", why=res["why"], to=target)
+                _rmtree(REDUT_NEW)
+                log(res["why"])
+                return res
             return _apply_install(cfg, pool, alerter, log, target, manual, res,
                                   baseline, force, lock_fd=network_lock.fd)
     except apply_mod.ApplyError:
@@ -854,21 +975,23 @@ def _apply_install(cfg, pool, alerter, log, target, manual, res, baseline,
     log("Проверка после обновления ПРОВАЛЕНА: %s" % why_v)
     status_write("rollback", why=why_v, to=target, frm=local)
     rolled = False
-    if rollback_ok:
+    boot_job_stopped = _cancel_boot_setup_before_rollback(log)
+    if rollback_ok and boot_job_stopped:
         _rmtree(REDUT_SRC + ".failed")
         os.rename(REDUT_SRC, REDUT_SRC + ".failed")   # битое дерево — для разбора
         os.rename(REDUT_PREV, REDUT_SRC)
         log("Откатываюсь: прогоняю setup.sh прежней сборки %s" % (local or ""))
         rc2, _t2 = _run_setup(REDUT_SRC, log, lock_fd=lock_fd)
         ok2, why2 = verify_health(cfg, baseline)
-        # Истина — здоровье узла, а не rc: старый setup.sh мог упасть на том же
-        # инфраструктурном сбое (недоступен apt), не тронув живой узел (ревью 17.08).
-        rolled = ok2
+        # Barrier intentionally stopped DNS supervision.  Only a completed old
+        # setup may re-establish every lifecycle unit; core health alone cannot
+        # prove this when setup exited early (for example during apt update).
+        rolled = bool(ok2 and rc2 == 0)
         if not rolled:
             log("Откат тоже не прошёл проверку: %s" % (why2 or "setup.sh rc=%s" % rc2))
-        elif rc2 != 0:
-            log("откат: setup.sh прежней сборки rc=%s, но узел прошёл проверку — похоже "
-                "на инфраструктурный сбой (зеркала apt?), сам узел цел" % rc2)
+    elif rollback_ok:
+        log("Откат НЕ запускался: не доказана остановка vpn-boot-setup целевой версии; "
+            "деревья оставлены на месте, нужен человек.")
     elif had_prev:
         log("Откат НЕ запускался: прежнее дерево без режима UPDATE=1 переустановило бы "
             "узел дефолтами (node1/10.8.0.0/24) — это хуже провала. Нужен человек.")

@@ -28,16 +28,23 @@
 владелец заполнил в мастере /setup (ключ провайдера, 2FA, SMTP).
 """
 import argparse
+import contextlib
 import hashlib
 import json
 import os
 import secrets
 import shlex
+import stat
 import sys
 import time
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 PANEL_DIR = os.path.dirname(os.path.abspath(__file__))
+INSTALL_DIR = os.path.abspath(os.path.join(PANEL_DIR, os.pardir, "install"))
+if INSTALL_DIR not in sys.path:
+    sys.path.insert(0, INSTALL_DIR)
+from base_manifest import (DNS_PREFLIGHT_PROGRAM as REMOTE_DNS_PREFLIGHT_PROGRAM,
+                           remote_check_command, remote_dns_preflight_command)  # noqa: E402
 
 try:
     import paramiko
@@ -202,40 +209,238 @@ def connect(host, pwds):
     raise SystemExit("SSH к %s недоступен: %s" % (host, last))
 
 
-def run(c, cmd, t=180):
+def run_result(c, cmd, t=180):
     _, o, e = c.exec_command(cmd, timeout=t)
-    return (o.read().decode("utf-8", "replace") + e.read().decode("utf-8", "replace")).strip()
+    stdout = o.read().decode("utf-8", "replace")
+    stderr = e.read().decode("utf-8", "replace")
+    rc = o.channel.recv_exit_status()
+    return rc, (stdout + stderr).strip()
+
+
+def run(c, cmd, t=180):
+    return run_result(c, cmd, t=t)[1]
+
+
+def _remove_own_staging(sftp, path):
+    """Best-effort removal of only our root-owned private regular staging file."""
+    try:
+        attrs = sftp.lstat(path)
+        if (stat.S_ISREG(attrs.st_mode)
+                and stat.S_IMODE(attrs.st_mode) == 0o600
+                and getattr(attrs, "st_uid", None) == 0):
+            sftp.remove(path)
+    except Exception:
+        pass
+
+
+def _write_secret_staging(sftp, path, data):
+    """Create an exclusive 0600 regular file before writing the first secret byte."""
+    target = None
+    try:
+        target = sftp.open(path, "wx")
+        # FSETSTAT/FSTAT apply to the inode that this handle will write.  A
+        # path-based chmod/lstat pair would check a replaceable directory entry.
+        target.chmod(0o600)
+        attrs = target.stat()
+        if (not stat.S_ISREG(attrs.st_mode)
+                or stat.S_IMODE(attrs.st_mode) != 0o600
+                or getattr(attrs, "st_uid", None) != 0):
+            raise OSError("secret staging has unsafe type, owner or mode")
+        target.write(data)
+        target.flush()
+    except Exception:
+        if target is not None:
+            try:
+                target.close()
+            except Exception:
+                pass
+        _remove_own_staging(sftp, path)
+        raise
+    else:
+        target.close()
+
+
+SECRET_WRITER_PROGRAM = """import json, os, stat, sys, tempfile, time
+p, s, keep_admin = sys.argv[1:4]
+directory = os.path.dirname(p) or "."
+def read_private(path, missing_ok=False):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        if missing_ok:
+            return {}
+        raise
+    with os.fdopen(fd, "r", encoding="utf-8") as source:
+        attrs = os.fstat(source.fileno())
+        if (not stat.S_ISREG(attrs.st_mode) or stat.S_IMODE(attrs.st_mode) != 0o600
+                or attrs.st_uid != 0):
+            raise OSError("secret source has unsafe type, owner or mode")
+        return json.load(source)
+def cleanup_stale():
+    merge_prefix = "." + os.path.basename(p) + ".redut-secrets-merge-"
+    prefixes = (os.path.basename(p) + ".deploy-", merge_prefix)
+    cutoff = time.time() - 3600
+    for name in os.listdir(directory):
+        candidate = os.path.join(directory, name)
+        if candidate == s or not name.startswith(prefixes):
+            continue
+        try:
+            attrs = os.lstat(candidate)
+            if (stat.S_ISREG(attrs.st_mode) and attrs.st_uid == 0
+                    and stat.S_IMODE(attrs.st_mode) == 0o600 and attrs.st_mtime < cutoff):
+                os.unlink(candidate)
+        except FileNotFoundError:
+            pass
+cleanup_stale()
+new = read_private(s)
+if not isinstance(new, dict):
+    raise ValueError("secret payload must be a JSON object")
+if keep_admin == "1":
+    cur = read_private(p, missing_ok=True)
+    if not isinstance(cur, dict):
+        raise ValueError("existing secrets must be a JSON object")
+    new["admin"] = cur["admin"] if cur.get("admin") else new.get("admin")
+    if new.get("admin") is None:
+        new.pop("admin", None)
+directory = os.path.dirname(p) or "."
+merge_prefix = "." + os.path.basename(p) + ".redut-secrets-merge-"
+fd, out = tempfile.mkstemp(prefix=merge_prefix, dir=directory)
+opened = True
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as target:
+        opened = False
+        json.dump(new, target, ensure_ascii=False, indent=2)
+        target.write("\\n")
+        target.flush()
+        os.fsync(target.fileno())
+    with open(out, encoding="utf-8") as check:
+        attrs = os.fstat(check.fileno())
+        if stat.S_IMODE(attrs.st_mode) != 0o600 or json.load(check) != new:
+            raise OSError("secret staging verification failed")
+    os.replace(out, p)
+    out = None
+    os.chmod(p, 0o600)
+    attrs = os.lstat(p)
+    if not stat.S_ISREG(attrs.st_mode) or stat.S_IMODE(attrs.st_mode) != 0o600 or attrs.st_uid != 0:
+        raise OSError("installed secret has unsafe type, owner or mode")
+    with open(p, encoding="utf-8") as check:
+        if json.load(check) != new:
+            raise OSError("installed secret verification failed")
+    dfd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+    os.unlink(s)
+    print("REDUT_SECRET_WRITE_OK")
+finally:
+    if opened:
+        os.close(fd)
+    if out is not None:
+        try:
+            os.unlink(out)
+        except FileNotFoundError:
+            pass
+"""
 
 
 def put_secret_atomic(c, sftp, path, data, preserve_admin=False):
     """Upload a 0600 secret through the same adjacent writer lock as panel."""
+    incoming = json.loads(data)
+    if not isinstance(incoming, dict):
+        raise ValueError("secret payload must be a JSON object")
     tmp = path + ".deploy-" + secrets.token_hex(8)
-    with sftp.open(tmp, "w") as target:
-        target.write(data)
-    sftp.chmod(tmp, 0o600)
-    if preserve_admin:
-        program = (
-            "import json,os,sys; p,s=sys.argv[1:3]; "
-            "new=json.load(open(s,encoding='utf-8')); "
-            "cur=json.load(open(p,encoding='utf-8')) if os.path.isfile(p) else {}; "
-            "new['admin']=cur['admin'] if cur.get('admin') else new.get('admin'); "
-            "new.pop('admin',None) if new.get('admin') is None else None; "
-            "out=s+'.merged'; f=open(out,'w',encoding='utf-8'); "
-            "json.dump(new,f,ensure_ascii=False,indent=2); f.write('\\n'); f.flush(); "
-            "os.fsync(f.fileno()); f.close(); os.chmod(out,0o600); "
-            "os.replace(out,p); os.unlink(s); os.chmod(p,0o600)"
-        )
-        inner = "python3 -c %s %s %s" % (
-            shlex.quote(program), shlex.quote(path), shlex.quote(tmp))
-    else:
-        inner = "mv -f -- %s %s && chmod 600 %s" % (
-            shlex.quote(tmp), shlex.quote(path), shlex.quote(path))
-    command = "flock -w 30 %s.lock sh -c %s" % (shlex.quote(path), shlex.quote(inner))
-    output = run(c, command)
-    exists = run(c, "test -f %s && echo ok" % shlex.quote(path))
-    if exists.strip() != "ok":
-        run(c, "rm -f -- %s" % shlex.quote(tmp))
-        raise SystemExit("не удалось атомарно записать %s: %s" % (path, output))
+    complete = False
+    try:
+        _write_secret_staging(sftp, tmp, data)
+        inner = "python3 -c %s %s %s %s" % (
+            shlex.quote(SECRET_WRITER_PROGRAM), shlex.quote(path), shlex.quote(tmp),
+            "1" if preserve_admin else "0")
+        command = "flock -w 30 %s.lock sh -c %s" % (shlex.quote(path), shlex.quote(inner))
+        rc, output = run_result(c, command)
+        if rc != 0 or output.strip().splitlines()[-1:] != ["REDUT_SECRET_WRITE_OK"]:
+            detail = output if output else "remote writer returned rc=%s without success marker" % rc
+            raise SystemExit("не удалось атомарно записать %s: %s" % (path, detail))
+        complete = True
+    finally:
+        if not complete:
+            _remove_own_staging(sftp, tmp)
+
+
+def put_config_atomic(c, sftp, path, data, preserve_keys):
+    """Merge owner settings and replace config through the deployed common writer."""
+    incoming = json.loads(data)
+    if not isinstance(incoming, dict):
+        raise ValueError("config payload must be a JSON object")
+    tmp = path + ".deploy-config-" + secrets.token_hex(8)
+    complete = False
+    try:
+        _write_secret_staging(sftp, tmp, data)
+        program = """import json, os, sys
+sys.path.insert(0, sys.argv[1])
+import config_store
+p, s = sys.argv[2:4]
+preserve = json.loads(sys.argv[4])
+incoming = json.load(open(s, encoding="utf-8"))
+if not isinstance(incoming, dict):
+    raise ValueError("config payload must be a JSON object")
+def merge(current):
+    result = dict(incoming)
+    for key in preserve:
+        if isinstance(current.get(key), dict) and current[key]:
+            result[key] = current[key]
+    return result
+written = config_store.update({"_source": p}, merge, create=True)
+with open(p, encoding="utf-8") as check:
+    if json.load(check) != written:
+        raise OSError("installed config verification failed")
+os.unlink(s)
+print("REDUT_CONFIG_WRITE_OK")
+"""
+        inner = "python3 -c %s %s %s %s %s" % (
+            shlex.quote(program), shlex.quote(OPT), shlex.quote(path), shlex.quote(tmp),
+            shlex.quote(json.dumps(list(preserve_keys))))
+        rc, output = run_result(c, inner)
+        if rc != 0 or output.strip().splitlines()[-1:] != ["REDUT_CONFIG_WRITE_OK"]:
+            detail = output if output else "remote writer returned rc=%s without success marker" % rc
+            raise SystemExit("не удалось атомарно записать %s: %s" % (path, detail))
+        complete = True
+    finally:
+        if not complete:
+            _remove_own_staging(sftp, tmp)
+
+
+@contextlib.contextmanager
+def remote_panel_config_upgrade_barrier(c, enabled):
+    """Stop a legacy panel while the first common-lock config merge is performed."""
+    rc, state = run_result(c, "systemctl is-active vpn-panel") if enabled else (1, "")
+    was_running = rc == 0 and state.strip().splitlines()[-1:] in (["active"], ["activating"])
+    if was_running:
+        stop_rc, detail = run_result(c, "systemctl stop vpn-panel")
+        if stop_rc != 0:
+            raise SystemExit("не удалось остановить старую панель перед config merge: %s" % detail)
+    failed = False
+    try:
+        yield
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        if was_running:
+            try:
+                start_rc, detail = run_result(c, "systemctl start vpn-panel")
+            except Exception as error:
+                if not failed:
+                    raise
+                print("  ⚠️ не удалось восстановить панель после ошибки config merge: %s" % error)
+            else:
+                if start_rc != 0:
+                    message = "не удалось восстановить панель после config merge: %s" % detail
+                    if not failed:
+                        raise SystemExit(message)
+                    print("  ⚠️ " + message)
 
 
 def acquire_remote_network_lock(c):
@@ -256,6 +461,23 @@ def acquire_remote_network_lock(c):
         raise SystemExit("vpn-agent занят; удалённый деплой отложен%s" %
                          ((": " + detail) if detail else ""))
     return stdin
+
+
+def remote_dns_preflight(c):
+    rc, output = run_result(c, remote_dns_preflight_command(), t=30)
+    if rc != 0 or output.strip().splitlines()[-1:] != ["REDUT_DNS_PREFLIGHT_OK"]:
+        raise SystemExit("удалённый DNS Rescue preflight не подтверждён: %s"
+                         % (output or "rc=%s" % rc))
+    return True
+
+
+def require_remote_base_contract(c):
+    rc, output = run_result(c, remote_check_command(), t=30)
+    if rc != 0 or output.strip().splitlines()[-1:] != ["REDUT_BASE_CONTRACT_OK"]:
+        raise SystemExit(
+            "базовые watchdog/post/boot/cleanup несовместимы; "
+            "сначала выполни полный UPDATE=1 setup.sh")
+    return True
 
 
 def build_config(name):
@@ -303,8 +525,22 @@ def main(argv=None):
           "| sing-box:", run(c, "systemctl is-active sing-box"))
 
     deploy_lock = acquire_remote_network_lock(c)
+    remote_dns_preflight(c)
+    require_remote_base_contract(c)
 
-    run(c, "mkdir -p %s/providers %s/webpanel /etc/vpn-panel /var/lib/vpn-panel/cfg" % (OPT, OPT))
+    if not a.with_panel:
+        panel_rc, panel_state = run_result(
+            c,
+            "if [ \"$(systemctl show -p LoadState --value vpn-panel 2>/dev/null)\" = loaded ] "
+            "|| [ -f /opt/vpn-panel/webpanel/server.py ]; then "
+            "grep -Fq 'config_store.save_update_auto' /opt/vpn-panel/webpanel/server.py "
+            "2>/dev/null || { echo REDUT_LEGACY_PANEL; exit 42; }; fi")
+        if panel_rc != 0 or "REDUT_LEGACY_PANEL" in panel_state.splitlines():
+            c.close()
+            sys.exit("установлена старая vpn-panel; повтори деплой с --with-panel")
+
+    run(c, "mkdir -p %s/providers %s/webpanel /var/lib/vpn-panel/cfg && "
+           "install -d -o root -g root -m 0700 /etc/vpn-panel" % (OPT, OPT))
     run(c, "chmod 700 /var/lib/vpn-panel")
     identity_state = run(
         c, "(command -v conntrack >/dev/null 2>&1 || "
@@ -332,22 +568,15 @@ def main(argv=None):
     if a.keep_config:
         print("  config.json: оставлен как есть (--keep-config)")
     else:
-        existing = {}
-        raw = run(c, "cat /etc/vpn-panel/config.json 2>/dev/null").strip()
-        if raw:
-            try:
-                existing = json.loads(raw)
-            except ValueError:
-                existing = {}
         final_cfg = {**cfg, "panel_port": a.panel_port}
-        for k in ("money", "countries", "auto_prolong", "update", "stability", "learning",
-                  "dns_rescue"):
-            if isinstance(existing.get(k), dict) and existing[k]:
-                final_cfg[k] = existing[k]
-                print("  config.json: сохранён настроенный владельцем блок '%s' (§6.2)" % k)
-        with sftp.open("/etc/vpn-panel/config.json", "w") as f:
-            json.dump(final_cfg, f, ensure_ascii=False, indent=2)
-        sftp.chmod("/etc/vpn-panel/config.json", 0o644)
+        preserve = ("money", "countries", "auto_prolong", "update", "stability", "learning",
+                    "dns_rescue")
+        # A prior interrupted deploy may have replaced server.py while the old
+        # process kept running.  Always restart an active compatible payload.
+        with remote_panel_config_upgrade_barrier(c, True):
+            put_config_atomic(c, sftp, "/etc/vpn-panel/config.json",
+                              json.dumps(final_cfg, ensure_ascii=False, indent=2) + "\n", preserve)
+        print("  config.json: настроенные владельцем блоки сохранены под общим writer lock")
     # secrets.json: в чистой установке НЕ сеем (владелец введёт всё в мастере /setup);
     # иначе ключи провайдеров + SMTP берём из локального файла, а admin-блок (заведён на
     # сервере) сохраняем — иначе каждый деплой выбивал бы вход. Аналогично money/countries.

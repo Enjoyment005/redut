@@ -511,7 +511,7 @@ _DASH_HTML = """
   <div class="card fold folded" id="card_clients">
     <h2 onclick="foldClick(event,'clients')">Кто подключён<span class="sub" id="sum_clients"></span><span class="r">
       <input id="cname" style="width:180px" placeholder="имя, например phone-mine" autocomplete="off">
-      <button class="btn g" onclick="addClient()">Выдать доступ</button><span class="arr" id="fa_clients">▸</span></span></h2>
+      <button class="btn g" id="client-add" onclick="addClient()">Выдать доступ</button><span class="arr" id="fa_clients">▸</span></span></h2>
     <div class="fold-body">
     <div class="ex">Каждому устройству — свой профиль. Нажми «Выдать доступ» → появится строка → <b>«Скачать»</b>
       даёт файл для компьютера, <b>«QR»</b> — картинку для телефона. На устройстве нужно приложение
@@ -954,7 +954,7 @@ document.addEventListener('visibilitychange',()=>{document.hidden?geoStop():geoS
 window.addEventListener('resize',()=>{GEO.W=0;if(!GEO.run)geoDraw(0)});
 async function api(path,opts){opts=opts||{};opts.headers=Object.assign({'X-CSRF-Token':CSRF},opts.headers||{});
   const r=await fetch(path,opts);const t=await r.text();let j;try{j=JSON.parse(t)}catch(e){j={error:t}}
-  if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
+  if(!r.ok){const err=new Error(j.error||('HTTP '+r.status));Object.assign(err,j);throw err}return j}
 function fl(v){return v===1?'<span class="ok">✓</span>':v===0?'<span class="bad">✕</span>':'<span class="mut">·</span>'}
 function tile(k,v,hint){return '<div class="tile"><div class="k">'+k+(hint?('<i class="q" tabindex="0" data-h="'+esc(hint)+'">?</i>'):'')+
   '</div><div class="v">'+v+'</div></div>'}
@@ -1361,22 +1361,36 @@ function fillBuyCC(){const s=window.__S||{};const m=window.__MARKET||null;
   opts.push('<option value="__other__"'+(cur==='__other__'?' selected':'')+'>другая страна…</option>');
   sel.innerHTML=opts.join('')}
 
+const __moneyRequestFallback={};
+function moneyRequest(kind,intent){const key='redut-money-v1:'+kind+':'+intent;let id='';
+  try{id=sessionStorage.getItem(key)||''}catch(_){id=__moneyRequestFallback[key]||''}
+  if(!id){id=(globalThis.crypto&&crypto.randomUUID)?crypto.randomUUID():
+    ('web-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2));
+    try{sessionStorage.setItem(key,id)}catch(_){__moneyRequestFallback[key]=id}}
+  return {key:key,id:id}}
+function moneyRequestDone(req){try{if(sessionStorage.getItem(req.key)===req.id)sessionStorage.removeItem(req.key)}
+  catch(_){if(__moneyRequestFallback[req.key]===req.id)delete __moneyRequestFallback[req.key]}}
+
 async function buy(){const _sel=document.getElementById('buycc');
   const cc=(_sel.value==='__other__'?(document.getElementById('buyccfree').value||''):_sel.value).trim().toLowerCase();
   const per=document.getElementById('buyperiod').value.trim();
   if(!confirm('Купить прокси'+(cc?(' в стране '+cc):' (страну выберет панель)')+(per?(', на '+per+' дн'):'')+'?\\n\\n'+
     'Спишутся РЕАЛЬНЫЕ деньги с баланса у провайдера. После покупки панель сама проверит, из какой страны реально выходит прокси.'))return;
-  toast('Покупаю: узнаю цену → покупка → проверка…');try{const b={};if(cc)b.country=cc;if(per)b.period=parseInt(per);
+  const req=moneyRequest('buy',(cc||'auto')+':'+(per||'default'));
+  toast('Покупаю: узнаю цену → покупка → проверка…');try{const b={request_id:req.id};if(cc)b.country=cc;if(per)b.period=parseInt(per);
     const r=await api('/api/buy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+    moneyRequestDone(req);
     const pc=(r.postcheck||[]).map(x=>x.uid+' страна выхода '+(x.exit_cc||'?')+(x.blocked?' → заблокирован, роль off':' → годен')).join('; ');
     toast('Куплено: '+(r.uids||[]).join(',')+' за '+r.price+' '+r.currency+(r.recovered?' (восстановлено по описанию)':'')+'. '+pc+
       (r.warning?(' ⚠️ '+r.warning):''),r.warning?'warn':'ok');await reloadAll()}
-  catch(e){toast('покупка: '+e.message,'bad');await reloadAll()}}
+  catch(e){if(e.replace_request)moneyRequestDone(req);toast('покупка: '+e.message,'bad');await reloadAll()}}
 
 async function prolong(btn,uid){const d=prompt('На сколько дней продлить '+uid+'?\\nСпишутся реальные деньги.','30');if(!d)return;
+  const req=moneyRequest('prolong',uid+':'+d);
   btn.disabled=true;toast('Продлеваю '+uid+'…');try{const r=await api('/api/proxy/'+encodeURIComponent(uid)+'/prolong',
-    {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days:parseInt(d)})});
-    toast('Продлён '+uid+' на '+r.days+' дн · '+r.price+' '+r.currency+' · действует до '+(r.date_end||'?'),'ok');await reloadAll()}catch(e){toast(e.message,'bad')}btn.disabled=false}
+    {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days:parseInt(d),request_id:req.id})});
+    moneyRequestDone(req);
+    toast('Продлён '+uid+' на '+r.days+' дн · '+r.price+' '+r.currency+' · действует до '+(r.date_end||'?'),'ok');await reloadAll()}catch(e){if(e.replace_request)moneyRequestDone(req);toast(e.message,'bad')}btn.disabled=false}
 
 async function del(btn,uid){if(!confirm('Удалить прокси '+uid+' НАВСЕГДА?\\n\\nСервер пропустит удаление, только если: удаление разрешено тумблером, '+
     'прокси не боевой, он дважды провалил проверку и сам провайдер считает его нерабочим.'))return;
@@ -1608,16 +1622,25 @@ function fbytes(n){n=n||0;if(n<1024)return n+' Б';if(n<1048576)return (n/1024).
 
 async function loadClients(){const r=await api('/api/clients');const tb=document.querySelector('#clients tbody');tb.innerHTML='';
   for(const c of r.clients){const tr=document.createElement('tr');const nm=esc(c.name);
-    tr.innerHTML='<td>'+nm+'</td><td>'+esc(c.ip)+'</td><td class="mut">'+ago(c.handshake)+'</td>'+
+    const unsupported=c.unsupported?('<br><span class="warn" title="'+esc(c.unsupported_reason||'legacy-конфигурация')+'">⚠ legacy: создание заблокировано; отзыв по ключу доступен</span>'):'';
+    tr.innerHTML='<td>'+nm+unsupported+'</td><td>'+esc(c.ip)+'</td><td class="mut">'+ago(c.handshake)+'</td>'+
       '<td class="mut">'+fbytes(c.rx)+' / '+fbytes(c.tx)+'</td>'+
-      '<td>'+(c.has_conf?('<button class="btn s tiny" onclick="dlClient(\\''+nm+'\\')" title="Файл для компьютера">Скачать</button> '+
-        '<button class="btn s tiny" onclick="qrClient(\\''+nm+'\\')" title="Картинка для телефона">QR</button> '):
+      '<td>'+(c.has_conf?('<button class="btn s tiny client-download" title="Файл для компьютера">Скачать</button> '+
+        '<button class="btn s tiny client-qr" title="Картинка для телефона">QR</button> '):
         '<span class="mut" title="профиль заведён мимо панели — файла с ключом нет">файла нет</span> ')+
-      '<button class="btn r tiny" onclick="delClient(\\''+nm+'\\')">Отозвать</button></td>';
+      '<button class="btn r tiny client-revoke">Отозвать</button></td>';
+    const download=tr.querySelector('.client-download'),qr=tr.querySelector('.client-qr');
+    if(download)download.addEventListener('click',()=>dlClient(c.name));
+    if(qr)qr.addEventListener('click',()=>qrClient(c.name));
+    tr.querySelector('.client-revoke').addEventListener('click',()=>delClient(c.name,c.pubkey));
     tb.appendChild(tr)}
   window.__CN=r.clients.length;
   const rec=((window.__S||{}).sys||{}).rec_clients;
-  sum('clients','устройств: '+r.clients.length+(rec?(' · советуем ≤'+rec):''));
+  const add=document.getElementById('client-add'),name=document.getElementById('cname');
+  add.disabled=!r.can_add;name.disabled=!r.can_add;
+  add.title=name.title=r.can_add?'':(r.add_error||'новое устройство сейчас добавить нельзя');
+  sum('clients','устройств: '+r.clients.length+(rec?(' · советуем ≤'+rec):'')+
+      (r.can_add?'':(' · добавление недоступно: '+esc(r.add_error||'проверь конфигурацию'))));
   vitals();clientRec();
   document.getElementById('qstart').style.display=r.clients.length?'none':'grid';
   if(!r.clients.length)tb.innerHTML='<tr><td colspan="5" class="mut">доступ пока никому не выдан — начни с шагов выше</td></tr>';
@@ -1629,8 +1652,8 @@ async function addClient(){const n=document.getElementById('cname').value.trim()
     document.getElementById('cname').value='';
     toast('Готово: '+r.name+' ('+r.ip+'). Дальше — «QR» для телефона или «Скачать» для компьютера.','ok');await loadClients()}catch(e){toast(e.message,'bad')}}
 
-async function delClient(n){if(!confirm('Отозвать доступ у «'+n+'»?\\n\\nУстройство сразу потеряет VPN, его профиль удалится. Вернуть — только выдать новый.'))return;
-  toast('Отзываю доступ '+n+'…');try{await api('/api/clients/'+encodeURIComponent(n)+'/delete',{method:'POST'});
+async function delClient(n,pubkey){if(!confirm('Отозвать доступ у «'+n+'»?\\n\\nУстройство сразу потеряет VPN, его профиль удалится. Вернуть — только выдать новый.'))return;
+  toast('Отзываю доступ '+n+'…');try{await api('/api/clients/'+encodeURIComponent(n)+'/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pubkey:pubkey})});
     toast('Доступ «'+n+'» отозван','ok');await loadClients()}catch(e){toast(e.message,'bad')}}
 
 function dlClient(n){window.location='/api/clients/'+encodeURIComponent(n)+'/config'}

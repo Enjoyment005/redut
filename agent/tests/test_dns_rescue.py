@@ -110,6 +110,14 @@ class TestDNSConfig(unittest.TestCase):
         self.assertEqual(out["dns_rescue"]["mode"], "automatic_last_resort")
         self.assertFalse(out["dns_rescue"]["automatic_ready"])
 
+    def test_active_probes_false_closes_automatic_readiness(self):
+        raw = normalized("automatic_last_resort", True, True)
+        raw.pop("_config_meta", None)
+        raw["dns_rescue"]["active_probes"] = False
+        out = config_schema.normalize(raw)
+        self.assertEqual(out["dns_rescue"]["mode"], "automatic_last_resort")
+        self.assertFalse(out["dns_rescue"]["automatic_ready"])
+
     def test_hostname_or_credentials_are_rejected(self):
         cfg = normalized("manual_canary", True)
         cfg.pop("_config_meta", None)
@@ -324,8 +332,6 @@ class TestDNSRuntime(unittest.TestCase):
         commands = []
         def fake(command, **_kwargs):
             commands.append(command)
-            if command[0] == dns_runtime.CONNTRACK:
-                return (1, "no entries")
             if (command[:4] == [dns_runtime.IPTABLES, "-t", "nat", "-S"]
                     and command[4] == dns_runtime.PRIMARY_TEST_CHAIN):
                 return (1, "missing")
@@ -335,6 +341,11 @@ class TestDNSRuntime(unittest.TestCase):
                                return_value=True), \
              mock.patch.object(dns_runtime, "_listener_acl_effective",
                                return_value=True), \
+             mock.patch.object(
+                 dns_runtime, "_conntrack_cmd",
+                 side_effect=lambda command, *_args, **_kwargs:
+                 ((1, "0 flow entries have been deleted", "")
+                  if "-D" in command else (0, "<conntrack />", ""))), \
              mock.patch.object(dns_runtime, "_delete_rule_all"):
             dns_runtime.activate_firewall(self.cfg, scope="peer:10.77.0.9")
         self.assertIn([dns_runtime.IPTABLES, "-t", "nat", "-F",
@@ -348,6 +359,7 @@ class TestDNSRuntime(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             target = os.path.join(root, "config.json")
             with mock.patch.object(dns_runtime, "_cmd", return_value=(0, "")), \
+                 mock.patch.object(dns_runtime.os, "name", "nt"), \
                  mock.patch.object(dns_runtime, "_fsync_directory") as fsync_dir:
                 built = dns_runtime.stage_config(self.cfg, direct, {}, path=target)
             fsync_dir.assert_called_once_with(root)
@@ -448,6 +460,36 @@ class TestCoordinator(unittest.TestCase):
         self.cfg["dns_rescue"]["mode"] = "disabled"
         with self.assertRaises(dns_rescue.DNSRescueError):
             dns_rescue.activate(self.cfg, self.pool)
+
+    def test_active_probes_false_blocks_new_manual_before_operation_or_probe(self):
+        self.cfg["dns_rescue"]["active_probes"] = False
+        with mock.patch.object(dns_rescue, "probe_backend") as probe:
+            with self.assertRaisesRegex(dns_rescue.DNSRescueError,
+                                        "active DNS probes are disabled"):
+                dns_rescue.activate(
+                    self.cfg, self.pool, scope="peer:10.77.0.9",
+                    profile_class="wg-ip", _locked=True)
+        probe.assert_not_called()
+        self.assertEqual(self.pool.dns_operations(), [])
+
+    def test_active_probes_false_blocks_new_automatic_before_causal_probe(self):
+        self.cfg = normalized("automatic_last_resort", True, True)
+        self.cfg["dns_rescue"]["active_probes"] = False
+        self.pool.set_settings({"dns_recovery_exhausted": "1",
+                                "dns_incident_id": "dns-no-probes",
+                                "automat_state": "EMERGENCY"})
+        with mock.patch.object(dns_rescue.dns_runtime,
+                               "client_primary_failure_proven") as causal, \
+             mock.patch.object(dns_rescue, "_primary_dns_failure") as primary, \
+             mock.patch.object(dns_rescue, "probe_backend") as backend:
+            result = dns_rescue.automatic_tick(
+                self.cfg, self.pool, "EMERGENCY", _locked=True)
+        self.assertEqual(result["action"], "ineligible")
+        self.assertFalse(result["state"].get("attempt_used"))
+        causal.assert_not_called()
+        primary.assert_not_called()
+        backend.assert_not_called()
+        self.assertEqual(self.pool.dns_operations(), [])
 
     def test_observe_uses_isolated_candidate_sidecar_not_live_listener(self):
         self.cfg["dns_rescue"].update(
@@ -1960,6 +2002,276 @@ class TestCoordinator(unittest.TestCase):
                 self.cfg, self.pool, "EMERGENCY", _locked=True)
         self.assertTrue(result["resume_pending"])
         self.assertIsNotNone(self.pool.get_setting("dns_exit_resume"))
+
+    def test_reconcile_inactive_owned_generation_detaches_then_resumes(self):
+        self.cfg = normalized("automatic_last_resort", True, True)
+        self.pool.set_settings({"automat_state": "EMERGENCY",
+                                "emergency_manual": "0",
+                                "dns_incident_id": "dns-boot",
+                                "dns_recovery_exhausted": "1"})
+        original = self._seed_nodewide_committed(boot_id="boot-test")
+        original = self.pool.set_dns_state(attempt_used=True)
+        order = []
+        restored = dict(original, phase="active_proxy", active_scope="all",
+                        active_slot="google-proxy",
+                        active_kind="node_wide_automatic")
+
+        def detach(*_args, **_kwargs):
+            descriptor = json.loads(self.pool.get_setting("dns_exit_resume"))
+            self.assertEqual(descriptor["incident_id"], "dns-boot")
+            self.assertEqual(descriptor["scope_identity"], "scope-test")
+            order.append("detach")
+            return True
+
+        def resume(*args, **kwargs):
+            order.append("successor")
+            return self._resume_success("dns_exit_resume", restored)(*args, **kwargs)
+
+        with mock.patch.object(dns_rescue.os, "name", "posix"), \
+             mock.patch.object(dns_rescue, "_boot_id", return_value="boot-test"), \
+             mock.patch.object(dns_rescue.dns_runtime, "scrub_candidate_sidecar"), \
+             mock.patch.object(dns_rescue.dns_runtime, "scrub_primary_test_bypass"), \
+             mock.patch.object(dns_rescue.dns_runtime, "firewall_attached", return_value=True), \
+             mock.patch.object(dns_rescue.dns_runtime, "service_state", return_value="inactive"), \
+             mock.patch.object(dns_rescue.dns_runtime,
+                               "wireguard_scope_identity_state",
+                               return_value={"status": "valid", "identity": "scope-test"}), \
+             mock.patch.object(dns_rescue.dns_runtime, "emergency_route_state",
+                               return_value="ready"), \
+             mock.patch.object(dns_rescue.dns_runtime, "firewall_effective", return_value=True), \
+             mock.patch.object(dns_rescue.dns_runtime, "deactivate_redirect",
+                               side_effect=detach), \
+             mock.patch.object(dns_rescue.dns_runtime, "service_stop"), \
+             mock.patch.object(dns_rescue.dns_runtime, "remove_listener_acl"), \
+             mock.patch.object(dns_rescue, "_activate_locked", side_effect=resume):
+            state = dns_rescue.reconcile(self.cfg, self.pool, _locked=True)
+        self.assertEqual(order, ["detach", "successor"])
+        self.assertEqual(state["active_slot"], "google-proxy")
+        self.assertEqual(state["incident_id"], "dns-boot")
+        self.assertTrue(state["attempt_used"])
+        self.assertIsNone(self.pool.get_setting("dns_exit_resume"))
+
+    def test_reconcile_owned_route_drift_detaches_repairs_then_resumes(self):
+        self.cfg = normalized("automatic_last_resort", True, True)
+        self.pool.set_settings({"automat_state": "EMERGENCY",
+                                "emergency_manual": "0",
+                                "dns_incident_id": "dns-boot",
+                                "dns_recovery_exhausted": "1"})
+        original = self._seed_nodewide_committed(boot_id="boot-test")
+        original = self.pool.set_dns_state(attempt_used=True)
+        restored = dict(original, phase="active_proxy", active_scope="all",
+                        active_slot="google-proxy",
+                        active_kind="node_wide_automatic")
+        order = []
+
+        def detach(*_args, **_kwargs):
+            self.assertIsNotNone(self.pool.get_setting("dns_exit_resume"))
+            order.append("detach")
+            return True
+
+        def repair(*_args, **_kwargs):
+            order.append("repair")
+            return "ready"
+
+        def resume(*args, **kwargs):
+            order.append("successor")
+            return self._resume_success("dns_exit_resume", restored)(*args, **kwargs)
+
+        with mock.patch.object(dns_rescue.os, "name", "posix"), \
+             mock.patch.object(dns_rescue, "_boot_id", return_value="boot-test"), \
+             mock.patch.object(dns_rescue.dns_runtime, "scrub_candidate_sidecar"), \
+             mock.patch.object(dns_rescue.dns_runtime, "scrub_primary_test_bypass"), \
+             mock.patch.object(dns_rescue.dns_runtime, "firewall_attached", return_value=True), \
+             mock.patch.object(dns_rescue.dns_runtime, "service_state", return_value="active"), \
+             mock.patch.object(dns_rescue.dns_runtime,
+                               "wireguard_scope_identity_state",
+                               return_value={"status": "valid", "identity": "scope-test"}), \
+             mock.patch.object(dns_rescue.dns_runtime, "emergency_route_state",
+                               return_value="mismatch"), \
+             mock.patch.object(dns_rescue.dns_runtime, "firewall_effective", return_value=True), \
+             mock.patch.object(dns_rescue.dns_runtime, "deactivate_redirect",
+                               side_effect=detach), \
+             mock.patch.object(dns_rescue.dns_runtime, "service_stop"), \
+             mock.patch.object(dns_rescue.dns_runtime, "remove_listener_acl"), \
+             mock.patch.object(dns_rescue, "_ensure_resume_emergency_route",
+                               side_effect=repair), \
+             mock.patch.object(dns_rescue, "_activate_locked", side_effect=resume):
+            state = dns_rescue.reconcile(self.cfg, self.pool, _locked=True)
+        self.assertEqual(order, ["detach", "repair", "successor"])
+        self.assertEqual(state["active_slot"], "google-proxy")
+        self.assertEqual(state["incident_id"], "dns-boot")
+        self.assertTrue(state["attempt_used"])
+        self.assertIsNone(self.pool.get_setting("dns_exit_resume"))
+
+    def _assert_reconcile_partial_unknown_resumes(self, service_state, route_state):
+        self.cfg = normalized("automatic_last_resort", True, True)
+        self.pool.set_settings({"automat_state": "EMERGENCY",
+                                "emergency_manual": "0",
+                                "dns_incident_id": "dns-boot",
+                                "dns_recovery_exhausted": "1"})
+        original = self._seed_nodewide_committed(boot_id="boot-test")
+        original = self.pool.set_dns_state(attempt_used=True)
+        restored = dict(original, phase="active_proxy", active_scope="all",
+                        active_slot="google-proxy",
+                        active_kind="node_wide_automatic")
+
+        def detach(*_args, **_kwargs):
+            self.assertIsNotNone(self.pool.get_setting("dns_exit_resume"))
+            return True
+
+        with mock.patch.object(dns_rescue.os, "name", "posix"), \
+             mock.patch.object(dns_rescue, "_boot_id", return_value="boot-test"), \
+             mock.patch.object(dns_rescue.dns_runtime, "scrub_candidate_sidecar"), \
+             mock.patch.object(dns_rescue.dns_runtime, "scrub_primary_test_bypass"), \
+             mock.patch.object(dns_rescue.dns_runtime, "firewall_attached", return_value=True), \
+             mock.patch.object(dns_rescue.dns_runtime, "service_state",
+                               return_value=service_state), \
+             mock.patch.object(dns_rescue.dns_runtime,
+                               "wireguard_scope_identity_state",
+                               return_value={"status": "valid", "identity": "scope-test"}), \
+             mock.patch.object(dns_rescue.dns_runtime, "emergency_route_state",
+                               return_value=route_state), \
+             mock.patch.object(dns_rescue.dns_runtime, "firewall_effective", return_value=True), \
+             mock.patch.object(dns_rescue.dns_runtime, "deactivate_redirect",
+                               side_effect=detach), \
+             mock.patch.object(dns_rescue.dns_runtime, "service_stop"), \
+             mock.patch.object(dns_rescue.dns_runtime, "remove_listener_acl"), \
+             mock.patch.object(dns_rescue, "_ensure_resume_emergency_route",
+                               return_value="ready"), \
+             mock.patch.object(dns_rescue, "_activate_locked",
+                               side_effect=self._resume_success(
+                                   "dns_exit_resume", restored)):
+            state = dns_rescue.reconcile(self.cfg, self.pool, _locked=True)
+        self.assertEqual(state["active_slot"], "google-proxy")
+        self.assertEqual(state["incident_id"], "dns-boot")
+        self.assertTrue(state["attempt_used"])
+        self.assertIsNone(self.pool.get_setting("dns_exit_resume"))
+
+    def test_reconcile_inactive_listener_with_unknown_route_keeps_continuation(self):
+        self._assert_reconcile_partial_unknown_resumes("inactive", "unknown")
+
+    def test_reconcile_route_mismatch_with_unknown_listener_keeps_continuation(self):
+        self._assert_reconcile_partial_unknown_resumes("unknown", "mismatch")
+
+    def test_reconcile_inactive_listener_with_unknown_boot_keeps_continuation(self):
+        self.cfg = normalized("automatic_last_resort", True, True)
+        self.pool.set_settings({"automat_state": "EMERGENCY",
+                                "emergency_manual": "0",
+                                "dns_incident_id": "dns-boot",
+                                "dns_recovery_exhausted": "1"})
+        original = self._seed_nodewide_committed(boot_id="boot-test")
+        original = self.pool.set_dns_state(attempt_used=True)
+        events = []
+
+        def detach(*_args, **_kwargs):
+            descriptor = json.loads(self.pool.get_setting("dns_exit_resume"))
+            self.assertEqual(descriptor["boot_id"], "boot-test")
+            self.assertEqual(descriptor["scope_identity"], "scope-test")
+            events.append("detach")
+            return True
+
+        with mock.patch.object(dns_rescue.os, "name", "posix"), \
+             mock.patch.object(dns_rescue, "_boot_id", return_value=None), \
+             mock.patch.object(dns_rescue.dns_runtime, "scrub_candidate_sidecar"), \
+             mock.patch.object(dns_rescue.dns_runtime, "scrub_primary_test_bypass"), \
+             mock.patch.object(dns_rescue.dns_runtime, "firewall_attached", return_value=True), \
+             mock.patch.object(dns_rescue.dns_runtime, "service_state",
+                               return_value="inactive"), \
+             mock.patch.object(dns_rescue.dns_runtime,
+                               "wireguard_scope_identity_state",
+                               return_value={"status": "valid", "identity": "scope-test"}), \
+             mock.patch.object(dns_rescue.dns_runtime, "emergency_route_state",
+                               return_value="ready"), \
+             mock.patch.object(dns_rescue.dns_runtime, "firewall_effective", return_value=True), \
+             mock.patch.object(dns_rescue.dns_runtime, "deactivate_redirect",
+                               side_effect=detach), \
+             mock.patch.object(dns_rescue.dns_runtime, "service_stop",
+                               side_effect=lambda *_args: events.append("stop")), \
+             mock.patch.object(dns_rescue.dns_runtime, "remove_listener_acl"):
+            first = dns_rescue.reconcile(self.cfg, self.pool, _locked=True)
+        self.assertEqual(events, ["detach", "stop"])
+        self.assertEqual(first["phase"], "failed")
+        self.assertIsNone(first["active_scope"])
+        descriptor = json.loads(self.pool.get_setting("dns_exit_resume"))
+        self.assertEqual(descriptor["incident_id"], "dns-boot")
+        self.assertEqual(descriptor["attempt_seq"], 1)
+        descriptor["retry_monotonic"] = 0
+        self.pool.set_setting("dns_exit_resume", json.dumps(descriptor))
+
+        restored = dict(original, phase="active_proxy", active_scope="all",
+                        active_slot="google-proxy",
+                        active_kind="node_wide_automatic")
+        with mock.patch.object(dns_rescue.os, "name", "posix"), \
+             mock.patch.object(dns_rescue, "_boot_id", return_value="boot-test"), \
+             mock.patch.object(dns_rescue.dns_runtime, "scrub_candidate_sidecar"), \
+             mock.patch.object(dns_rescue.dns_runtime, "scrub_primary_test_bypass"), \
+             mock.patch.object(dns_rescue.dns_runtime, "firewall_attached", return_value=False), \
+             mock.patch.object(dns_rescue.dns_runtime, "service_inactive", return_value=True), \
+             mock.patch.object(dns_rescue.dns_runtime, "emergency_route_state",
+                               return_value="ready"), \
+             mock.patch.object(dns_rescue, "_activate_locked",
+                               side_effect=self._resume_success(
+                                   "dns_exit_resume", restored)):
+            second = dns_rescue.reconcile(self.cfg, self.pool, _locked=True)
+        self.assertEqual(second["active_slot"], "google-proxy")
+        self.assertEqual(second["incident_id"], "dns-boot")
+        self.assertTrue(second["attempt_used"])
+        self.assertIsNone(self.pool.get_setting("dns_exit_resume"))
+
+    def test_reconcile_continuation_survives_kill_after_publish(self):
+        self.cfg = normalized("automatic_last_resort", True, True)
+        self.pool.set_settings({"automat_state": "EMERGENCY",
+                                "emergency_manual": "0",
+                                "dns_incident_id": "dns-boot",
+                                "dns_recovery_exhausted": "1"})
+        original = self._seed_nodewide_committed(boot_id="boot-test")
+        original = self.pool.set_dns_state(attempt_used=True)
+        restored = dict(original, phase="active_proxy", active_scope="all",
+                        active_slot="google-proxy",
+                        active_kind="node_wide_automatic")
+
+        def killed(*_args, **_kwargs):
+            self.assertIsNotNone(self.pool.get_setting("dns_exit_resume"))
+            raise KeyboardInterrupt()
+
+        common = (
+            mock.patch.object(dns_rescue.os, "name", "posix"),
+            mock.patch.object(dns_rescue, "_boot_id", return_value="boot-test"),
+            mock.patch.object(dns_rescue.dns_runtime, "scrub_candidate_sidecar"),
+            mock.patch.object(dns_rescue.dns_runtime, "scrub_primary_test_bypass"),
+            mock.patch.object(dns_rescue.dns_runtime, "service_state", return_value="inactive"),
+            mock.patch.object(dns_rescue.dns_runtime, "wireguard_scope_identity_state",
+                              return_value={"status": "valid", "identity": "scope-test"}),
+            mock.patch.object(dns_rescue.dns_runtime, "emergency_route_state",
+                              return_value="ready"),
+            mock.patch.object(dns_rescue.dns_runtime, "firewall_effective", return_value=True),
+        )
+        with common[0], common[1], common[2], common[3], common[4], common[5], \
+                common[6], common[7], \
+                mock.patch.object(dns_rescue.dns_runtime, "firewall_attached",
+                                  return_value=True), \
+                mock.patch.object(dns_rescue.dns_runtime, "deactivate_redirect",
+                                  side_effect=killed):
+            with self.assertRaises(KeyboardInterrupt):
+                dns_rescue.reconcile(self.cfg, self.pool, _locked=True)
+        descriptor = json.loads(self.pool.get_setting("dns_exit_resume"))
+        self.assertEqual(descriptor["incident_id"], "dns-boot")
+
+        with mock.patch.object(dns_rescue.os, "name", "posix"), \
+             mock.patch.object(dns_rescue, "_boot_id", return_value="boot-test"), \
+             mock.patch.object(dns_rescue.dns_runtime, "scrub_candidate_sidecar"), \
+             mock.patch.object(dns_rescue.dns_runtime, "scrub_primary_test_bypass"), \
+             mock.patch.object(dns_rescue.dns_runtime, "firewall_attached", return_value=False), \
+             mock.patch.object(dns_rescue.dns_runtime, "service_inactive", return_value=True), \
+             mock.patch.object(dns_rescue.dns_runtime, "emergency_route_state",
+                               return_value="ready"), \
+             mock.patch.object(dns_rescue, "_activate_locked",
+                               side_effect=self._resume_success(
+                                   "dns_exit_resume", restored)):
+            state = dns_rescue.reconcile(self.cfg, self.pool, _locked=True)
+        self.assertEqual(state["active_slot"], "google-proxy")
+        self.assertEqual(state["incident_id"], "dns-boot")
+        self.assertIsNone(self.pool.get_setting("dns_exit_resume"))
 
     def test_nodewide_unknown_threshold_publishes_exact_resume_before_teardown(self):
         self.cfg = normalized("automatic_last_resort", True, True)

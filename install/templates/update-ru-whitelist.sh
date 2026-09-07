@@ -12,6 +12,15 @@ NET_SET="ru_whitelist_net"
 DOMAIN_SET="ru_whitelist"
 LOG="/var/log/ru-whitelist-update.log"
 TXN_MARK="/var/lib/vpn-panel/ru-whitelist-update.pending"
+OLD_SNAPSHOT="$LKG_DIR/old-live-candidate.ipset"
+OLD_SNAPSHOT_SHA="$LKG_DIR/.old_snapshot_sha256"
+RECOVER_ONLY=0
+if [ "${1:-}" = "--recover-only" ]; then
+    RECOVER_ONLY=1
+elif [ "$#" -ne 0 ]; then
+    echo "usage: $0 [--recover-only]" >&2
+    exit 2
+fi
 mkdir -p /var/lib/vpn-panel
 PARENT_LOCK_FD="${REDUT_PARENT_LOCK_FD:-}"
 if [[ "$PARENT_LOCK_FD" =~ ^[0-9]+$ ]] \
@@ -54,6 +63,23 @@ members_hash(){
         | awk '$1 == "add" { print $3 }' \
         | LC_ALL=C sort \
         | sha256sum | awk '{print $1}'
+}
+snapshot_members_hash(){
+    awk '$1 == "add" { print $3 }' "$1" | LC_ALL=C sort \
+        | sha256sum | awk '{print $1}'
+}
+snapshot_valid(){
+    [ -f "$OLD_SNAPSHOT" ] && [ -f "$OLD_SNAPSHOT_SHA" ] || return 1
+    local recorded actual
+    recorded="$(cat "$OLD_SNAPSHOT_SHA")" || return 1
+    actual="$(sha256sum "$OLD_SNAPSHOT" | awk '{print $1}')" || return 1
+    [ "$recorded" = "$actual" ] || return 1
+    awk -v set="${NET_SET}_candidate" '
+        $1 == "create" && $2 == set && $3 == "hash:net" { creates++; next }
+        $1 == "add" && $2 == set && NF == 3 { next }
+        { bad=1 }
+        END { exit !(!bad && creates == 1) }
+    ' "$OLD_SNAPSHOT"
 }
 restart_dnsmasq(){
     # SIGHUP/reload does not reread conf-dir.  A checked restart is the only
@@ -116,8 +142,29 @@ rollback_pending(){
             if ! set_exists "${NET_SET}_candidate" \
                     || ! candidate_hash="$(members_hash "${NET_SET}_candidate")" \
                     || [ "$candidate_hash" != "$old_hash" ]; then
-                log "ОШИБКА: старое поколение ipset не найдено; marker сохранён"
-                return 1
+                if ! snapshot_valid \
+                        || [ "$(snapshot_members_hash "$OLD_SNAPSHOT")" != "$old_hash" ]; then
+                    log "ОШИБКА: durable snapshot старого ipset не подтверждён; marker сохранён"
+                    return 1
+                fi
+                if set_exists "${NET_SET}_candidate" \
+                        && ! ipset destroy "${NET_SET}_candidate"; then
+                    log "ОШИБКА: повреждённый rollback candidate не удалён; marker сохранён"
+                    return 1
+                fi
+                if ! ipset restore < "$OLD_SNAPSHOT" \
+                        || ! candidate_hash="$(members_hash "${NET_SET}_candidate")" \
+                        || [ "$candidate_hash" != "$old_hash" ]; then
+                    log "ОШИБКА: старое поколение не восстановлено из snapshot; marker сохранён"
+                    return 1
+                fi
+            fi
+            # A reboot drops both volatile sets. Recreate the empty live
+            # endpoint before the one atomic swap from the durable candidate.
+            if ! set_exists "$NET_SET"; then
+                ipset create "$NET_SET" hash:net family inet \
+                    hashsize 65536 maxelem 1000000 \
+                    || { log "ОШИБКА: live ipset для rollback не создан; marker сохранён"; return 1; }
             fi
             if ! ipset swap "${NET_SET}_candidate" "$NET_SET"; then
                 log "ОШИБКА: rollback ipset swap не выполнен; marker сохранён"
@@ -157,7 +204,7 @@ rollback_pending(){
         return 1
     fi
     ipset destroy "${NET_SET}_candidate" 2>/dev/null || true
-    if ! rm -f -- "$LKG_DIR/.old_set_hash"; then
+    if ! rm -f -- "$LKG_DIR/.old_set_hash" "$OLD_SNAPSHOT" "$OLD_SNAPSHOT_SHA"; then
         log "ПРЕДУПРЕЖДЕНИЕ: rollback завершён, но LKG metadata не очищена"
     elif ! fsync_paths "$LKG_DIR"; then
         log "ПРЕДУПРЕЖДЕНИЕ: rollback завершён, но очистка LKG metadata не синхронизирована"
@@ -174,6 +221,10 @@ trap 'exit 1' HUP INT TERM
 # A killed previous update leaves a durable marker and the old live ipset under
 # the candidate name. Restore it before fetching or overwriting the LKG copy.
 rollback_pending || exit 1
+if [ "$RECOVER_ONLY" = "1" ]; then
+    log "RU recovery-only завершён без сетевой загрузки"
+    exit 0
+fi
 
 fetch(){
     local name="$1" sha="$2"
@@ -284,14 +335,27 @@ if [ -f "$NET_FILE" ]; then
     cp -a "$NET_FILE" "$LKG_DIR/ru_whitelist_net.ipset"
     touch "$LKG_DIR/.had_net"
 fi
+rm -f -- "$OLD_SNAPSHOT" "$OLD_SNAPSHOT_SHA"
 if set_exists "$NET_SET"; then
     members_hash "$NET_SET" > "$LKG_DIR/.old_set_hash"
+    ipset save "$NET_SET" \
+        | sed -e "s/^create $NET_SET /create ${NET_SET}_candidate /" \
+              -e "s/^add $NET_SET /add ${NET_SET}_candidate /" \
+        > "$OLD_SNAPSHOT"
+    chmod 600 "$OLD_SNAPSHOT"
+    [ "$(snapshot_members_hash "$OLD_SNAPSHOT")" = "$(cat "$LKG_DIR/.old_set_hash")" ] \
+        || { log "ОШИБКА: snapshot старого ipset не совпал с live"; exit 1; }
+    sha256sum "$OLD_SNAPSHOT" | awk '{print $1}' > "$OLD_SNAPSHOT_SHA"
+    chmod 600 "$OLD_SNAPSHOT_SHA"
+    snapshot_valid \
+        || { log "ОШИБКА: durable snapshot старого ipset не прошёл проверку"; exit 1; }
 else
     printf 'ABSENT\n' > "$LKG_DIR/.old_set_hash"
 fi
 chmod 600 "$LKG_DIR/.old_set_hash"
 fsync_paths "$LKG_DIR/ru-whitelist.conf" "$LKG_DIR/ru_whitelist_net.ipset" \
-    "$LKG_DIR/.had_conf" "$LKG_DIR/.had_net" "$LKG_DIR/.old_set_hash" "$LKG_DIR"
+    "$LKG_DIR/.had_conf" "$LKG_DIR/.had_net" "$LKG_DIR/.old_set_hash" \
+    "$OLD_SNAPSHOT" "$OLD_SNAPSHOT_SHA" "$LKG_DIR"
 install -m 0644 "$TMP/dnsmasq.conf" "$CONF_FILE.candidate"
 install -m 0600 "$TMP/net.ipset" "$NET_FILE.candidate"
 fsync_paths "$CONF_FILE.candidate" "$NET_FILE.candidate" \
@@ -323,7 +387,7 @@ fi
 if ! fsync_paths "$(dirname "$TXN_MARK")"; then
     log "ОШИБКА: удаление commit marker не синхронизировано; generation will be rolled back"; exit 1
 fi
-if ! rm -f -- "$LKG_DIR/.old_set_hash"; then
+if ! rm -f -- "$LKG_DIR/.old_set_hash" "$OLD_SNAPSHOT" "$OLD_SNAPSHOT_SHA"; then
     log "ПРЕДУПРЕЖДЕНИЕ: commit завершён, но LKG metadata не очищена"
 elif ! fsync_paths "$LKG_DIR"; then
     log "ПРЕДУПРЕЖДЕНИЕ: commit завершён, но очистка LKG metadata не синхронизирована"

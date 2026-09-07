@@ -257,6 +257,26 @@ def new_csrf_token():
     return secrets.token_urlsafe(24)
 
 
+def new_credential_epoch():
+    return secrets.token_urlsafe(24)
+
+
+def admin_credential_epoch(admin):
+    """Return explicit epoch, or a stable legacy epoch until migration writes one."""
+    admin = admin if isinstance(admin, dict) else {}
+    explicit = str(admin.get("credential_epoch") or "").strip()
+    if explicit:
+        return explicit
+    legacy = {key: admin.get(key) for key in ("pw", "totp", "recovery")}
+    encoded = json.dumps(legacy, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":")).encode("utf-8")
+    return "legacy-" + hashlib.sha256(encoded).hexdigest()
+
+
+class CredentialEpochChanged(RuntimeError):
+    pass
+
+
 class AuthStore:
     """Сессии и антибрут в state.db. Схема создаётся идемпотентно."""
 
@@ -264,28 +284,92 @@ class AuthStore:
         self.conn = conn
         conn.execute("""CREATE TABLE IF NOT EXISTS session(
             token TEXT PRIMARY KEY, created REAL, expires REAL, src_ip TEXT, csrf TEXT)""")
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(session)")}
+        if "credential_epoch" not in columns:
+            conn.execute("ALTER TABLE session ADD COLUMN credential_epoch TEXT NOT NULL DEFAULT ''")
+        conn.execute("""CREATE TABLE IF NOT EXISTS authmeta(
+            key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS loginfail(
             src_ip TEXT PRIMARY KEY, fails INTEGER, banned_until REAL, waves INTEGER DEFAULT 0)""")
         conn.commit()
 
     # -- сессии --
-    def create_session(self, src_ip, now=None):
+    def credential_epoch(self):
+        row = self.conn.execute(
+            "SELECT value FROM authmeta WHERE key='credential_epoch'").fetchone()
+        if row:
+            return str(row[0])
+        epoch = new_credential_epoch()
+        self.conn.execute(
+            "INSERT OR IGNORE INTO authmeta(key,value) VALUES('credential_epoch',?)", (epoch,))
+        self.conn.commit()
+        row = self.conn.execute(
+            "SELECT value FROM authmeta WHERE key='credential_epoch'").fetchone()
+        return str(row[0])
+
+    def ensure_credential_epoch(self, epoch):
+        epoch = str(epoch or "").strip()
+        if not epoch:
+            raise ValueError("credential epoch is empty")
+        self.conn.execute(
+            "INSERT OR IGNORE INTO authmeta(key,value) VALUES('credential_epoch',?)", (epoch,))
+        self.conn.commit()
+        return self.credential_epoch()
+
+    def rotate_credential_epoch(self, epoch=None):
+        epoch = str(epoch or new_credential_epoch()).strip()
+        if not epoch:
+            raise ValueError("credential epoch is empty")
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute(
+                "INSERT INTO authmeta(key,value) VALUES('credential_epoch',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (epoch,))
+            self.conn.execute("DELETE FROM session")
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return epoch
+
+    def create_session(self, src_ip, now=None, expected_epoch=None):
         now = now if now is not None else time.time()
         token, csrf = new_session_token(), new_csrf_token()
-        self.conn.execute("INSERT INTO session(token, created, expires, src_ip, csrf) VALUES(?,?,?,?,?)",
-                          (token, now, now + SESSION_TTL, src_ip, csrf))
-        self.conn.commit()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT value FROM authmeta WHERE key='credential_epoch'").fetchone()
+            if row:
+                epoch = str(row[0])
+            else:
+                epoch = new_credential_epoch()
+                self.conn.execute(
+                    "INSERT INTO authmeta(key,value) VALUES('credential_epoch',?)", (epoch,))
+            if expected_epoch is not None and not hmac.compare_digest(
+                    epoch, str(expected_epoch)):
+                raise CredentialEpochChanged("admin credentials changed during login")
+            self.conn.execute(
+                "INSERT INTO session(token, created, expires, src_ip, csrf, credential_epoch) "
+                "VALUES(?,?,?,?,?,?)", (token, now, now + SESSION_TTL, src_ip, csrf, epoch))
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
         return token, csrf
 
     def get_session(self, token, now=None):
         if not token:
             return None
         now = now if now is not None else time.time()
-        row = self.conn.execute("SELECT token, expires, src_ip, csrf FROM session WHERE token=?",
+        row = self.conn.execute(
+            "SELECT token, expires, src_ip, csrf, credential_epoch FROM session WHERE token=?",
                                 (token,)).fetchone()
         if not row:
             return None
         if row[1] < now:
+            self.destroy_session(token)
+            return None
+        if not hmac.compare_digest(str(row[4] or ""), self.credential_epoch()):
             self.destroy_session(token)
             return None
         return {"token": row[0], "expires": row[1], "src_ip": row[2], "csrf": row[3]}
@@ -332,6 +416,43 @@ class AuthStore:
     def record_success(self, src_ip):
         self.conn.execute("DELETE FROM loginfail WHERE src_ip=?", (src_ip,))
         self.conn.commit()
+
+
+def ensure_admin_credential_epoch(secrets_path, store):
+    """Migrate a legacy admin to an explicit epoch without overriding a reset in progress."""
+    with secrets_writer(secrets_path):
+        data = _read_secrets_unlocked(secrets_path)
+        admin = data.get("admin") if isinstance(data.get("admin"), dict) else None
+        if not admin:
+            return data, store.credential_epoch()
+        expected = admin_credential_epoch(admin)
+        current = store.ensure_credential_epoch(expected)
+        if not admin.get("credential_epoch") and hmac.compare_digest(current, expected):
+            data = dict(data)
+            migrated = dict(admin)
+            migrated["credential_epoch"] = expected
+            data["admin"] = migrated
+            _write_secrets_unlocked(secrets_path, data)
+        return data, expected
+
+
+def write_admin_credentials_atomic(secrets_path, payload, store, force=False,
+                                   replace_all=False):
+    """Rotate the DB epoch before installing new factors; failures remain fail-closed."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("admin"), dict):
+        raise ValueError("admin credential payload is invalid")
+    with secrets_writer(secrets_path):
+        current = _read_secrets_unlocked(secrets_path)
+        if current.get("admin") and not force:
+            raise SystemExit("Админ уже настроен в %s. Перезаписать: --force" % secrets_path)
+        replacement = dict(payload) if replace_all else dict(current)
+        admin = dict(payload["admin"])
+        epoch = new_credential_epoch()
+        admin["credential_epoch"] = epoch
+        replacement["admin"] = admin
+        store.rotate_credential_epoch(epoch)
+        _write_secrets_unlocked(secrets_path, replacement)
+        return replacement, epoch
 
 
 def consume_recovery_code(conn, secrets_path, code):

@@ -2,8 +2,8 @@
 
 Исходный аудит: 2026-09-01, локальная версия `1.12.3`. Редакция режима: 2026-09-06.
 
-Статус: **локальный implementation candidate 1.13.1 после повторного adversarial security
-review; в GitHub не опубликован и live-canary не выполнен**. Без digest-pinned внешнего
+Статус: **релиз 1.13.2 после повторного adversarial security review; live-canary не
+выполнен**. Без digest-pinned внешнего
 runner v3, controlled wildcard zone, живого exact WireGuard peer и свежих canary/rollback
 evidence конфигурация принудительно оставляет `automatic_last_resort` закрытым. Установка
 кода сама не меняет DNS, маршруты или режим на боевых узлах; manual canary и production
@@ -905,25 +905,26 @@ Chaos на боевом узле выполняется только по одн
 с заранее проверенным SSH/панельным доступом и готовым rollback. Серии рестартов sing-box
 не допускаются.
 
-## 14. Порядок rollout
+## 14. Порядок публикации и production rollout
 
 1. Закрыть пакет -1: owner-verified secret preflight; при подтверждении утечки — отдельный
    incident plan до продолжения.
 2. Утвердить threat model, live inventory, dependency DAG и ADR.
 3. Локальные unit/contract/security-тесты и изолированная install/reinstall-приёмка.
-4. Observe-only на одном явно утверждённом canary-узле с точечным firewall exception.
-5. Не менее нескольких полных циклов наблюдения без изменения трафика; длительность
+4. Публичная сборка P0, clean-install, secret/provenance scan, release notes и публикация
+   исходного кода без включения режима в production.
+5. Observe-only на одном явно утверждённом canary-узле с точечным firewall exception.
+6. Не менее нескольких полных циклов наблюдения без изменения трафика; длительность
    определяется baseline, а не календарным предположением.
-6. Изолированный manual canary из `NORMAL` только на test peer/namespace для каждого
+7. Изолированный manual canary из `NORMAL` только на test peer/namespace для каждого
    присутствующего класса профилей; затем отдельный node-wide manual test из sticky
    `EMERGENCY`. Сначала DoH через proxy, затем отдельный сценарий direct DoH.
-7. Rollback/kill/reboot drill и доказательство, что вне сессии штатный DNS не меняется.
-8. Shadow-trigger `after_recovery_exhausted`: решение журналируется, но режим не включается.
-9. Автоматический last-resort только на одном owner-approved узле, где UDP/TCP прошли для
+8. Rollback/kill/reboot drill и доказательство, что вне сессии штатный DNS не меняется.
+9. Shadow-trigger `after_recovery_exhausted`: решение журналируется, но режим не включается.
+10. Автоматический last-resort только на одном owner-approved узле, где UDP/TCP прошли для
    всех присутствующих классов профилей; `LOCAL_RU=observe_only`.
-10. Сравнение baseline/rescue/failure/recovery SLO, counters и отдельный owner approval.
-11. Второй узел.
-12. Публичная сборка P0, clean-install, secret/provenance scan, release notes и публикация.
+11. Сравнение baseline/rescue/failure/recovery SLO, counters и отдельный owner approval.
+12. Второй узел.
 13. Отдельным P1: hardened allowlist/route-claim engine и local-RU внутри rescue.
 14. Отдельным P1: IPv6 cohort после стабилизации IPv4.
 
@@ -950,9 +951,10 @@ automatic trigger, allowlist engine и IPv6 в один деплой.
 
 Неуспешный `DNS_RESCUE` не должен требовать смены proxy или покупки нового адреса.
 
-## 16. Критерии готовности релиза
+## 16. Критерии готовности к production rollout и automatic DNS
 
-Релиз не готов, пока не доказано всё ниже:
+Публикация исходного кода не означает эксплуатационную готовность. Production rollout и
+включение automatic DNS не готовы, пока не доказано всё ниже:
 
 - пакет -1 закрыт владельцем; публичная сборка и canonical templates не содержат credentials;
 - узел canary не получает непроверенный RU-list tip: updater зафиксирован на LKG/pinned
@@ -985,9 +987,10 @@ automatic trigger, allowlist engine и IPv6 в один деплой.
 - plain 53/853 leak отсутствует внутри активного rescue по synthetic WG probes и effective
   OUTPUT/FORWARD counters; ожидаемый direct DoH/443 помечен как `RESCUE_DIRECT`;
   ограниченный packet capture — дополнительное, а не единственное доказательство;
-- P0-релиз явно ограничен IPv4: при `ipv6_capture=off` UI показывает `IPv6 unmanaged` и
+- P0 production rollout явно ограничен IPv4: при `ipv6_capture=off` UI показывает
+  `IPv6 unmanaged` и
   общий green запрещён; отсутствие IPv6 leak не является P0-критерием, а общий IPv4+IPv6
-  release возможен только после `block|tunnel` canary;
+  rollout возможен только после `block|tunnel` canary;
 - application DoH scope отображается как unmanaged там, где его нельзя контролировать;
 - reboot/install/reinstall/rollback проходят;
 - полный canonical и public test suites зелёные;

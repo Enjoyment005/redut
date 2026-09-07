@@ -9,6 +9,7 @@
 | Приватные ключи устройств | `/etc/wireguard/clients/*.conf` | `0600` |
 | Приватный ключ WireGuard-сервера | `/etc/wireguard/server_private.key` | `0600` |
 | Журнал состояния и операций | `/var/lib/vpn-panel/state.db` | `0600` |
+| Параметры bootstrap с upstream/SOCKS5 паролями | `/opt/vpn-install/params.sh` | `0600` до первого секретного байта |
 
 Root на сервере видит эти данные. Модель угроз Редута защищает от чужой сети и
 посторонних сервисов, но не от владельца root-доступа к VPS.
@@ -36,6 +37,12 @@ python3 /opt/vpn-panel/webpanel/setup_admin.py
 - Recovery consume, смена ключей и reset администратора используют один
   межпроцессный writer lock, повторное чтение после lock, `0600` unique temp,
   `fsync` и atomic replace.
+- Сессия связана с durable поколением учётных данных администратора. Смена пароля,
+  TOTP/recovery или `setup_admin.py --force` увеличивает поколение, поэтому старые cookies
+  отвергаются даже после перезапуска и при гонке login/reset.
+- SSH deploy/bootstrap сначала создаёт exclusive regular staging handle, устанавливает и
+  проверяет `root:0600`, и лишь затем пишет первый байт секрета. Dry-run выводит структуру
+  `params.sh` с замаскированными паролями.
 - Тело POST ограничено 64 KiB (login — 8 KiB), неоднозначный framing отклоняется.
 - Одновременно обслуживается не более 32 HTTP workers и четырёх scrypt-проверок;
   systemd ограничивает память, tasks и descriptors панели.

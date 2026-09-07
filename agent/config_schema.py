@@ -628,7 +628,8 @@ def normalize(raw, defaults=None, source=""):
         endpoint_hosts = {urlparse(item["endpoint"]).hostname
                           for item in dns["candidates"]}
         transports = {item["transport"] for item in dns["candidates"]}
-        readiness_ok = bool(dns["canary_evidence_id"] and dns["rollback_drill_passed"]
+        readiness_ok = bool(dns["active_probes"]
+                            and dns["canary_evidence_id"] and dns["rollback_drill_passed"]
                             and dns["firewall_drill_evidence_id"]
                             and dns["clock_evidence_id"]
                             and dns["resource_slo_evidence_id"]

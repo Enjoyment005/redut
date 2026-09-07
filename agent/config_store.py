@@ -50,9 +50,9 @@ def _runtime_lock_path(config_path):
     raise OSError("не удалось создать runtime-каталог lock: %s" % last_error)
 
 
-def _path(cfg):
+def _path(cfg, must_exist=True):
     path = str((cfg or {}).get("_source") or "").strip()
-    if not path or not os.path.isfile(path):
+    if not path or (must_exist and not os.path.isfile(path)):
         raise OSError("runtime config.json не найден: %s" % (path or "путь не задан"))
     return path
 
@@ -102,21 +102,21 @@ def read(cfg):
 
 
 @contextlib.contextmanager
-def writer(cfg):
+def writer(cfg, create=False):
     """Единая межпроцессная критическая секция для intent -> config -> CAS."""
-    path = _path(cfg)
+    path = _path(cfg, must_exist=not create)
     with _LOCK, _file_lock(path):
         yield
 
 
-def update(cfg, mutator, mode=0o644, _locked=False):
+def update(cfg, mutator, mode=0o644, _locked=False, create=False):
     """Атомарно применить mutator(data) и вернуть новый дисковый объект."""
-    path = _path(cfg)
+    path = _path(cfg, must_exist=not create)
     directory = os.path.dirname(os.path.abspath(path))
     tmp = None
-    lock = contextlib.nullcontext() if _locked else writer(cfg)
+    lock = contextlib.nullcontext() if _locked else writer(cfg, create=create)
     with lock:
-        data = read(cfg)
+        data = {} if create and not os.path.isfile(path) else read(cfg)
         changed = mutator(data)
         if changed is not None:
             data = changed
@@ -156,6 +156,18 @@ def save_country_strategy(cfg, name, _locked=False):
         data.setdefault("countries", {})["strategy"] = name
     data = update(cfg, mutate, _locked=_locked)
     cfg.setdefault("countries", {})["strategy"] = name
+    return data
+
+
+def save_update_auto(cfg, enabled, _locked=False):
+    """Сохранить update.auto, не перетирая параллельные изменения config.json."""
+    enabled = bool(enabled)
+
+    def mutate(data):
+        data.setdefault("update", {})["auto"] = enabled
+
+    data = update(cfg, mutate, _locked=_locked)
+    cfg.setdefault("update", {})["auto"] = enabled
     return data
 
 

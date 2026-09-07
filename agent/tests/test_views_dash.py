@@ -23,6 +23,12 @@ class TestMetricsMarkup(unittest.TestCase):
         self.assertIn("esc(JSON.stringify({fault_recovery:f,learning:l,quality:q}", html)
         self.assertIn("metrics:{def:1,load:()=>loadMetrics()}", html)
 
+    def test_money_request_is_replaced_only_on_terminal_server_signal(self):
+        html = views._DASH_HTML
+        self.assertIn("Object.assign(err,j)", html)
+        self.assertGreaterEqual(
+            html.count("if(e.replace_request)moneyRequestDone(req)"), 2)
+
 
 class TestHelpDetailsVisibleWithoutEx(unittest.TestCase):
     def test_css_exception_present_and_after_hider(self):
@@ -130,6 +136,14 @@ class TestVitalsMarkup(unittest.TestCase):
         self.assertIn('id="crec"', html)
         self.assertIn("function clientRec", html)
         self.assertIn("рекомендуется не более", html)
+
+    def test_legacy_client_warning_keeps_revoke_available(self):
+        html = views._DASH_HTML
+        self.assertIn("c.unsupported", html)
+        self.assertIn("c.unsupported_reason", html)
+        self.assertIn("отзыв по ключу доступен", html)
+        self.assertIn("()=>delClient(c.name,c.pubkey)", html)
+        self.assertIn("JSON.stringify({pubkey:pubkey})", html)
 
 
 class TestToolbarCompact(unittest.TestCase):

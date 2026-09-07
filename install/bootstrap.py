@@ -20,6 +20,8 @@
 import argparse
 import os
 import re
+import secrets
+import stat
 import sys
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -31,6 +33,7 @@ REMOTE = "/opt/vpn-install"
 
 sys.path.insert(0, HERE)
 import profiles  # noqa: E402
+from base_manifest import remote_check_command, remote_dns_preflight_command  # noqa: E402
 
 try:
     import paramiko
@@ -62,6 +65,23 @@ def run(c, cmd, t=120):
     return (o.read().decode("utf-8", "replace") + e.read().decode("utf-8", "replace")).strip()
 
 
+def run_result(c, cmd, t=120):
+    """Return remote rc and combined output for fail-closed contract checks."""
+    _, stdout, stderr = c.exec_command(cmd, timeout=t)
+    output = (stdout.read().decode("utf-8", "replace")
+              + stderr.read().decode("utf-8", "replace")).strip()
+    return stdout.channel.recv_exit_status(), output
+
+
+def remote_dns_preflight(c):
+    """Reject an unsafe installed generation before touching staging files."""
+    rc, output = run_result(c, remote_dns_preflight_command(), t=30)
+    if rc != 0 or output.strip().splitlines()[-1:] != ["REDUT_DNS_PREFLIGHT_OK"]:
+        raise SystemExit("удалённый DNS Rescue preflight не подтверждён: %s"
+                         % (output or "rc=%s" % rc))
+    return True
+
+
 def run_stream(c, cmd, t=1800, prefix="    "):
     """Выполнить и стримить вывод построчно. Возвращает (rc, полный_вывод)."""
     _, stdout, _ = c.exec_command(cmd + " 2>&1", timeout=t, get_pty=False)
@@ -87,6 +107,55 @@ def sftp_write_text(sftp, content, remote_path, mode=0o644):
     with sftp.open(remote_path, "w") as f:
         f.write(content.replace("\r\n", "\n"))
     sftp.chmod(remote_path, mode)
+
+
+def _remove_own_secret_staging(sftp, path):
+    """Remove only a proven root-owned private regular staging file."""
+    try:
+        attrs = sftp.lstat(path)
+        if (stat.S_ISREG(attrs.st_mode)
+                and stat.S_IMODE(attrs.st_mode) == 0o600
+                and getattr(attrs, "st_uid", None) == 0):
+            sftp.remove(path)
+    except Exception:
+        pass
+
+
+def _write_secret_staging(sftp, path, content):
+    """Create and prove 0600 on our handle before the first secret byte."""
+    target = None
+    try:
+        target = sftp.open(path, "wx")
+        target.chmod(0o600)
+        attrs = target.stat()
+        if (not stat.S_ISREG(attrs.st_mode)
+                or stat.S_IMODE(attrs.st_mode) != 0o600
+                or getattr(attrs, "st_uid", None) != 0):
+            raise OSError("bootstrap secret staging has unsafe type, owner or mode")
+        target.write(content.replace("\r\n", "\n"))
+        target.flush()
+    except Exception:
+        if target is not None:
+            try:
+                target.close()
+            except Exception:
+                pass
+        _remove_own_secret_staging(sftp, path)
+        raise
+    else:
+        target.close()
+
+
+def render_params_preview(p, net):
+    """Return the params structure without putting credentials in logs."""
+    hidden = {"UP_PASS", "MICROSOCKS_PASS"}
+    lines = []
+    for line in profiles.render_params(p, net).splitlines():
+        key, separator, _value = line.partition("=")
+        if separator and key in hidden:
+            line = "%s='<redacted>'" % key
+        lines.append(line)
+    return "\n".join(lines) + "\n"
 
 
 # ─────────────────────────── параметры / профиль ─────────────────────────
@@ -139,7 +208,15 @@ def detect_net(c, p, args):
 # ─────────────────────────── заливка + install.sh ────────────────────────
 def upload(c, p, net):
     sftp = c.open_sftp()
-    run(c, "mkdir -p %s/templates %s/clients" % (REMOTE, REMOTE))
+    rc, output = run_result(
+        c,
+        "umask 077; mkdir -p {0}/templates {0}/clients && chmod 700 {0} && "
+        "test \"$(stat -c '%a:%U:%F' {0})\" = '700:root:directory' && "
+        "echo REDUT_BOOTSTRAP_DIR_OK".format(REMOTE))
+    if rc != 0 or output.strip().splitlines()[-1:] != ["REDUT_BOOTSTRAP_DIR_OK"]:
+        sftp.close()
+        raise SystemExit("private bootstrap staging directory не подтверждён: %s"
+                         % (output or "rc=%s" % rc))
     n = 0
     for root, _, files in os.walk(TPL_DIR):
         rel = os.path.relpath(root, TPL_DIR)
@@ -151,9 +228,27 @@ def upload(c, p, net):
             sftp_put_text(sftp, lp, "%s/templates/%s" % (REMOTE, sub), 0o644)
             n += 1
     sftp_put_text(sftp, os.path.join(HERE, "install.sh"), "%s/install.sh" % REMOTE, 0o755)
-    sftp_write_text(sftp, profiles.render_params(p, net), "%s/params.sh" % REMOTE, 0o600)
+    sftp_put_text(sftp, os.path.join(HERE, "base_manifest.py"),
+                  "%s/base_manifest.py" % REMOTE, 0o644)
+    params_path = "%s/params.sh" % REMOTE
+    params_stage = "%s/.params.sh.bootstrap-%s" % (REMOTE, secrets.token_hex(16))
+    try:
+        _write_secret_staging(sftp, params_stage, profiles.render_params(p, net))
+        # OpenSSH's atomic overwrite extension prevents a partially written
+        # params.sh from becoming visible on reconnect or process death.
+        sftp.posix_rename(params_stage, params_path)
+        attrs = sftp.lstat(params_path)
+        if (not stat.S_ISREG(attrs.st_mode)
+                or stat.S_IMODE(attrs.st_mode) != 0o600
+                or getattr(attrs, "st_uid", None) != 0):
+            raise OSError("installed params.sh has unsafe type, owner or mode")
+    except Exception:
+        _remove_own_secret_staging(sftp, params_stage)
+        sftp.close()
+        raise
     sftp.close()
-    print("  залито: %d шаблонов + install.sh + params.sh -> %s" % (n, REMOTE))
+    print("  залито: %d шаблонов + install.sh + base_manifest.py + params.sh -> %s"
+          % (n, REMOTE))
 
 
 def fetch_clients(c, p):
@@ -339,7 +434,7 @@ def main(argv=None):
         net = detect_net(c, p, a)
         c.close()
         print("  автоопределено: wan=%s gw=%s server_ip=%s" % (net["wan"], net["gw"], net["server_ip"]))
-        print("\n--- params.sh ---\n" + profiles.render_params(p, net))
+        print("\n--- params.sh (секреты скрыты) ---\n" + render_params_preview(p, net))
         print("[dry-run] ничего не залито/не изменено.")
         return 0
 
@@ -347,13 +442,27 @@ def main(argv=None):
     try:
         net = detect_net(c, p, a)
         print("  автоопределено: wan=%s gw=%s server_ip=%s" % (net["wan"], net["gw"], net["server_ip"]))
+        # Fast read-only admission before staging upload. install.sh repeats the
+        # same canonical check under /run/vpn-agent.lock immediately before
+        # its first live mutation, closing the race after this early check.
+        remote_dns_preflight(c)
+
+        if a.skip_base:
+            rc, output = run_result(c, remote_check_command())
+            if (rc != 0
+                    or output.strip().splitlines()[-1:] != ["REDUT_BASE_CONTRACT_OK"]):
+                raise SystemExit(
+                    "--skip-base запрещён: базовые watchdog/post/boot/cleanup "
+                    "не имеют актуального manifest; запусти без --skip-base")
 
         if not a.skip_base:
             print("\n=== ЗАЛИВКА + install.sh ===")
             upload(c, p, net)
             rc, _ = run_stream(c, "bash %s/install.sh" % REMOTE, t=1800)
             if rc != 0:
-                print("  ⚠️ install.sh завершился с кодом %d — смотри вывод выше." % rc)
+                raise SystemExit(
+                    "install.sh завершился с кодом %d; bootstrap остановлен до deploy/verify"
+                    % rc)
             saved = fetch_clients(c, p)
             for s in saved:
                 print("  клиентский конфиг: %s" % os.path.relpath(s, REPO))

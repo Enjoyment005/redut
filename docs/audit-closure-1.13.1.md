@@ -1,80 +1,63 @@
-# Redut 1.13.1 — закрытие аудита 1.13.0
+# Redut 1.13.2 — закрытие подтверждённых дефектов аудита 1.13.1
 
-Дата локального контроля: 2026-09-06  
-Исходный документ: `Redut_v1.13.0_audit_and_fix_plan.md`  
-Состояние публикации: локальная сборка, commit/tag/push не выполнялись.
+Дата локального контроля: 2026-09-07
+
+Исходный документ: `Redut_v1.13.1_audit_and_fix_plan.md`
+
+Ветка реализации: `fix/v1.13.1-audit-confirmed`
+
+Релиз: `v1.13.2`; production deploy не входит в эту публикацию.
 
 ## Метод
 
-Документ аудита использован как перечень проверяемых требований, а не как исполняемые
-инструкции. Каждый пункт сопоставлен с актуальным деревом 1.13.1. Уже реализованные
-инварианты проверены по коду и regression tests; подтверждённые остаточные дефекты исправлены.
+Документ аудита использован только как перечень требований и воспроизведений. Исправлялись
+лишь подтверждённые A01–A19. Работа велась малыми шагами: фокусный regression, изменение,
+повторный regression и независимая проверка другим агентом. После закрытия пунктов выполнен
+повторный сквозной аудит; найденные им остатки в A03/A04/A06/A08/A19 также получили
+исполняемые регрессии до итогового PASS.
 
-Обозначения:
+`CLOSED` ниже означает закрытие локального code/model воспроизведения. `LIVE GATE` честно
+оставляет физическую проверку Debian/systemd/kernel/provider до production rollout и
+включения automatic DNS.
 
-- `CLOSED` — код и локальные детерминированные тесты закрывают воспроизведение;
-- `CLOSED / LIVE GATE` — реализация fail-closed готова, но физическая Linux/WireGuard
-  приёмка остаётся обязательным условием включения automatic mode;
-- `NOT REPRODUCED IN 1.13.1` — дефект старого публичного commit уже отсутствовал в
-  текущем локальном дереве и подтверждён тестом.
+## Матрица A01–A19
 
-## Матрица F01–F31
+| ID | Статус | Закрытый инвариант и локальное доказательство |
+|---|---|---|
+| A01 | CLOSED / LIVE GATE | Старый updater передаёт именно своё locked open-file-description через pinned pidfd; все same-inode FD удерживаются до probe. `test_legacy_lock_handoff.py` проверяет multi-FD/death/PID-reuse ошибки. Реальные tagged 1.12.3/1.13.0 + Yama остаются live gate. |
+| A02 | CLOSED / LIVE GATE | DROP/ACL вынесены из `nat` в owned `filter` chains; активация и fail-open проверяют точные jumps/chains. Реальный iptables/WG dataplane остаётся live gate. |
+| A03 | CLOSED / LIVE GATE | Авторитетные DNS phase/unit и dataplane baseline читаются после общего lock перед первой mutation. Setup/install/bootstrap/deploy используют fail-closed preflight; missing/blank singleton и dangling symlink артефакты не считаются fresh. |
+| A04 | CLOSED / LIVE GATE | Reconcile перед detach сохраняет durable resume descriptor для принадлежащего активного поколения, включая временно неизвестный boot id; orphan по-прежнему не возобновляется. Реальная service/route drift проверка остаётся live gate. |
+| A05 | CLOSED / LIVE GATE | Primary recovery canary использует точный terminal bypass, поэтому пакет не возвращается в прежний GLOBAL REDIRECT. Модель проверяет UDP/TCP counters и cleanup; реальный WG peer остаётся live gate. |
+| A06 | CLOSED / LIVE GATE | rc=1 delete допускается только с точной zero-deleted сводкой; list доказывает отсутствие strict empty XML либо реальным для conntrack-tools 1.4.8 `rc0 + blank stdout + exact zero-shown stderr`. Blank/blank, malformed, permission и residual flow отклоняются. |
+| A07 | CLOSED / LIVE GATE | Boot всегда создаёт пустой `ru_whitelist_net` и прикрепляет owned RETURN rule; первый updater атомарно наполняет уже используемый set. Реальный reboot/iptables остаётся live gate. |
+| A08 | CLOSED / LIVE GATE | До `prepared` сохраняется проверяемый durable snapshot старого live set. Real-shell harness исполняет 8 forward boundaries, commit boundary, 5 повторных падений rollback, reboot wipe всех sets, ABSENT-old и create/swap/restart failures; recovery offline и идемпотентен. Power-loss/fsync на Debian остаётся live gate. |
+| A09 | CLOSED | Admin credential epoch входит в session contract. Reset пароля/TOTP/recovery атомарно меняет epoch, и старые cookies не проходят после перезапуска или login/reset interleaving. |
+| A10 | CLOSED / LIVE GATE | Buy/prolong получают stable request id и durable SQLite phases. `submitted` ambiguity блокирует новую трату до read-only reconciliation; точный replay не мутирует повторно. Отдельные процессы и automation jobs проверены; настоящая sandbox-покупка остаётся live gate. |
+| A11 | CLOSED | Config writes сравнивают owner revision/CAS; stale background snapshot не может вернуть отключённое владельцем auto-update. |
+| A12 | CLOSED | `active_probes=false` соблюдается на новом входе и failover: активные кандидатные probes не запускаются, readiness не подделывается. |
+| A13 | CLOSED | Единый base manifest охватывает watchdog/post/boot/cleanup; agent-only deploy запрещён поверх legacy payload без явного полного upgrade. |
+| A14 | CLOSED | Remote secret/config writer принимает успех только по проверенному marker; любой nonzero/empty/transport failure сохраняет ошибку и не сообщает успешный deploy. |
+| A15 | CLOSED | Inventory устройств отделён от readiness добавления: полная подсеть или legacy peer видимы, а кнопка add получает точную причину отказа. |
+| A16 | CLOSED | Авторизованные handlers сохраняют типизированные 400/411/413 body-reader ошибки; invalid/non-object JSON не превращается в 500. |
+| A17 | CLOSED / CI GATE | Публичная workflow запускает discovery из `agent` и real-shell regressions. Локально public discovery проходит; фактический GitHub Linux run обязателен до release. |
+| A18 | CLOSED / LIVE GATE | Setup ждёт обязательный lifecycle, проверяет boot после него и возвращает nonzero при любом обязательном failure; success больше не печатается заранее. Реальный systemd install остаётся live gate. |
+| A19 | CLOSED / LIVE GATE | Deploy и bootstrap создают exclusive handle, ставят/проверяют `root:0600` до первого секретного байта и атомарно публикуют; dry-run маскирует пароли. Observer-модели проходят; реальный OpenSSH SFTP остаётся live gate. |
 
-| ID | Статус | Что проверено или изменено | Основное доказательство |
-|---|---|---|---|
-| F01 | CLOSED | Redirect оставлен в `nat`; ACL/DROP и rate limits живут в `filter`. TCP имеет отдельный per-source packet rate, а не только SYN limiter. | `test_dns_runtime_failopen.py`: раздельные NAT/INPUT chains, отсутствие DROP в nat, UDP/TCP limits. |
-| F02 | CLOSED | `install/install.sh` — единственный установщик canonical watchdog. `setup.sh` и `deploy.py` больше не перетирают его `node/`/developer-копией. Обе исходные копии синхронизированы. Watchdog не делает `systemctl start/restart sing-box` и не пишет route. | `test_audit_hardening.TestStaticInstallerContracts`. |
-| F03 | CLOSED | `singbox-post.sh` не вызывает `rotate` синхронно во время `ExecStartPost`. Он ставит отдельный transient reconcile через `systemd-run --on-active=2s`; сетевые изменения затем выполняет агент под общим lock. | Static contract + `bash -n`. |
-| F04 | NOT REPRODUCED IN 1.13.1 | `_leave_direct` первым делом требует положительный normal-path verify. Ветка external outage/quorum-held удерживает текущий direct state без снятия маршрута. | `test_health_quorum.py`, `test_dns_rescue_state_contract.py`. |
-| F05 | CLOSED | SHA256 трёх файлов pinned commit исправлены и повторно вычислены по immutable raw content. | whitelist `dfa4…eb9`, IP `8a38…da0`, CIDR `149d…868`; live download/hash check. |
-| F06 | CLOSED | Валидатор проверяет длину DNS name/labels, ASCII LDH, дефисы, TLD и round-trip встроенного IDNA codec для `xn--` labels. Весь pinned набор: 910 доменов, один корректный A-label, 0 отклонённых. | Static regression + live pinned-set validation. |
-| F07 | CLOSED / LIVE GATE | SIGHUP/reload удалён. Forward и rollback выполняют полный `dnsmasq --test`, `systemctl restart`, `is-active` и требуют новый ненулевой MainPID. | `test_install_dns_safety.py`, `test_audit_hardening.py`; реальный domain→ipset запрос — стендовый gate. |
-| F08 | CLOSED | RU bundle использует один network writer lock, bounded download, candidate files/set, LKG, durable phase marker, fsync, exact old set hash и idempotent recovery. Ошибка любого обязательного rollback шага сохраняет marker. | `test_install_dns_safety.py` transaction/rollback ordering. |
-| F09 | CLOSED | Проверяется отсутствие каждого owned jump/chain, а не отрицание «обе ветки присутствуют». Redirect снимается до остановки backend; partial cleanup остаётся `recovering/cleanup_pending`. | `test_dns_runtime_failopen.py`, `test_dns_rescue.py`. |
-| F10 | CLOSED / LIVE GATE | Cutover очищает только scoped UDP/TCP DNS conntrack для WG DNS, без global flush. | Runtime tests на точный command scope; долгоживущие реальные UDP/TCP flows — стендовый gate. |
-| F11 | CLOSED | Lock берётся до reserve/journal/mutation; deferred caller не оставляет operation. State+operation связаны owner/generation, DB commits используют transaction/CAS-like generation checks. | DNS concurrency/state tests. |
-| F12 | CLOSED | Terminal operation и DNS state коммитятся одной DB transaction. Reconcile инвентаризует service/config/firewall даже без unfinished saga и компенсирует orphan runtime. | Crash-boundary и orphan recovery tests в `test_dns_rescue.py`. |
-| F13 | CLOSED | Единый admission под lock проверяет mode, owner flags, pause, incident reason/exhaustion, DNS evidence, WG/route proof, scope и active-probes policy. | Табличные pause/manual/automatic tests. |
-| F14 | CLOSED | В одной incident attempt используется bounded ordered candidate series с общим monotonic deadline; expired slots пропускаются, backend switch имеет отдельный бюджет. | Candidate failover/deadline tests. |
-| F15 | CLOSED | Attempt budget привязан к durable incident. Cleanup не возвращает бюджет того же incident; закрытие и новый incident дают новый budget. | Incident lifecycle tests в state contract/DNS suite. |
-| F16 | CLOSED | `_leave_direct`, manual emergency off и explicit apply используют DNS coordinator. Normal state не публикуется до DNS cleanup и normal-path proof; failure восстанавливает direct intent. | `test_dns_rescue_state_contract.py`. |
-| F17 | CLOSED / LIVE GATE | Отдельный systemd timer запускает bounded watchdog каждые 5 секунд независимо от hourly heartbeat. TTL/cleanup обслуживаются даже при pause; unknown timestamps fail closed. | Unit/timer static tests + watchdog state tests; wall-clock SLO — стендовый gate. |
-| F18 | CLOSED | Один monotonic deadline передаётся в commands/probes/start/cutover, ограничивается candidate `not_after` и перепроверяется перед commit; rollback имеет bounded cleanup state. | Virtual-clock and timeout tests. |
-| F19 | CLOSED / LIVE GATE | Listener допускает только точный wg0 bind. INPUT ACL покрывает high port и точный peer/all scope; unmanaged/wildcard bind rejected. Есть memory/tasks/fd limits. | Firewall/config tests; WAN/второй peer — стендовый gate. |
-| F20 | CLOSED / LIVE GATE | Evidence разделено на listener, upstream, rules и client path. Gate использует root-owned external runner с challenge, route generation, одноразовым QNAME, expected IPv4 и profile outcomes; проверяется рост redirect counters. | Runner/report/counter tests; настоящий peer/namespace — стендовый gate. |
-| F21 | CLOSED | Parser сверяет txid/QR/opcode/question, bounds, compression pointers, все RR sections, TC, A owner/address/TTL и trailing bytes. UDP socket connected к ожидаемому peer; TCP prefix/body читаются `read_exact` под общим deadline, включая split prefix. | DNS wire tests + `test_audit_hardening.TestDNSWireDeadline`. |
-| F22 | CLOSED / LIVE GATE | Unit объявляет `RuntimeDirectory` и `StateDirectory` с режимом 0700; отсутствующий `/run` больше не зависит от установщика. | Unit static test; cold reboot — стендовый gate. |
-| F23 | CLOSED | Первый посетитель по IP больше не может занять панель. Инсталлятор создаёт SSH-only bootstrap secret, хранит только SHA256 в root:0600, TTL 24 ч. Claim выдаёт одну setup-сессию на 30 мин; новый claim очищает незавершённое состояние и инвалидирует старый. Finish атомарно создаёт admin и гасит bootstrap. | `TestSetupOwnership`, installer reinstall test, обновлённый `/setup` UI. |
-| F24 | CLOSED | Recovery consume, provider-key writes, setup finish и CLI admin reset используют один adjacent file lock, повторное чтение после lock, unique 0600 temp, fsync и atomic replace. | 20 параллельных consume: ровно один `True`, код остаётся погашенным. |
-| F25 | CLOSED / LIVE GATE | Delete — durable desired/effective saga; success только после отсутствия pubkey в live `wg show`. Ошибка оставляет pending/retry и не удаляет доказательства. | `test_clients_safety.py`; трафик реального revoked peer — стендовый gate. |
-| F26 | CLOSED | Один network lock покрывает allocate→stage→apply→verify→commit. Проверяется точный один IPv4 `/32`, staging unique, forward/rollback marker recoverable. | Concurrent/add/delete/crash tests в `test_clients_safety.py`. |
-| F27 | CLOSED | Единственный bounded body reader: один Content-Length, no Transfer-Encoding, 400/411/413, exact read; 64 KiB общий лимит, 8 KiB login. HTTP workers=32, scrypt=4, systemd MemoryMax/TasksMax/LimitNOFILE. | `TestBoundedHTTPBody`, service static contract. |
-| F28 | CLOSED / LIVE GATE | Update baseline/verify сравнивает exact WG pubkeys+AllowedIPs, ip_forward, wg0, middleman default, policy rules, emergency intent, DNS phase/unit/dnsmasq и HTTPS. Active DNS generation блокирует update. | `TestUpdateDataPlane`, 74 update tests; version-pair/live client — release gate. |
-| F29 | CLOSED | Cleanup удаляет только старые root-owned Redut temp prefixes и атомарно ограничивает хвост двух собственных логов. `known_hosts`, journald, login/package history, dmesg, failed units, чужие `/tmp`/`/opt` не меняются. | Updated cleanup collector + static forbidden-pattern test. |
-| F30 | CLOSED | Decision JSON ограничен 64 KiB, depth 32, nodes 4096, object root, finite scalars. Invalid history проецируется `decision=null`, `decision_invalid=true`. | Deep/oversized/non-object/NaN tests. |
-| F31 | CLOSED | В server остались один DNS import, один GET handler, один POST handler и одно чтение status. | Static duplicate-count test + panel API tests. |
+## Локальный контроль
 
-## Контрольные результаты
+- полный public suite: **1107 tests, OK (skipped=2)**; на Windows пропущены только
+  Linux-only реальные `flock` process gate и `pidfd_getfd` handoff;
+- независимые фокусные проверки A01–A19 и финальный сквозной аудит: PASS;
+- `py_compile`/`compileall`, JSON parse, `bash -n`, `git diff --check`: PASS;
+- real-shell RU crash/recovery matrix: 6 methods, все boundary/failure subcases — PASS;
+- production deploy и внешние денежные операции не выполнялись.
 
-- canonical tree `python -m unittest discover -s tests -p 'test_*.py'`:
-  **993 tests, OK**;
-- allowlisted public tree `python -m unittest discover -s agent/tests -p 'test_*.py'`:
-  **993 tests, OK**;
-- `python -m py_compile`: изменённые Python-модули — OK;
-- public `compileall`, все 9 JSON и `bash -n` для setup/install/watchdog/post hook,
-  RU updater и cleanup — OK;
-- public build secret scan: запрещённых паттернов и GitHub PAT — 0;
-- `release.py --check`: код, origin, версия, публичная сборка, документация, оба дерева
-  тестов и diff — OK; публикация намеренно остановлена единственным честным gate:
-  отсутствует указанная обкатка на реальном стенде;
-- immutable RU input check: все 3 SHA256 совпали;
-- полный набор RU domains: 910 unique, 1 punycode A-label, 0 invalid;
-- RU IPv4 collapse: 30 222 networks, coverage 36 265 984, envelope — OK.
+## Стоп-гейты перед production и включением automatic DNS
 
-## Что намеренно не объявлено проверенным локально
-
-Windows-разработка не доказывает физическое поведение Debian/systemd/kernel. До включения
-`automatic_last_resort` на реальном узле обязательны: reboot, kill каждой saga phase,
-WireGuard test peer и второй peer, UDP/TCP conntrack cutover, WAN-deny high port, реальный
-domain→ipset после dnsmasq restart, update 1.12.3↔1.13.1 и resource/load SLO. Эти проверки
-не заменены предположением: config gate остаётся закрытым без свежих evidence id и сроков.
+Нужен отдельный Debian 13 x86_64 стенд: tagged updater 1.12.3 и 1.13.0 с реальным
+cron/systemd/Yama/pidfd; kill/contender/rollback/manual retry; reboot и power-loss на RU
+транзакциях; настоящий iptables/conntrack/WireGuard peer для A02/A04–A08; browser E2E
+reset-session; OpenSSH SFTP observer; sandbox buy/prolong с provider reconciliation; зелёная
+GitHub Linux workflow. Публикация исходного кода не заменяет эти доказательства: до них
+automatic DNS mode и production rollout остаются закрыты.

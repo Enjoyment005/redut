@@ -70,7 +70,7 @@ class ProxyLine(Provider):
         b = self._api("/balance/") or {}
         return {"balance": b.get("balance"), "currency": "USD", "partner": b.get("partner_balance")}
 
-    def prolong(self, ids, period):
+    def prolong(self, ids, period, on_submit=None):
         """Продление: POST /api/renew/ {proxies, period} (form-encoded, §2.1).
 
         ids -> список внутренних id (только числовые, валидация ДО API §15);
@@ -85,6 +85,8 @@ class ProxyLine(Provider):
         if not (1 <= period <= 365):
             raise ProviderError("ProxyLine.prolong: period=%d вне 1..365 дней" % period)
         def renew():
+            if on_submit is not None:
+                on_submit()
             return http_post_form(
                 API_BASE + "/renew/", {"proxies": proxies, "period": period},
                 headers={"API-KEY": self.api_key}, host_label=HOST_LABEL,

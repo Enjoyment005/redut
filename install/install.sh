@@ -45,6 +45,29 @@ fi
 flock -n "$LOCK_FD" || die "общий lock установки не подтверждён"
 export REDUT_LOCK_HELD=1 REDUT_LOCK_FD="$LOCK_FD"
 
+# Every direct/repeat/bootstrap path reaches this authoritative admission under
+# the same node-wide lock, not only setup.sh UPDATE=1.  A fast bootstrap/deploy
+# check may run earlier, but only this position closes the check-to-mutation
+# race.  Fresh hosts without Python are allowed only when no Redut state/unit
+# exists; existing or unreadable state fails closed before apt/sysctl/files.
+DNS_LOAD_STATE="$(systemctl show redut-dns-rescue -p LoadState --value 2>/dev/null || true)"
+DNS_PREFLIGHT_REQUIRED=0
+if [ "$DNS_LOAD_STATE" != "not-found" ] \
+        || [ -e /etc/vpn-panel/config.json ] || [ -L /etc/vpn-panel/config.json ] \
+        || [ -e /opt/vpn-panel/VERSION ] || [ -L /opt/vpn-panel/VERSION ] \
+        || [ -e /var/lib/vpn-panel/state.db ] || [ -L /var/lib/vpn-panel/state.db ]; then
+    DNS_PREFLIGHT_REQUIRED=1
+fi
+if [ "$DNS_PREFLIGHT_REQUIRED" = "1" ]; then
+    command -v python3 >/dev/null 2>&1 \
+        || die "установленное состояние Редута требует python3 для DNS preflight"
+    [ -r "$HERE/base_manifest.py" ] \
+        || die "нет canonical DNS preflight helper ($HERE/base_manifest.py)"
+    python3 "$HERE/base_manifest.py" --dns-preflight \
+        || die "DNS Rescue preflight не подтверждён; установка не начата"
+fi
+unset DNS_LOAD_STATE DNS_PREFLIGHT_REQUIRED
+
 # Копия текстового шаблона со снятием CR (репозиторий на Windows может быть в CRLF).
 put_tpl(){ # src dst mode
     sed 's/\r$//' "$1" > "$2" || die "не скопировать $1 -> $2"
@@ -301,6 +324,7 @@ put_tpl "$TPL/server_cleanup.sh"    /usr/local/bin/server_cleanup.sh          07
 log "7/12 vpn-boot-setup.sh (§11 RETURN + wg0 fallback)"
 cat > /usr/local/bin/vpn-boot-setup.sh <<BOOT
 #!/bin/bash
+# REDUT_BASE_CONTRACT=2
 set -euo pipefail
 # VPN boot setup — subnet $SUBNET, upstream $UP_HOST_EFF (сгенерирован install.sh).
 # Идемпотентно, переживает ребут. §11: RETURN для трафика ВНУТРИ VPN и К самому серверу
@@ -324,17 +348,25 @@ else
 fi
 export REDUT_LOCK_HELD=1 REDUT_LOCK_FD="\$LOCK_FD"
 
+# Finish an interrupted allowlist transaction before restoring kernel state.
+# Recovery is local-only and shares this already verified writer lock.
+if [ -f /var/lib/vpn-panel/ru-whitelist-update.pending ]; then
+    REDUT_PARENT_LOCK_FD="\$LOCK_FD" \
+        /usr/local/bin/update-ru-whitelist.sh --recover-only
+fi
+
 # 0) фолбэк — поднять wg0, если systemd не поднял его на буте (случалось на живом узле)
 if ! ip link show wg0 >/dev/null 2>&1; then
     systemctl start wg-quick@wg0 2>/dev/null || wg-quick up wg0 2>/dev/null || true
 fi
 
 ipset create ru_whitelist hash:ip timeout 7200 2>/dev/null || true
+ipset create ru_whitelist_net hash:net family inet hashsize 16384 maxelem 1000000 2>/dev/null || true
 # Статический белый список сетей РФ (IP/CIDR из GitHub). Файл пишет update-ru-whitelist.sh;
-# на ребуте восстанавливаем набор из него, без обращения к сети. Нет файла (напр. dnsmasq
-# выключен) -> блок пропускается, правило ниже не навешивается.
+# на ребуте восстанавливаем набор из него, без обращения к сети. Если файла ещё нет,
+# набор остаётся пустым, но owned RETURN rule ниже уже прикреплён и будет атомарно
+# наполнен первым успешным обновлением allowlist.
 if [ -f /etc/ru_whitelist_net.ipset ]; then
-    ipset create ru_whitelist_net hash:net family inet hashsize 16384 maxelem 1000000 2>/dev/null || true
     ipset flush ru_whitelist_net 2>/dev/null || true
     grep '^add ' /etc/ru_whitelist_net.ipset | sed 's/^add [^ ]* /add ru_whitelist_net /' | ipset restore -! 2>/dev/null || true
 fi
@@ -346,9 +378,7 @@ iptables -t mangle -F REDUT_PREROUTING
 iptables -t mangle -C PREROUTING -s $SUBNET -j REDUT_PREROUTING 2>/dev/null || \
     iptables -t mangle -I PREROUTING 1 -s $SUBNET -j REDUT_PREROUTING
 iptables -t mangle -A REDUT_PREROUTING -s $SUBNET -m set --match-set ru_whitelist dst -j RETURN
-if ipset list -n ru_whitelist_net >/dev/null 2>&1; then
-    iptables -t mangle -A REDUT_PREROUTING -s $SUBNET -m set --match-set ru_whitelist_net dst -j RETURN
-fi
+iptables -t mangle -A REDUT_PREROUTING -s $SUBNET -m set --match-set ru_whitelist_net dst -j RETURN
 iptables -t mangle -A REDUT_PREROUTING -s $SUBNET -d $SUBNET -j RETURN
 iptables -t mangle -A REDUT_PREROUTING -s $SUBNET -d $SERVER_IP/32 -j RETURN
 iptables -t mangle -A REDUT_PREROUTING -s $SUBNET -j MARK --set-mark 0x64
@@ -482,7 +512,9 @@ else
 fi
 systemctl restart microsocks || true
 systemctl restart sing-box; sleep 3
-bash /usr/local/bin/vpn-boot-setup.sh || true
+if ! bash /usr/local/bin/vpn-boot-setup.sh; then
+    die "vpn-boot-setup.sh не применил обязательные firewall/route правила"
+fi
 # Do not synchronously start the unit while this installer still owns the
 # common flock: the direct run above already reconciled the host, and systemd
 # would otherwise wait on our own lock. The enabled unit starts on next boot.
@@ -517,9 +549,10 @@ log "11/12 cron (watchdog */2; cleanup 0 */3 = $CLEANUP; whitelist 0 3 * * 0 п�
 # ── 12. Verify базы ──────────────────────────────────────────────────────
 log "12/12 verify"
 echo "  sing-box: $(/usr/local/bin/sing-box version 2>/dev/null | awk '/version/{print $NF; exit}')"
-for s in wg-quick@wg0 sing-box microsocks vpn-boot-setup; do
+for s in wg-quick@wg0 sing-box microsocks; do
     echo "  $s: $(systemctl is-active $s 2>/dev/null)"
 done
+echo "  vpn-boot-setup: direct reconcile OK; unit starts after coordinator lock release"
 echo "  tun0 carrier: $(cat /sys/class/net/tun0/carrier 2>/dev/null || echo none)"
 echo "  wg peers: $(wg show wg0 peers 2>/dev/null | wc -l)"
 echo "  middleman: $(ip route show table middleman 2>/dev/null | tr '\n' ';')"

@@ -326,6 +326,10 @@ class StateContractCase(unittest.TestCase):
         with mock.patch.object(states, "_prepare_dns_emergency_exit",
                                return_value={"ok": True}), \
              mock.patch.object(states, "emergency_off", return_value=True), \
+             mock.patch.object(states.apply_mod, "verify_egress",
+                               return_value={"ok": True,
+                                             "egress_ip": "198.51.100.9",
+                                             "exit_cc": "FI"}), \
              mock.patch.object(self.pool, "log_event",
                                side_effect=RuntimeError("crash-after-commit")):
             with self.assertRaises(RuntimeError):

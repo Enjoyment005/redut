@@ -48,6 +48,13 @@ PANEL_PORT="${PANEL_PORT:-8443}"
 SUBNET="${SUBNET:-10.8.0.0/24}"
 CLIENTS="${CLIENTS:-phone1}"
 WORKDIR="/opt/redut-src"
+SOURCE_CANDIDATE=""
+cleanup_source_candidate(){
+    if [ -n "$SOURCE_CANDIDATE" ] && [ -d "$SOURCE_CANDIDATE" ]; then
+        rm -rf -- "$SOURCE_CANDIDATE"
+    fi
+}
+trap cleanup_source_candidate EXIT
 
 say()  { printf '\n\033[1;36m▸ %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[1;32m✔\033[0m %s\n' "$*"; }
@@ -65,7 +72,8 @@ die()  { printf '\n\033[1;31m✖ %s\033[0m\n' "$*" >&2; exit 1; }
 # Узел уже установлен, а параметры установки не заданы? Голый повторный прогон
 # переустановил бы его ДЕФОЛТАМИ (NAME=node1, SUBNET=10.8.0.0/24, CLIENTS=phone1) —
 # включаем режим обновления сами (ревью 17.08). Отключить: явно UPDATE=0.
-if [ -z "$_UPDATE_SET" ] && [ -f /etc/vpn-panel/config.json ] \
+if [ -z "$_UPDATE_SET" ] \
+   && { [ -e /etc/vpn-panel/config.json ] || [ -L /etc/vpn-panel/config.json ]; } \
    && [ -z "$_NAME_SET$_SUBNET_SET$_CLIENTS_SET" ]; then
     UPDATE=1
     printf '  \033[1;33m!\033[0m узел уже установлен, а NAME/SUBNET/CLIENTS не заданы — включаю режим обновления (UPDATE=1)\n'
@@ -142,6 +150,123 @@ command -v systemctl >/dev/null || die "нет systemd"
 ip route show default | grep -q . || die "нет маршрута по умолчанию — сервер без сети?"
 ok "root, systemd, сеть на месте"
 
+# Acquire the node-wide writer lock before the first possible system mutation
+# (including dependency installation). UPDATE admission also proves the real
+# durable DNS phase and unit LoadState here, before downloading or installing.
+LOCK_FD="${REDUT_LOCK_FD:-}"
+if [ "${REDUT_LOCK_HELD:-0}" != "1" ] \
+        || [[ ! "$LOCK_FD" =~ ^[0-9]+$ ]] \
+        || [ "$(readlink "/proc/$$/fd/$LOCK_FD" 2>/dev/null || true)" != "/run/vpn-agent.lock" ]; then
+    # Incoming 1.12.3/1.13.0 updater owns the correct kernel flock but did not
+    # pass its fd.  Replace this shell with a verified pidfd_getfd bridge; the
+    # copied open-file description keeps the lock continuous across parent kill.
+    if [ "$UPDATE" = "1" ] && [ -z "${REDUT_LOCK_HANDOFF:-}" ] \
+            && [ -r "/proc/$PPID/fd" ]; then
+        for parent_fd in /proc/$PPID/fd/*; do
+            if [ "$(readlink "$parent_fd" 2>/dev/null || true)" = "/run/vpn-agent.lock" ]; then
+                handoff="$(cd "$(dirname "$0")" && pwd)/install/legacy_lock_handoff.py"
+                [ -f "$handoff" ] || die "нет проверяемого legacy lock handoff helper"
+                exec python3 "$handoff" --owner "$PPID" --lock /run/vpn-agent.lock \
+                    --script "$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" -- "$@"
+                die "legacy lock handoff не запустился"
+            fi
+        done
+    fi
+    exec 8>/run/vpn-agent.lock
+    flock -n 8 || die "vpn-agent занят; установка отложена"
+    LOCK_FD=8
+fi
+flock -n "$LOCK_FD" || die "общий lock установки не подтверждён"
+export REDUT_LOCK_HELD=1 REDUT_LOCK_FD="$LOCK_FD"
+# Every direct path, including an explicit UPDATE=0 reinstall, must repeat the
+# DNS admission under the node-wide lock. A truly fresh host may not have
+# Python yet; any unit/artifact (including a dangling symlink) requires the
+# complete fail-closed reader before the first apt/file mutation.
+DNS_LOAD_STATE="$(systemctl show redut-dns-rescue -p LoadState --value 2>/dev/null || true)"
+DNS_PREFLIGHT_REQUIRED=0
+if [ "$DNS_LOAD_STATE" != "not-found" ] \
+        || [ -e /etc/vpn-panel/config.json ] || [ -L /etc/vpn-panel/config.json ] \
+        || [ -e /opt/vpn-panel/VERSION ] || [ -L /opt/vpn-panel/VERSION ] \
+        || [ -e /var/lib/vpn-panel/state.db ] || [ -L /var/lib/vpn-panel/state.db ]; then
+    DNS_PREFLIGHT_REQUIRED=1
+fi
+if [ "$DNS_PREFLIGHT_REQUIRED" = "1" ]; then
+    command -v python3 >/dev/null 2>&1 \
+        || die "установленное состояние Редута требует python3 для DNS preflight"
+    python3 - <<'PY' || die "DNS Rescue preflight не подтверждён; установка не начата"
+import json, os, sqlite3, subprocess, sys
+
+config_path = "/etc/vpn-panel/config.json"
+default_db = "/var/lib/vpn-panel/state.db"
+installed = os.path.lexists("/opt/vpn-panel/VERSION")
+config_exists = os.path.lexists(config_path)
+if config_exists:
+    try:
+        with open(config_path, encoding="utf-8") as source:
+            config = json.load(source)
+    except Exception as error:
+        sys.exit("installed config is unreadable: %s" % type(error).__name__)
+    db = config.get("db") or default_db
+    if not isinstance(db, str) or not os.path.isabs(db):
+        sys.exit("installed config has invalid DNS database path")
+else:
+    if installed:
+        sys.exit("installed node has no readable config")
+    db = default_db
+probe = subprocess.run(
+    ["systemctl", "is-active", "redut-dns-rescue"], capture_output=True,
+    text=True, timeout=10)
+raw = (probe.stdout or probe.stderr or "").strip().splitlines()[-1:] or [""]
+load_probe = subprocess.run(
+    ["systemctl", "show", "redut-dns-rescue", "-p", "LoadState", "--value"],
+    capture_output=True, text=True, timeout=10)
+load = load_probe.stdout.strip()
+if load == "not-found":
+    state = "not-found"
+elif load == "loaded" and raw[0] in ("active", "inactive", "failed",
+                                      "activating", "deactivating"):
+    state = raw[0]
+else:
+    sys.exit("DNS Rescue unit state is unreadable")
+if state not in ("inactive", "failed", "not-found"):
+    sys.exit("DNS Rescue unit is active or transitional: %s" % state)
+if not config_exists and state != "not-found":
+    sys.exit("loaded DNS unit has no readable config")
+if os.path.lexists(db) and not os.path.isfile(db):
+    sys.exit("DNS state database exists but is not a readable regular file")
+if not os.path.isfile(db):
+    if state != "not-found":
+        sys.exit("installed DNS unit has no readable state database")
+    phase = "idle"
+else:
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=2.0)
+        try:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='dns_rescue_state'").fetchone()
+            if not exists:
+                if state != "not-found":
+                    sys.exit("DNS Rescue state table is missing for an installed unit")
+                phase = "idle"
+            else:
+                row = conn.execute(
+                    "SELECT phase FROM dns_rescue_state WHERE singleton=1").fetchone()
+                if not row or not isinstance(row[0], str) or not row[0].strip():
+                    sys.exit("DNS Rescue state singleton/phase is missing")
+                phase = row[0]
+        finally:
+            conn.close()
+    except SystemExit:
+        raise
+    except Exception as error:
+        sys.exit("DNS state database is unreadable: %s" % type(error).__name__)
+if phase != "idle":
+    sys.exit("DNS Rescue generation is not idle (phase=%s unit=%s)" % (phase, state))
+PY
+fi
+unset DNS_LOAD_STATE DNS_PREFLIGHT_REQUIRED
+
 # ── 1. Минимальные зависимости для самой установки ──────────────────────────
 say "Ставлю curl/tar/python3 (если их нет)"
 export DEBIAN_FRONTEND=noninteractive
@@ -167,7 +292,9 @@ if [ -n "$SRC_DIR" ]; then
     WORKDIR="$SRC_DIR"
 else
     say "Скачиваю Редут ($REPO, ветка $BRANCH)"
-    rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"
+    SOURCE_CANDIDATE="/opt/redut-src.setup-candidate.$$"
+    rm -rf -- "$SOURCE_CANDIDATE"; mkdir -p "$SOURCE_CANDIDATE"
+    WORKDIR="$SOURCE_CANDIDATE"
     url="https://codeload.github.com/${REPO}/tar.gz/refs/heads/${BRANCH}"
     if ! curl -fsSL "$url" | tar -xz -C "$WORKDIR" --strip-components=1; then
         die "не скачался $url — проверь имя репозитория (REPO=владелец/имя) и ветку"
@@ -245,21 +372,23 @@ ok "параметры готовы"
 
 # ── 4. База: WireGuard, sing-box, маршруты, самолечение ─────────────────────
 say "Ставлю базу узла (это самый долгий шаг, пара минут)"
-# From the first live mutation through panel installation, setup owns the same
-# open lock description as install.sh, the RU updater and setup_panel.py. This
-# closes the former watchdog replacement gap between two separately locked
-# children. An inherited claim is accepted only with the exact proven fd.
-LOCK_FD="${REDUT_LOCK_FD:-}"
-if [ "${REDUT_LOCK_HELD:-0}" != "1" ] \
-        || [[ ! "$LOCK_FD" =~ ^[0-9]+$ ]] \
-        || [ "$(readlink "/proc/$$/fd/$LOCK_FD" 2>/dev/null || true)" != "/run/vpn-agent.lock" ]; then
-    exec 8>/run/vpn-agent.lock
-    flock -n 8 || die "vpn-agent занят; установка отложена"
-    LOCK_FD=8
+if [ "$UPDATE" = "1" ]; then
+    # The download/source-selection phase happened before this lock. Re-read
+    # the durable DNS generation and unit state now, immediately before the
+    # first live mutation; unreadable state is not equivalent to idle.
+    python3 - "$WORKDIR/agent" "$CFG_LIVE" <<'PY' \
+        || die "DNS Rescue preflight не подтверждён; установка не начата"
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import update
+with open(sys.argv[2], encoding="utf-8") as source:
+    cfg = json.load(source)
+ok, why = update.dns_update_preflight(cfg)
+if not ok:
+    sys.stderr.write((why or "DNS Rescue state is unsafe") + "\n")
+    raise SystemExit(1)
+PY
 fi
-flock -n "$LOCK_FD" || die "общий lock установки не подтверждён"
-export REDUT_LOCK_HELD=1
-export REDUT_LOCK_FD="$LOCK_FD"
 bash "$WORKDIR/install/install.sh" 2>&1 | sed 's/^/  /'
 
 # install/install.sh is the single canonical watchdog installer.  Do not
@@ -307,13 +436,44 @@ if [ -z "$UP_NOW" ]; then
     fi
 fi
 
+# Queue the RemainAfterExit unit, but never wait for its flock while this
+# coordinator (or its updater parent) still owns the same open lock.  The
+# mandatory direct reconcile in install.sh already proved this installation;
+# the queued unit establishes normal systemd lifecycle after lock release.
+BOOT_UNIT_QUEUED=0
+if systemctl reset-failed vpn-boot-setup >/dev/null 2>&1 \
+        && systemctl start --no-block vpn-boot-setup >/dev/null 2>&1; then
+    BOOT_UNIT_QUEUED=1
+fi
+
 # ── 6. Проверка ─────────────────────────────────────────────────────────────
 say "Проверяю, что всё поднялось"
 fail=0
-for s in wg-quick@wg0 sing-box vpn-boot-setup vpn-panel; do
+for s in wg-quick@wg0 sing-box vpn-panel; do
     st="$(systemctl is-active "$s" 2>/dev/null || true)"
     if [ "$st" = "active" ]; then ok "$s"; else printf '  \033[1;31m✖\033[0m %s: %s\n' "$s" "$st"; fail=1; fi
 done
+boot_st="$(systemctl is-active vpn-boot-setup 2>/dev/null || true)"
+if [ "$boot_st" = "active" ]; then
+    ok "vpn-boot-setup"
+elif [ "$BOOT_UNIT_QUEUED" = "1" ] && { [ "$boot_st" = "activating" ] || [ "$boot_st" = "inactive" ]; }; then
+    printf '  \033[1;32m✔\033[0m vpn-boot-setup: %s, queued after coordinator lock\n' "$boot_st"
+else
+    printf '  \033[1;31m✖\033[0m vpn-boot-setup lifecycle: %s (queue=%s)\n' "$boot_st" "$BOOT_UNIT_QUEUED"
+    fail=1
+fi
+if [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || true)" != "1" ]; then
+    printf '  \033[1;31m✖\033[0m boot invariant: net.ipv4.ip_forward != 1\n'; fail=1
+fi
+if ! ip route show table middleman 2>/dev/null | grep -q '^default '; then
+    printf '  \033[1;31m✖\033[0m boot invariant: в table middleman нет default route\n'; fail=1
+fi
+if ! ip rule show 2>/dev/null | grep -Eq 'fwmark (0x)?64 .*lookup middleman'; then
+    printf '  \033[1;31m✖\033[0m boot invariant: нет fwmark 0x64 lookup middleman\n'; fail=1
+fi
+if ! iptables -t mangle -C PREROUTING -s "$SUBNET" -j REDUT_PREROUTING 2>/dev/null; then
+    printf '  \033[1;31m✖\033[0m boot invariant: нет PREROUTING -> REDUT_PREROUTING для %s\n' "$SUBNET"; fail=1
+fi
 hz="$(curl -sk --max-time 10 "https://127.0.0.1:${PANEL_PORT}/healthz" || true)"
 if [ "$hz" = "ok" ]; then
     ok "панель отвечает по HTTPS"
@@ -404,3 +564,17 @@ printf '  Клиентские конфиги на сервере: /etc/wireguar
 printf '  SOCKS5-прокси для приложений (по желанию): %s:%s, логин «%s»,\n' "$SERVER_IP" "$MS_PORT" "${MS_USER:-proxyuser}"
 printf '  пароль сгенерирован при установке — смотри /etc/microsocks.env (только root).\n'
 printf '  Повторный запуск этой команды безопасен — узел обновится, ключи сохранятся.\n\n'
+if [ "$fail" != "0" ]; then
+    exit 1
+fi
+if [ -n "$SOURCE_CANDIDATE" ]; then
+    # Publish downloaded sources only after live install verification.  A
+    # failed DNS preflight or setup therefore leaves the current/rollback tree
+    # untouched.
+    rm -rf -- /opt/redut-src.manual-prev
+    if [ -d /opt/redut-src ]; then
+        mv /opt/redut-src /opt/redut-src.manual-prev
+    fi
+    mv "$SOURCE_CANDIDATE" /opt/redut-src
+    SOURCE_CANDIDATE=""
+fi

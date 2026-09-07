@@ -115,8 +115,8 @@ class TestClientMembershipSafety(unittest.TestCase):
         with mock.patch.object(clients, "server_params", return_value=params), \
              mock.patch.object(clients, "_run",
                                side_effect=clients.ClientError("timeout")), \
-             mock.patch.object(clients, "_set_live_peer"), \
-             mock.patch.object(clients, "_live_peer_matches", return_value=True):
+             mock.patch.object(clients, "_set_live_peer_allowed_ips"), \
+             mock.patch.object(clients, "_live_peer_allowed_ips_match", return_value=True):
             with self.assertRaises(clients.ClientError):
                 clients.delete_client(self.cfg, "phone", _locked=True)
         with open(self.wg_conf, encoding="utf-8") as handle:
@@ -178,9 +178,8 @@ class TestClientMembershipSafety(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertFalse(os.path.exists(self.marker))
 
-    def test_delete_refuses_missing_or_multiple_allowed_ips_before_journal(self):
-        for lines in (("",), ("10.77.0.9/32, 10.77.0.10/32",),
-                      ("10.77.0.9/32", "10.77.0.10/32")):
+    def test_delete_refuses_missing_allowed_ips_before_journal(self):
+        for lines in (("",), ()):
             text = ("[Interface]\nPrivateKey = server-private\n\n[Peer]\n"
                     "# phone\nPublicKey = pub\nPresharedKey = psk\n"
                     + "".join("AllowedIPs = %s\n" % item for item in lines))
@@ -193,6 +192,121 @@ class TestClientMembershipSafety(unittest.TestCase):
                     self.cfg, "phone", _locked=True,
                     dns_pool=self._DNSPool())
             journal.assert_not_called()
+
+    def test_legacy_multi_allowed_ips_can_be_revoked_and_rolled_back_exactly(self):
+        original = ("[Interface]\nPrivateKey = server-private\n\n[Peer]\n"
+                    "# phone\nPublicKey = pub\nPresharedKey = psk\n"
+                    "AllowedIPs = 10.77.0.9/32, fd00::9/128\n")
+        params = {"text": original, "net": None, "wg_ip": "10.77.0.1"}
+        commands = []
+
+        def run(args, inp=None, timeout=20):
+            commands.append(args)
+            if args == ["wg", "show", "wg0", "allowed-ips"]:
+                return "" if len(commands) == 2 else "pub\t10.77.0.9/32,fd00::9/128\n"
+            if args[:4] == ["wg", "set", "wg0", "peer"] and args[-1] == "remove":
+                raise clients.ClientError("synthetic delete timeout")
+            return ""
+
+        with mock.patch.object(clients, "server_params", return_value=params), \
+             mock.patch.object(clients, "_run", side_effect=run):
+            with self.assertRaises(clients.ClientError):
+                clients.delete_client(
+                    self.cfg, "phone", _locked=True, dns_pool=self._DNSPool())
+        self.assertFalse(os.path.exists(self.marker))
+        with open(self.wg_conf, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), original)
+        restore = next(command for command in commands
+                       if command[:4] == ["wg", "set", "wg0", "peer"]
+                       and "allowed-ips" in command)
+        self.assertEqual(restore[-1], "10.77.0.9/32,fd00::9/128")
+
+    def test_remove_peer_matches_public_key_exactly(self):
+        text = ("[Interface]\nPrivateKey = key\n\n[Peer]\n# one\nPublicKey = pub\n"
+                "AllowedIPs = 10.77.0.2/32\n\n[Peer]\n# two\nPublicKey = pub-extra\n"
+                "AllowedIPs = 10.77.0.3/32\n")
+        result = clients._remove_peer_block_text(text, "pub")
+        self.assertNotIn("PublicKey = pub\n", result)
+        self.assertIn("PublicKey = pub-extra", result)
+
+    def test_remove_peer_public_key_value_is_case_sensitive(self):
+        upper = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+        lower = "aAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+        text = ("[Interface]\nPrivateKey = key\n\n[Peer]\n# upper\nPublicKey = %s\n"
+                "AllowedIPs = 10.77.0.2/32\n\n[Peer]\n# lower\nPublicKey = %s\n"
+                "AllowedIPs = 10.77.0.3/32\n" % (upper, lower))
+        result = clients._remove_peer_block_text(text, upper)
+        self.assertNotIn("PublicKey = " + upper, result)
+        self.assertIn("PublicKey = " + lower, result)
+
+    def test_legacy_delete_marker_address_must_stay_inside_vpn_subnet(self):
+        clients._write_client_operation({
+            "kind": "delete", "name": "phone", "pubkey": "pub",
+            "address": "192.0.2.10",
+            "wg_config": "[Interface]\nPrivateKey = server-private\n"})
+        with self.assertRaises(clients.ClientError):
+            clients.reconcile_client_operation(self.cfg, _locked=True)
+
+    def test_unnamed_legacy_peer_is_revoked_by_exact_public_key(self):
+        pubkey = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+        original = ("[Interface]\nPrivateKey = server-private\n\n[Peer]\n"
+                    "PublicKey = %s\nAllowedIPs = 10.77.0.9/32, fd00::9/128\n"
+                    % pubkey)
+        with open(self.wg_conf, "w", encoding="utf-8") as handle:
+            handle.write(original)
+        params = {"text": original, "net": None, "wg_ip": "10.77.0.1"}
+        with mock.patch.object(clients, "server_params", return_value=params), \
+             mock.patch.object(clients, "_run", return_value=""), \
+             mock.patch.object(clients, "_live_peer_absent", return_value=True):
+            result = clients.delete_client(
+                self.cfg, "peer-10-77-0-9", pubkey=pubkey,
+                _locked=True, dns_pool=self._DNSPool())
+        self.assertEqual(result["pubkey"], pubkey)
+        self.assertTrue(result["removed_peer"])
+        with open(self.wg_conf, encoding="utf-8") as handle:
+            self.assertNotIn(pubkey, handle.read())
+
+    def test_duplicate_names_require_and_honor_exact_public_key(self):
+        first = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+        second = "aAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+        original = ("[Interface]\nPrivateKey = server-private\n\n"
+                    "[Peer]\n# phone\nPublicKey = %s\nAllowedIPs = 10.77.0.2/32\n\n"
+                    "[Peer]\n# phone\nPublicKey = %s\nAllowedIPs = 10.77.0.3/32\n"
+                    % (first, second))
+        with open(self.wg_conf, "w", encoding="utf-8") as handle:
+            handle.write(original)
+        params = {"text": original, "net": None, "wg_ip": "10.77.0.1"}
+        with mock.patch.object(clients, "server_params", return_value=params), \
+             self.assertRaises(clients.ClientError):
+            clients.delete_client(
+                self.cfg, "phone", _locked=True, dns_pool=self._DNSPool())
+        with mock.patch.object(clients, "server_params", return_value=params), \
+             mock.patch.object(clients, "_run", return_value=""), \
+             mock.patch.object(clients, "_live_peer_absent", return_value=True):
+            clients.delete_client(
+                self.cfg, "phone", pubkey=second,
+                _locked=True, dns_pool=self._DNSPool())
+        with open(self.wg_conf, encoding="utf-8") as handle:
+            final = handle.read()
+        self.assertIn(first, final)
+        self.assertNotIn(second, final)
+
+    def test_ipv6_first_legacy_inventory_finds_exact_saved_profile(self):
+        os.makedirs(self.clients_dir)
+        with open(os.path.join(self.clients_dir, "phone.conf"), "w",
+                  encoding="utf-8") as handle:
+            handle.write("[Interface]\nAddress = 10.77.0.9/32\n")
+        with open(self.wg_conf, "w", encoding="utf-8") as handle:
+            handle.write("[Interface]\nPrivateKey = server-private\n\n[Peer]\n"
+                         "PublicKey = pub\n"
+                         "AllowedIPs = fd00::9/128, 10.77.0.9/32\n")
+        with mock.patch.object(clients, "_wg_dump", return_value={}), \
+             mock.patch.object(clients, "_server_pubkey", return_value="server-public"):
+            result = clients.client_inventory(self.cfg)
+        row = result["clients"][0]
+        self.assertEqual((row["name"], row["ip"], row["has_conf"]),
+                         ("phone", "10.77.0.9", True))
+        self.assertTrue(row["unsupported"])
 
     def test_live_peer_match_requires_exact_single_allowed_ip(self):
         with mock.patch.object(
@@ -226,6 +340,34 @@ class TestClientMembershipSafety(unittest.TestCase):
                     dns_pool=self._DNSPool())
             command.assert_not_called()
             journal.assert_not_called()
+
+    def test_full_subnet_keeps_inventory_visible_and_disables_add(self):
+        self.cfg["subnet"] = "10.77.0.0/30"
+        with open(self.wg_conf, "w", encoding="utf-8") as handle:
+            handle.write("[Interface]\nAddress = 10.77.0.1/30\nPrivateKey = server-private\n\n"
+                         "[Peer]\n# phone\nPublicKey = pub\nAllowedIPs = 10.77.0.2/32\n")
+        with mock.patch.object(clients, "_wg_dump", return_value={}), \
+             mock.patch.object(clients, "_server_pubkey", return_value="server-public"):
+            result = clients.client_inventory(self.cfg)
+        self.assertEqual([row["name"] for row in result["clients"]], ["phone"])
+        self.assertFalse(result["can_add"])
+        self.assertIsNone(result["next_ip"])
+        self.assertIn("свободных адресов", result["add_error"])
+
+    def test_legacy_peer_keeps_all_inventory_visible_but_allocation_fail_closed(self):
+        with open(self.wg_conf, "w", encoding="utf-8") as handle:
+            handle.write("[Interface]\nAddress = 10.77.0.1/24\nPrivateKey = server-private\n\n"
+                         "[Peer]\n# legacy\nPublicKey = old\n"
+                         "AllowedIPs = 10.77.0.2/32, fd00::2/128\n\n"
+                         "[Peer]\n# phone\nPublicKey = new\nAllowedIPs = 10.77.0.3/32\n")
+        with mock.patch.object(clients, "_wg_dump", return_value={}), \
+             mock.patch.object(clients, "_server_pubkey", return_value="server-public"):
+            result = clients.client_inventory(self.cfg)
+        self.assertEqual([row["name"] for row in result["clients"]], ["legacy", "phone"])
+        self.assertTrue(result["clients"][0]["unsupported"])
+        self.assertFalse(result["clients"][1]["unsupported"])
+        self.assertFalse(result["can_add"])
+        self.assertIsNone(result["next_ip"])
 
 
 if __name__ == "__main__":
