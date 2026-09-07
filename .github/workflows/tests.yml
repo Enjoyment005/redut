@@ -17,14 +17,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
       - name: Install test dependency
         run: python -m pip install --disable-pip-version-check paramiko
       - name: Record environment
         run: |
           uname -a
           python --version
-          git rev-parse HEAD
+          printf '%s\n' "$GITHUB_SHA"
       - name: Shell syntax
         run: find . -type f -name '*.sh' -not -path './.git/*' -print0 | xargs -0 -n1 bash -n
       - name: Python syntax
@@ -49,7 +48,7 @@ jobs:
         run: |
           cat /etc/os-release
           python3 --version
-          git rev-parse HEAD
+          printf '%s\n' "$GITHUB_SHA"
       - name: Shell syntax
         run: find . -type f -name '*.sh' -not -path './.git/*' -print0 | xargs -0 -n1 bash -n
       - name: Python syntax
