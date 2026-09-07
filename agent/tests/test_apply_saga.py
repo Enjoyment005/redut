@@ -154,6 +154,29 @@ class TestApplySaga(unittest.TestCase):
                 apply_mod.atomic_copy_replace(src, self.live)
         self.assertEqual(apply_mod.file_checksum(self.live), before)
 
+    def test_failed_route_install_keeps_apply_recoverable_without_restart(self):
+        cfg = dict(self.cfg, gw="192.0.2.1", wan="eth0")
+        with mock.patch.object(apply_mod, "singbox_check", return_value=(0, "")), \
+                mock.patch.object(apply_mod, "run_cmd", return_value=(2, "invalid gateway")), \
+                mock.patch.object(apply_mod, "restart_singbox") as restart:
+            with self.assertRaisesRegex(apply_mod.ApplyError, "anti-loop"):
+                apply_mod.apply_candidate(
+                    cfg, self.row, self.probe, log=lambda *_: None,
+                    pool=self.pool, requested_by="test", idempotency_key="apply:route-fail")
+        restart.assert_not_called()
+        operation = self.pool.unfinished_operations()[0]
+        self.assertEqual(operation["phase"], "applied")
+        self.assertIsNotNone(apply_mod.backup_by_checksum(self.ring, operation["before_checksum"]))
+
+        with self.system_ok() as mocks:
+            mocks["restart_singbox"].return_value = True
+            mocks["wait_tun0"].return_value = True
+            mocks["verify_egress"].return_value = self.ok_verify
+            recovered = apply_mod.recover_operation(
+                cfg, self.pool, operation, log=lambda *_: None)
+        self.assertTrue(recovered["ok"])
+        self.assertEqual(recovered["action"], "post-state-pending")
+
     def test_unconfirmed_compensation_stays_unfinished(self):
         bad = {"ok": False, "egress_ip": None, "exit_cc": None,
                "tg_code": "000", "why": "dead"}

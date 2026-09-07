@@ -53,6 +53,7 @@
 import json
 import os
 import re
+import socket
 import ssl
 import subprocess
 import sys
@@ -70,6 +71,7 @@ import config_store                # noqa: E402
 import config_schema               # noqa: E402
 import dns_rescue as dns_rescue_mod  # noqa: E402
 import country as country_mod      # noqa: E402
+import health as health_mod        # noqa: E402
 import metrics as metrics_mod      # noqa: E402
 import money as money_mod          # noqa: E402
 import pool as pool_mod            # noqa: E402
@@ -488,7 +490,11 @@ class App:
 
     def reload_secrets(self):
         """Перечитать secrets.json на лету (после мастера/смены ключей) — без рестарта."""
-        self._load_secrets()
+        # _load_secrets also updates credential metadata, provider health and
+        # spend recovery through the one shared sqlite connection. Centralize
+        # serialization here so every caller is safe, not only login/setup.
+        with _DB_LOCK:
+            self._load_secrets()
 
     def write_secrets(self, data):
         """Атомарно записать secrets.json (0600) и перечитать состояние."""
@@ -590,9 +596,14 @@ class App:
         res = probe_mod.probe(row, provider_check=cb)
         is_cur = row["host"] == self.current_host()
         res["score"] = probe_mod.score(row, res, is_current=is_cur, cfg=self.cfg)
-        with _DB_LOCK:
-            self.pool.record_probe(row["uid"], res, is_current=is_cur,
-                                   strategy=country_mod.strategy(self.cfg))
+        classification = health_mod.classify_probe_result(res, cfg=self.cfg)
+        res["persistence_outcome"] = classification["outcome"]
+        if classification["decision"] is not None:
+            res["health_decision"] = classification["decision"]
+        if classification["outcome"] != health_mod.PROBE_INCONCLUSIVE:
+            with _DB_LOCK:
+                self.pool.record_probe(row["uid"], res, is_current=is_cur,
+                                       strategy=country_mod.strategy(self.cfg))
         return res
 
 
@@ -602,6 +613,55 @@ APP = None
 class Handler(BaseHTTPRequestHandler):
     server_version = "vpn-panel"
     protocol_version = "HTTP/1.1"
+
+    def handle_one_request(self):
+        """Cap request-line/header/body reading by an absolute deadline.
+
+        Socket timeouts are idle timeouts and can be defeated by a peer sending
+        one byte just before every timeout. The watchdog is cancelled as soon
+        as a complete GET header or POST body has been accepted, so long-running
+        authenticated operations are not interrupted.
+        """
+        self._request_read_guard = threading.Lock()
+        self._request_read_done = False
+        self._request_read_timer = threading.Timer(
+            _CONN_TIMEOUT, self._expire_request_read)
+        self._request_read_timer.daemon = True
+        self._request_read_timer.start()
+        try:
+            return super().handle_one_request()
+        finally:
+            self._finish_request_read()
+
+    def _expire_request_read(self):
+        guard = getattr(self, "_request_read_guard", None)
+        if guard is None:
+            return
+        with guard:
+            if self._request_read_done:
+                return
+            self._request_read_done = True
+        self.close_connection = True
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.connection.close()
+        except OSError:
+            pass
+
+    def _finish_request_read(self):
+        guard = getattr(self, "_request_read_guard", None)
+        if guard is None:
+            return
+        with guard:
+            if self._request_read_done:
+                return
+            self._request_read_done = True
+        timer = getattr(self, "_request_read_timer", None)
+        if timer is not None:
+            timer.cancel()
 
     # ------- утилиты ответа -------
     def _headers(self, code, ctype="text/html; charset=utf-8", extra=None):
@@ -666,7 +726,11 @@ class Handler(BaseHTTPRequestHandler):
     def _body(self, limit=None):
         """Read one bounded, unambiguous HTTP request body."""
         limit = MAX_REQUEST_BODY if limit is None else max(0, int(limit))
-        if self.headers.get("Transfer-Encoding"):
+        # get() returns only one combined/first value depending on the parser.
+        # Even an empty first header must not hide a second "chunked" header:
+        # this server deliberately supports Content-Length framing only.
+        transfer_encodings = self.headers.get_all("Transfer-Encoding") or []
+        if transfer_encodings:
             self.close_connection = True
             raise RequestBodyError(400, "Transfer-Encoding не поддерживается")
         lengths = self.headers.get_all("Content-Length") or []
@@ -674,6 +738,10 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             raise RequestBodyError(411 if not lengths else 400,
                                    "нужен один корректный Content-Length")
+        if not re.fullmatch(r"[0-9]+", lengths[0]):
+            self.close_connection = True
+            raise RequestBodyError(
+                400, "Content-Length должен содержать только ASCII-цифры")
         try:
             ln = int(lengths[0], 10)
         except (TypeError, ValueError):
@@ -685,12 +753,17 @@ class Handler(BaseHTTPRequestHandler):
         if ln > limit:
             self.close_connection = True
             raise RequestBodyError(413, "тело запроса слишком большое")
+        cached = getattr(self, "_request_body", None)
+        if cached is not None:
+            return cached
         if not ln:
+            self._request_body = b""
             return b""
         data = self.rfile.read(ln)
         if len(data) != ln:
             self.close_connection = True
             raise RequestBodyError(400, "тело запроса короче Content-Length")
+        self._request_body = data
         return data
 
     def _json_object_body(self, limit=None):
@@ -711,6 +784,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------ GET
     def do_GET(self):
+        Handler._finish_request_read(self)
         u = urlparse(self.path)
         path = u.path
         if path == "/healthz":
@@ -856,10 +930,19 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------ POST
     def do_POST(self):
+        self._request_body = None
         try:
+            # Consume bounded framing even for early auth failures and routes
+            # that ignore their payload. Otherwise unread bytes become the
+            # next HTTP/1.1 request (for example, "{}GET" -> HTTP 501).
+            # Endpoint readers reuse these bytes and still enforce lower limits.
+            self._body()
+            Handler._finish_request_read(self)
             return self._do_POST_inner()
         except RequestBodyError as error:
             return self._json(error.status, {"error": error.message})
+        finally:
+            self._request_body = None
 
     def _do_POST_inner(self):
         u = urlparse(self.path)
@@ -994,7 +1077,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "frozen": body["frozen"]})
         if path == "/api/emergency":
             body = Handler._json_object_body(self)
-            on = bool(body.get("on"))
+            if not isinstance(body.get("on"), bool):
+                return self._json(400, {"error": "ожидаю {on: true|false}"})
+            on = body["on"]
             rc, out = _run_agent(["emergency", "on" if on else "off"])
             with _DB_LOCK:
                 st = APP.pool.get_setting("automat_state") or "OK"
@@ -1750,6 +1835,11 @@ class Handler(BaseHTTPRequestHandler):
         password = (body.get("password") or [""])[0]
         otp = (body.get("otp") or [""])[0]
         admin = APP.admin
+        # Bind every factor and the eventual session to this exact snapshot.
+        # APP.admin_epoch may change during scrypt/recovery when a reset is
+        # followed by reload_secrets; reading it later would authorize old
+        # factors under the newly installed credentials.
+        login_epoch = auth.admin_credential_epoch(admin)
         ok = False
         if not _AUTH_SLOTS.acquire(blocking=False):
             return self._json(503, {"error": "слишком много одновременных попыток входа"},
@@ -1758,11 +1848,18 @@ class Handler(BaseHTTPRequestHandler):
             if admin and auth.verify_password(password, admin.get("pw", "")):
                 if auth.totp_verify(admin.get("totp", ""), otp):
                     ok = True
-                elif otp and APP.secrets_path and auth.consume_recovery_code(
-                        None, APP.secrets_path, otp):
-                    # recovery-код одноразовый: перечитать секреты (список изменился)
-                    APP.reload_secrets()
-                    ok = True
+                elif otp and APP.secrets_path:
+                    # reload_secrets touches the shared sqlite connection
+                    # (credential epoch, provider health, spend recovery). Keep
+                    # consume+reload under the same DB lock so one login cannot
+                    # commit another handler's in-flight transaction.
+                    with _DB_LOCK:
+                        if auth.consume_recovery_code(
+                                None, APP.secrets_path, otp,
+                                expected_epoch=login_epoch):
+                            # recovery-код одноразовый: перечитать секреты
+                            APP.reload_secrets()
+                            ok = True
         finally:
             _AUTH_SLOTS.release()
         if not ok:
@@ -1774,7 +1871,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with _DB_LOCK:
                 token, csrf = APP.store.create_session(
-                    ip, expected_epoch=APP.admin_epoch)
+                    ip, expected_epoch=login_epoch)
                 APP.store.record_success(ip)
         except auth.CredentialEpochChanged:
             return self._send(

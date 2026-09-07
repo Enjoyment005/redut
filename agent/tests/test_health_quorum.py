@@ -7,6 +7,7 @@ from unittest import mock
 
 import _ctx  # noqa: F401
 import health
+import agent as agent_mod
 import pool as pool_mod
 import states
 
@@ -109,6 +110,79 @@ class TestRetuneQuorumIntegration(unittest.TestCase):
 
 
 class TestQuorumRegressions(unittest.TestCase):
+    @staticmethod
+    def _seed(pool):
+        uid = pool.upsert_proxy({
+            "provider": "proxy6", "ext_id": "1", "ip": "1.1.1.1",
+            "host": "1.1.1.1", "port_http": 8080, "port_socks5": 1080,
+            "user": "u", "password": "p", "country": "fi", "ip_version": 4,
+            "kind": "dedicated", "date_end": None, "descr": ""})
+        pool.conn.execute(
+            "UPDATE proxy SET probe_ok=1,fail_count=0,score=120 WHERE uid=?", (uid,))
+        pool.conn.commit()
+        return uid
+
+    @staticmethod
+    def _inconclusive():
+        return {"ok": False, "disqualified": "no-combo", "evidence": [
+            health.evidence("http", False, target="https://api.ipify.org",
+                            via_proxy=True),
+            health.evidence("http", True,
+                            target="https://www.gstatic.com/generate_204",
+                            via_proxy=True),
+        ]}
+
+    def test_all_probe_entrypoints_preserve_health_when_quorum_is_inconclusive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = pool_mod.Pool(os.path.join(tmp, "state.db"), server="test")
+            try:
+                uid = self._seed(pool)
+                row = pool.get(uid)
+                for module, call in (
+                    (states, lambda: states._probe(
+                        pool, {}, row, row["host"], cfg={}, persist=True)),
+                    (agent_mod, lambda: agent_mod._probe_one(
+                        pool, {}, {}, row, row["host"], background=True)),
+                ):
+                    with self.subTest(entrypoint=module.__name__), \
+                            mock.patch.object(module.probe_mod, "probe",
+                                              return_value=self._inconclusive()), \
+                            mock.patch.object(module.probe_mod, "score", return_value=None):
+                        result = call()
+                    self.assertEqual(result["persistence_outcome"],
+                                     health.PROBE_INCONCLUSIVE)
+                    stored = pool.get(uid)
+                    self.assertEqual((stored["probe_ok"], stored["fail_count"],
+                                      stored["score"]), (1, 0, 120.0))
+                self.assertEqual(pool.conn.execute(
+                    "SELECT COUNT(*) FROM probe_log").fetchone()[0], 0)
+            finally:
+                pool.close()
+
+    def test_quorum_confirmed_failure_is_persisted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = pool_mod.Pool(os.path.join(tmp, "state.db"), server="test")
+            try:
+                uid = self._seed(pool)
+                result = {"ok": False, "disqualified": "no-combo", "evidence": [
+                    health.evidence("socks", False, target="https://api.ipify.org",
+                                    via_proxy=True),
+                    health.evidence("http", False,
+                                    target="https://www.gstatic.com/generate_204",
+                                    via_proxy=True),
+                ]}
+                with mock.patch.object(states.probe_mod, "probe", return_value=result), \
+                        mock.patch.object(states.probe_mod, "score", return_value=None):
+                    observed = states._probe(pool, {}, pool.get(uid), "1.1.1.1", cfg={})
+                self.assertEqual(observed["persistence_outcome"],
+                                 health.PROBE_CONFIRMED_FAILURE)
+                stored = pool.get(uid)
+                self.assertEqual((stored["probe_ok"], stored["fail_count"]), (0, 1))
+                self.assertEqual(pool.conn.execute(
+                    "SELECT COUNT(*) FROM probe_log").fetchone()[0], 1)
+            finally:
+                pool.close()
+
     def test_external_outage_does_not_poison_persistent_proxy_health(self):
         with tempfile.TemporaryDirectory() as tmp:
             pool = pool_mod.Pool(os.path.join(tmp, "state.db"), server="test")
@@ -173,7 +247,7 @@ class TestQuorumRegressions(unittest.TestCase):
                          mock.patch.object(states, "_leave_direct") as leave, \
                          mock.patch.object(states, "try_rotating") as rotate:
                         answer = states._rotate_locked(
-                            {}, {}, pool, mock.Mock(), "watchdog", "auto",
+                            {"singbox_config": "mocked.json"}, {}, pool, mock.Mock(), "watchdog", "auto",
                             lambda *_: None, result, previous)
                     self.assertEqual((answer["state"], answer["action"]),
                                      (previous, "quorum-held"))

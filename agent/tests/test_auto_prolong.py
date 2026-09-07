@@ -31,6 +31,12 @@ class FakeProv:
     def getprice(self, count, days, version):
         return {"price": 4.0 * days, "balance": 800.0, "currency": "RUB"}
 
+    def list(self):
+        extensions = {str(ext_id): days for ext_id, days in self.calls}
+        return [{"provider": self.name, "ext_id": ext_id,
+                 "date_end": _in(extensions.get(ext_id, 2))}
+                for ext_id in ("1", "2", "7")]
+
     def prolong(self, ext_id, days, on_submit=None):
         if on_submit is not None:
             on_submit()
@@ -132,13 +138,17 @@ class TestProviderMatch(Base):
             "SELECT result FROM event WHERE action='auto-prolong'").fetchone()
         self.assertEqual(ev["result"], "no-provider")
 
-    def test_right_adapter_chosen_by_row_provider(self):
+    def test_proxyline_adapter_is_not_called_without_trusted_quote(self):
         self.make_battle_proxyline()
         pl = FakeProv(name="proxyline")
         states_mod.auto_prolong(self.cfg, {"proxy6": self.prov, "proxyline": pl},
                                 self.pool, self.alerter, log=lambda *a: None)
         self.assertEqual(self.prov.calls, [], "proxy6 не трогали")
-        self.assertEqual([c[0] for c in pl.calls], ["7"], "продлил адаптер ProxyLine")
+        self.assertEqual(pl.calls, [], "ProxyLine не вызван без preflight-цены")
+        self.assertEqual(self.alerter.sent[0][0], "failed")
+        ev = self.pool.conn.execute(
+            "SELECT result FROM event WHERE action='auto-prolong'").fetchone()
+        self.assertEqual(ev["result"], "denied")
 
     def test_gone_battle_row_still_alerts(self):
         # ревью 1.3.0: после удаления ключа строки провайдера gone, но боевой канал
@@ -196,7 +206,7 @@ class TestIdempotency(Base):
         self.assertTrue(self.pool.prolonged_today("proxy6:1"))
         self.assertFalse(self.pool.prolonged_today("proxy6:2"))
 
-    def test_durable_job_recovers_after_provider_acceptance_kill(self):
+    def test_durable_job_blocks_after_uncorrelated_provider_acceptance(self):
         class KillOnce(FakeProv):
             def __init__(inner_self):
                 super().__init__()
@@ -223,11 +233,13 @@ class TestIdempotency(Base):
             self.pool.get_setting("money_request:auto-prolong:proxy6:1"))
         result = self.run_it()
         self.assertEqual(len(self.prov.calls), 1)
-        self.assertEqual(result["prolonged"][0]["uid"], "proxy6:1")
-        self.assertIsNone(
+        self.assertEqual(result["prolonged"], [])
+        self.assertIsNotNone(
             self.pool.get_setting("money_request:auto-prolong:proxy6:1"))
         self.assertEqual(self.pool.conn.execute(
-            "SELECT COUNT(*) FROM money WHERE op='prolong'").fetchone()[0], 1)
+            "SELECT COUNT(*) FROM money WHERE op='prolong'").fetchone()[0], 0)
+        self.assertEqual(self.pool.pending_spend_operations()[0]["phase"], "submitted")
+        self.assertEqual(self.alerter.sent[-1][0], "failed")
 
     def test_durable_job_replays_after_ack_before_caller_processing(self):
         class KillAlerter(FakeAlerter):

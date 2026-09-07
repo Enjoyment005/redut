@@ -27,6 +27,7 @@ sys.path.insert(0, PANEL_DIR)
 
 import apply as apply_mod           # noqa: E402
 import country as country_mod       # noqa: E402
+import health as health_mod         # noqa: E402
 import money as money_mod           # noqa: E402
 import config_schema                # noqa: E402
 import learning as learning_mod     # noqa: E402
@@ -405,8 +406,13 @@ def _probe_one(p, cfg, providers, row, current_host, background=False):
     res = probe_mod.probe(row, provider_check=check_cb)
     is_cur = row["host"] == current_host
     res["score"] = probe_mod.score(row, res, is_current=is_cur, cfg=cfg)
-    p.record_probe(row["uid"], res, is_current=is_cur, strategy=country_mod.strategy(cfg),
-                   background=background)
+    classification = health_mod.classify_probe_result(res, cfg=cfg)
+    res["persistence_outcome"] = classification["outcome"]
+    if classification["decision"] is not None:
+        res["health_decision"] = classification["decision"]
+    if classification["outcome"] != health_mod.PROBE_INCONCLUSIVE:
+        p.record_probe(row["uid"], res, is_current=is_cur,
+                       strategy=country_mod.strategy(cfg), background=background)
     return res
 
 

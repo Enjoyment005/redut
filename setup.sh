@@ -194,12 +194,160 @@ if [ "$DNS_PREFLIGHT_REQUIRED" = "1" ]; then
     command -v python3 >/dev/null 2>&1 \
         || die "установленное состояние Редута требует python3 для DNS preflight"
     python3 - <<'PY' || die "DNS Rescue preflight не подтверждён; установка не начата"
-import json, os, sqlite3, subprocess, sys
+import json, os, sqlite3, subprocess, sys, time
 
 config_path = "/etc/vpn-panel/config.json"
 default_db = "/var/lib/vpn-panel/state.db"
+legacy_version_path = "/opt/vpn-panel/VERSION"
+legacy_state_schema = (
+    ("singleton", "INTEGER", 0, None, 1),
+    ("phase", "TEXT", 1, None, 0),
+    ("configured_mode", "TEXT", 1, None, 0),
+    ("incident_id", "TEXT", 0, None, 0),
+    ("active_scope", "TEXT", 0, None, 0),
+    ("active_slot", "TEXT", 0, None, 0),
+    ("activated_at", "TEXT", 0, None, 0),
+    ("attempt_used", "INTEGER", 1, "0", 0),
+    ("return_successes", "INTEGER", 1, "0", 0),
+    ("last_error", "TEXT", 0, None, 0),
+    ("updated_at", "TEXT", 1, None, 0),
+)
+legacy_operation_schema = (
+    ("id", "TEXT", 0, None, 1),
+    ("incident_id", "TEXT", 1, None, 0),
+    ("kind", "TEXT", 1, None, 0),
+    ("phase", "TEXT", 1, None, 0),
+    ("slot_id", "TEXT", 0, None, 0),
+    ("scope", "TEXT", 1, None, 0),
+    ("actor", "TEXT", 1, None, 0),
+    ("requested_at", "TEXT", 1, None, 0),
+    ("updated_at", "TEXT", 1, None, 0),
+    ("finished_at", "TEXT", 0, None, 0),
+    ("error", "TEXT", 0, None, 0),
+    ("idempotency_key", "TEXT", 1, None, 0),
+)
+dns_descriptor_keys = (
+    "dns_boot_resume", "dns_exit_resume", "dns_incident_id",
+    "manual_emergency_ref",
+)
+
+
+def _schema(conn, table):
+    return tuple((str(row[1]), str(row[2]).upper(), int(row[3]), row[4],
+                  int(row[5])) for row in conn.execute("PRAGMA table_info(%s)" % table))
+
+
+def _empty_owned_directory(path):
+    if not os.path.lexists(path):
+        return True
+    if os.path.islink(path) or not os.path.isdir(path):
+        return False
+    return not os.listdir(path)
+
+
+def _legacy_physical_state_is_empty():
+    for path in ("/etc/redut-dns-rescue", "/var/lib/redut-dns-rescue",
+                 "/run/redut-dns-rescue", "/run/redut-dns-rescue-controller"):
+        try:
+            if not _empty_owned_directory(path):
+                return False
+        except OSError:
+            return False
+    checks = (
+        (["/usr/sbin/iptables-save", "-t", "nat"], "REDUT_DNS"),
+        (["/usr/sbin/iptables-save", "-t", "filter"], "REDUT_DNS"),
+    )
+    for command, forbidden in checks:
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if result.returncode != 0 or forbidden in (result.stdout or ""):
+            return False
+    try:
+        processes = subprocess.run(
+            ["ps", "-eo", "pid=,ppid=,args="], capture_output=True,
+            text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if processes.returncode != 0:
+        return False
+    rows = []
+    parents = {}
+    try:
+        for line in (processes.stdout or "").splitlines():
+            if not line.strip():
+                continue
+            pid_text, ppid_text, command = line.strip().split(None, 2)
+            pid, ppid = int(pid_text), int(ppid_text)
+            rows.append((pid, command))
+            parents[pid] = ppid
+    except (TypeError, ValueError):
+        return False
+    # SSH may invoke this program via `python3 -c`, so its own argv and the
+    # parent shell contain the literal guard text.  Exclude only that exact
+    # ancestor chain; any independent rescue process remains a blocker.
+    ancestors = set()
+    ancestor = os.getpid()
+    for _depth in range(64):
+        if ancestor <= 0 or ancestor in ancestors:
+            break
+        ancestors.add(ancestor)
+        ancestor = parents.get(ancestor, 0)
+    if any(pid not in ancestors and "redut-dns-rescue" in command
+           for pid, command in rows):
+        return False
+    return True
+
+
+def _materialize_legacy_1130_idle(conn, config, unit_state):
+    dns = config.get("dns_rescue") if isinstance(config, dict) else None
+    if (unit_state not in ("inactive", "failed")
+            or not isinstance(dns, dict)
+            or dns.get("mode") != "disabled"
+            or dns.get("owner_approved") is not False
+            or dns.get("automatic_ready") is not False
+            or not os.path.isfile(legacy_version_path)):
+        return False
+    try:
+        with open(legacy_version_path, encoding="ascii") as source:
+            if source.read().strip() != "1.13.0":
+                return False
+    except (OSError, UnicodeError):
+        return False
+    if not _legacy_physical_state_is_empty():
+        return False
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if (_schema(conn, "dns_rescue_state") != legacy_state_schema
+                or _schema(conn, "dns_rescue_operation") != legacy_operation_schema
+                or conn.execute("SELECT 1 FROM dns_rescue_state LIMIT 1").fetchone()
+                or conn.execute("SELECT 1 FROM dns_rescue_operation LIMIT 1").fetchone()):
+            conn.rollback()
+            return False
+        descriptors = conn.execute(
+            "SELECT key,value FROM setting WHERE key IN (?,?,?,?)",
+            dns_descriptor_keys).fetchall()
+        if any(value not in (None, "") for _key, value in descriptors):
+            conn.rollback()
+            return False
+        if not _legacy_physical_state_is_empty():
+            conn.rollback()
+            return False
+        conn.execute(
+            "INSERT INTO dns_rescue_state(singleton,phase,configured_mode,updated_at) "
+            "VALUES(1,'idle','disabled',?)",
+            (time.strftime("%Y-%m-%d %H:%M:%S"),))
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+
+
 installed = os.path.lexists("/opt/vpn-panel/VERSION")
 config_exists = os.path.lexists(config_path)
+config = {}
 if config_exists:
     try:
         with open(config_path, encoding="utf-8") as source:
@@ -240,7 +388,7 @@ if not os.path.isfile(db):
     phase = "idle"
 else:
     try:
-        conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=2.0)
+        conn = sqlite3.connect(db, timeout=2.0)
         try:
             exists = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' "
@@ -252,6 +400,9 @@ else:
             else:
                 row = conn.execute(
                     "SELECT phase FROM dns_rescue_state WHERE singleton=1").fetchone()
+                if not row and _materialize_legacy_1130_idle(conn, config, state):
+                    row = conn.execute(
+                        "SELECT phase FROM dns_rescue_state WHERE singleton=1").fetchone()
                 if not row or not isinstance(row[0], str) or not row[0].strip():
                     sys.exit("DNS Rescue state singleton/phase is missing")
                 phase = row[0]
@@ -323,21 +474,11 @@ if not m:
 gw, wan = m.group(1), m.group(2)
 server_ip = sh("ip -4 -o addr show dev %s scope global | awk '{print $4}' | cut -d/ -f1 | head -1" % wan)
 
-base = subnet.split("/")[0].rsplit(".", 1)[0]
-if re.fullmatch(r"\d+", clients_spec):
-    names = ["client%d" % i for i in range(1, int(clients_spec) + 1)]
-else:
-    names = [x.strip() for x in clients_spec.split(",") if x.strip()]
 # Элемент можно задать как "имя" (адрес назначится сам) или "имя:10.8.0.5" —
 # точный адрес нужен при переустановке поверх живого узла, чтобы у клиента не
 # поменялся IP и его старый профиль продолжил работать.
-clients = []
-for i, n in enumerate(names):
-    if ":" in n:
-        nm, addr = n.split(":", 1)
-        clients.append({"name": nm.strip(), "addr": addr.strip()})
-    else:
-        clients.append({"name": n, "addr": "%s.%d" % (base, 2 + i)})
+clients = profiles.parse_clients(
+    clients_spec, subnet, allow_empty=(os.environ.get("UPDATE") == "1"))
 
 # Имя базового профиля не хардкодим: в разных сборках оно своё, а нам нужны лишь
 # его дефолты (порт wg, версия sing-box, параметры локального SOCKS). Если профиль

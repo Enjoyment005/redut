@@ -8,10 +8,12 @@
 uid = f"{provider}:{ext_id}" собирает pool.py.
 """
 import json
+import http.client
 import os
 import subprocess
 import time
 import socket
+import ssl
 import datetime
 import email.utils
 import math
@@ -33,8 +35,8 @@ HTTP_TIMEOUT = 25
 #     повторяем через tun0 и запоминаем рабочий транспорт (в процессе + подсказка в /run,
 #     чтобы следующий запуск агента из cron не жёг таймауты заново);
 #   * ДЕНЬГИ (mutating=True: buy/prolong/delete): повтор другим транспортом допустим ТОЛЬКО
-#     если запрос заведомо не был доставлен (ошибка на этапе соединения/TLS/отправки —
-#     urllib поднимает URLError, curl — коды 6/7/35). Таймаут ЧТЕНИЯ ответа = «запрос мог
+#     если запрос заведомо не был доставлен (DNS/отказ соединения/проверка сертификата,
+#     curl — коды 6/7/35). Таймаут или сброс при отправке/чтении = «запрос мог
 #     пройти, ответ потерян» → повтора нет, как и раньше (иначе двойная покупка §6.2).
 TRANSPORT_HINT = "/run/vpn-agent-provider-transport"
 TRANSPORT_HINT_TTL = 3600
@@ -319,16 +321,29 @@ def _http_error(host_label, status, body, headers=None):
                          definitive=400 <= int(status) < 500)
 
 
-def _urlopen_json(req, host_label, timeout):
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Turn redirects into an observed HTTP response instead of a second request."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _urlopen_json(req, host_label, timeout, follow_redirects=True):
     """Общая обработка ответа/ошибок для GET и POST (прямой транспорт, urllib).
 
     В сообщениях ошибок URL не фигурирует (у PROXY6 в пути лежит ключ) —
     только host_label, который передаёт вызывающий.
-    URLError = ошибка ДО получения ответа (DNS/соединение/TLS/отправка: urllib оборачивает
-    исключения h.request()) -> unsent=True; сырые OSError/timeout — уже при чтении ответа.
+    urllib оборачивает в URLError все OSError из h.request(), включая сброс/таймаут
+    после частичной отправки. Сам тип URLError НЕ доказывает отсутствие мутации.
+    Повтор разрешён только для ошибок, однозначно предшествующих HTTP-запросу.
     """
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        if follow_redirects:
+            response = urllib.request.urlopen(req, timeout=timeout)
+        else:
+            response = urllib.request.build_opener(_NoRedirectHandler()).open(
+                req, timeout=timeout)
+        with response as resp:
             body = resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         body = ""
@@ -339,9 +354,17 @@ def _urlopen_json(req, host_label, timeout):
         raise _http_error(host_label, e.code, body, e.headers) from None
     except urllib.error.URLError as e:
         why = getattr(e, "reason", None) or e
-        raise ProviderError("Нет связи с %s (%s)" % (host_label or "API", why), network=True, unsent=True) from None
+        unsent = isinstance(why, (socket.gaierror, ConnectionRefusedError,
+                                  ssl.SSLCertVerificationError))
+        raise ProviderError("Нет связи с %s (%s)" % (host_label or "API", why),
+                            network=True, unsent=unsent) from None
     except (socket.timeout, OSError) as e:
         raise ProviderError("Нет связи с %s (%s)" % (host_label or "API", e), network=True) from None
+    except http.client.HTTPException as e:
+        # IncompleteRead/BadStatusLine may follow a successful remote mutation.
+        raise ProviderError("Неполный HTTP-ответ от %s (%s)"
+                            % (host_label or "API", type(e).__name__),
+                            network=True) from None
     try:
         return json.loads(body) if body else None
     except ValueError:
@@ -373,7 +396,10 @@ def _curl_json(url, headers, form_fields, host_label, timeout):
     except subprocess.SubprocessError as e:
         # Процесс curl уже стартовал: POST мог уйти, а timeout случиться при
         # чтении ответа. Для денег повтор другим транспортом небезопасен.
-        raise ProviderError("Нет связи с %s через канал узла (%s)" % (host_label or "API", e),
+        # TimeoutExpired/CalledProcessError stringify the full argv, which holds
+        # API keys in URLs and headers. Never include their command or output.
+        raise ProviderError("Нет связи с %s через канал узла (%s)"
+                            % (host_label or "API", type(e).__name__),
                             network=True, unsent=False) from None
     if p.returncode != 0:
         raise ProviderError("Нет связи с %s через канал узла (curl %s)" % (host_label or "API", p.returncode),
@@ -432,7 +458,11 @@ def _request_json(url, headers, form_fields, timeout, host_label, mutating):
                         headers={"User-Agent": USER_AGENT,
                                  "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
                                  **(headers or {})})
-                data = _urlopen_json(req, host_label, timeout)
+                # A redirect proves that the origin received the request, while
+                # a later connection failure says nothing about that mutation.
+                # Never follow redirects for money-bearing operations.
+                data = _urlopen_json(
+                    req, host_label, timeout, follow_redirects=not mutating)
             else:
                 data = _curl_json(url, headers, form_fields, host_label, timeout)
         except ProviderError as e:

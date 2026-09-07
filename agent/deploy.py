@@ -221,6 +221,25 @@ def run(c, cmd, t=180):
     return run_result(c, cmd, t=t)[1]
 
 
+def activate_panel(c, port, wait_s=20):
+    """Require both successful systemd activation and a ready HTTPS endpoint."""
+    rc, detail = run_result(
+        c, "systemctl daemon-reload && systemctl enable vpn-panel && "
+           "systemctl restart vpn-panel && systemctl is-active vpn-panel")
+    if rc != 0 or detail.strip().splitlines()[-1:] != ["active"]:
+        raise SystemExit("панель не запущена: %s" % (detail or "rc=%s" % rc))
+    deadline = time.monotonic() + wait_s
+    while True:
+        rc, detail = run_result(
+            c, "curl -fsk --max-time 5 https://127.0.0.1:%d/healthz" % int(port), t=10)
+        if rc == 0 and detail.strip() == "ok":
+            return
+        if time.monotonic() >= deadline:
+            raise SystemExit("панель не прошла HTTPS /healthz: %s"
+                             % (detail or "rc=%s" % rc))
+        time.sleep(1)
+
+
 def _remove_own_staging(sftp, path):
     """Best-effort removal of only our root-owned private regular staging file."""
     try:
@@ -457,7 +476,6 @@ def acquire_remote_network_lock(c):
     marker = stdout.readline().strip()
     if marker != "REDUT_LOCKED":
         detail = stderr.read().decode("utf-8", "replace").strip()
-        c.close()
         raise SystemExit("vpn-agent занят; удалённый деплой отложен%s" %
                          ((": " + detail) if detail else ""))
     return stdin
@@ -520,13 +538,33 @@ def main(argv=None):
         print("\n[dry-run] ничего не залито.")
         return 0
 
+    with contextlib.ExitStack() as resources:
+        return _deploy(a, cfg, files, resources)
+
+
+def _deploy(a, cfg, files, resources):
+    """Every exit releases SFTP, the remote network lock and its SSH transport."""
     c = connect(SERVERS[a.server]["host"], SERVERS[a.server]["pw"])
+    resources.callback(c.close)
     print("\negress ДО:", run(c, "curl -s --max-time 15 --interface tun0 https://api.ipify.org", t=25),
           "| sing-box:", run(c, "systemctl is-active sing-box"))
 
     deploy_lock = acquire_remote_network_lock(c)
+    resources.callback(deploy_lock.close)
     remote_dns_preflight(c)
     require_remote_base_contract(c)
+
+    # --keep-config means the live file owns the panel port. Resolve and
+    # validate it while the network lock is held and before the first upload
+    # or other durable remote mutation; otherwise a malformed config can leave
+    # a partially replaced application behind and only then abort.
+    if a.keep_config and a.with_panel:
+        rc, port = run_result(
+            c, "python3 -c \"import json; print(json.load(open("
+               "'/etc/vpn-panel/config.json')).get('panel_port') or 8443)\"")
+        if rc != 0 or not port.isdigit() or not 1 <= int(port) <= 65535:
+            raise SystemExit("не удалось прочитать действующий порт панели: %s" % port)
+        a.panel_port = int(port)
 
     if not a.with_panel:
         panel_rc, panel_state = run_result(
@@ -536,7 +574,6 @@ def main(argv=None):
             "grep -Fq 'config_store.save_update_auto' /opt/vpn-panel/webpanel/server.py "
             "2>/dev/null || { echo REDUT_LEGACY_PANEL; exit 42; }; fi")
         if panel_rc != 0 or "REDUT_LEGACY_PANEL" in panel_state.splitlines():
-            c.close()
             sys.exit("установлена старая vpn-panel; повтори деплой с --with-panel")
 
     run(c, "mkdir -p %s/providers %s/webpanel /var/lib/vpn-panel/cfg && "
@@ -552,9 +589,9 @@ def main(argv=None):
            "install -d -o redut-dns -g redut-dns -m 0700 "
            "/var/lib/redut-dns-rescue /run/redut-dns-rescue && echo REDUT_DNS_IDENTITY_OK")
     if "REDUT_DNS_IDENTITY_OK" not in identity_state.splitlines():
-        c.close()
         sys.exit("не удалось подготовить системную учётку redut-dns")
     sftp = c.open_sftp()
+    resources.callback(sftp.close)
     for rel in files:
         sftp.put(os.path.join(PANEL_DIR, rel.replace("/", os.sep)), OPT + "/" + rel)
     # Версия узла (vpn/UPDATE-PLAN.md Ф0): её показывают панель и `vpn-agent status`,
@@ -643,18 +680,15 @@ def main(argv=None):
                       "redut-dns-rescue-watchdog.timer"):
         unit_src = os.path.join(template_dir, unit_name)
         if not os.path.isfile(unit_src):
-            c.close()
             sys.exit("нет systemd-шаблона %s" % unit_src)
         sftp.put(unit_src, "/etc/systemd/system/" + unit_name)
         sftp.chmod("/etc/systemd/system/" + unit_name, 0o644)
     # install/install.sh owns the one canonical watchdog template.  deploy.py
     # must not replace it with a second developer-tree implementation.
-    sftp.close()
     timer_state = run(c, "systemctl daemon-reload && "
                          "systemctl enable --now redut-dns-rescue-watchdog.timer && "
                          "systemctl is-active redut-dns-rescue-watchdog.timer")
     if timer_state.strip().splitlines()[-1:] != ["active"]:
-        c.close()
         sys.exit("DNS Rescue watchdog timer не запущен: %s" % timer_state)
 
     # Кроны (идемпотентно, расписание E2 1.3.0): сторож */2; списки провайдеров */30
@@ -714,14 +748,12 @@ def main(argv=None):
             print("\n⚠️ Админ ещё не настроен. На сервере выполни:")
             print("   python3 /opt/vpn-panel/webpanel/setup_admin.py")
             print("   (сгенерирует пароль + TOTP + recovery, покажет один раз)")
-        run(c, "systemctl daemon-reload && systemctl enable vpn-panel 2>/dev/null")
-        print("\nпанель:", run(c, "systemctl restart vpn-panel; sleep 1; systemctl is-active vpn-panel"))
+        activate_panel(c, a.panel_port)
+        print("\nпанель: active, HTTPS /healthz: ok")
         print("URL: https://%s:%d/" % (SERVERS[a.server]["host"], a.panel_port))
 
     print("\negress ПОСЛЕ:", run(c, "curl -s --max-time 15 --interface tun0 https://api.ipify.org", t=25),
           "| sing-box:", run(c, "systemctl is-active sing-box"))
-    deploy_lock.close()
-    c.close()
     return 0
 
 

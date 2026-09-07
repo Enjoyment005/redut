@@ -6,8 +6,12 @@
 повтор другим транспортом — только если запрос заведомо не был доставлен (unsent).
 """
 import os
+import http.client
+import http.server
+import socket
 import tempfile
 import subprocess
+import threading
 import unittest
 import urllib.error
 from unittest import mock
@@ -36,7 +40,7 @@ class _Fixture(unittest.TestCase):
             os.unlink(self.hint)
 
     def _direct(self, outcome):
-        def f(req, host_label, timeout):
+        def f(req, host_label, timeout, follow_redirects=True):
             self.calls.append("direct")
             if isinstance(outcome, Exception):
                 raise outcome
@@ -123,7 +127,7 @@ class TestTransport(_Fixture):
 
 
 class TestUrlopenClassification(unittest.TestCase):
-    """URLError (до ответа) -> unsent=True; сырой таймаут чтения -> unsent=False; HTTPError -> код."""
+    """Only proven connection failures permit a second financial request."""
 
     def _run(self, exc):
         import urllib.request
@@ -140,9 +144,80 @@ class TestUrlopenClassification(unittest.TestCase):
         finally:
             urllib.request.urlopen = orig
 
-    def test_urlerror_is_unsent(self):
+    def test_urlerror_reset_is_ambiguous(self):
         e = self._run(urllib.error.URLError(ConnectionResetError(104, "reset")))
-        self.assertTrue(e.network and e.unsent)
+        self.assertTrue(e.network)
+        self.assertFalse(e.unsent)
+
+    def test_urlerror_timeout_is_ambiguous(self):
+        e = self._run(urllib.error.URLError(TimeoutError("send timed out")))
+        self.assertTrue(e.network)
+        self.assertFalse(e.unsent)
+
+    def test_dns_and_connection_refusal_are_unsent(self):
+        for reason in (socket.gaierror(-2, "name not known"),
+                       ConnectionRefusedError(111, "refused")):
+            with self.subTest(reason=reason):
+                e = self._run(urllib.error.URLError(reason))
+                self.assertTrue(e.network and e.unsent)
+
+    def test_truncated_response_is_ambiguous_provider_error(self):
+        e = self._run(http.client.IncompleteRead(b'{"accepted":', 20))
+        self.assertTrue(e.network)
+        self.assertFalse(e.unsent)
+
+    def test_mutating_reset_does_not_retry_another_transport(self):
+        opener = mock.Mock()
+        opener.open.side_effect = urllib.error.URLError(
+            ConnectionResetError(104, "reset"))
+        with mock.patch.object(base, "preferred_transport", return_value="direct"), \
+                mock.patch.object(base, "_tun0_alive", return_value=True), \
+                mock.patch.object(base.urllib.request, "build_opener",
+                                  return_value=opener), \
+                mock.patch.object(base, "_curl_json", return_value={"accepted": True}) as retry:
+            with self.assertRaises(ProviderError):
+                base.http_post_form("https://x/api/renew/", {"period": 30}, mutating=True)
+            retry.assert_not_called()
+
+    def test_mutating_redirect_is_observed_and_never_followed(self):
+        events = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                events.append(("POST", self.path))
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(302)
+                self.send_header("Location", "/after")
+                self.end_headers()
+
+            def do_GET(self):
+                events.append(("GET", self.path))
+                payload = b'{"unexpected":true}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = "http://127.0.0.1:%d/mutate" % server.server_port
+            with mock.patch.object(base, "preferred_transport", return_value="direct"), \
+                    mock.patch.object(base, "_tun0_alive", return_value=True), \
+                    mock.patch.object(base, "_curl_json") as retry:
+                with self.assertRaises(ProviderError) as caught:
+                    base.http_post_form(url, {"period": 30}, mutating=True)
+            self.assertEqual(caught.exception.code, 302)
+            self.assertEqual(events, [("POST", "/mutate")])
+            retry.assert_not_called()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(5)
 
     def test_read_timeout_not_unsent(self):
         e = self._run(TimeoutError("The read operation timed out"))
@@ -247,6 +322,18 @@ class TestCurlParsing(unittest.TestCase):
             base._curl_json("https://x/", None, {"buy": 1}, "x", 5)
         self.assertTrue(e.exception.network)
         self.assertFalse(e.exception.unsent)
+
+    def test_curl_timeout_does_not_expose_authentication(self):
+        def timeout(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, 5)
+
+        base.subprocess.run = timeout
+        with self.assertRaises(ProviderError) as caught:
+            base._curl_json("https://x/api/URL-SECRET/buy/",
+                            {"API-KEY": "HEADER-SECRET"}, {"period": 30}, "x", 5)
+        self.assertNotIn("URL-SECRET", str(caught.exception))
+        self.assertNotIn("HEADER-SECRET", str(caught.exception))
+        self.assertFalse(caught.exception.unsent)
 
 
 if __name__ == "__main__":

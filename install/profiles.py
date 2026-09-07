@@ -14,7 +14,9 @@ profiles.json — читаемое зеркало этих данных (пер�
 Секреты провайдеров/SMTP тут НЕ хранятся — они в panel/.secrets.local.json (как в deploy.py).
 """
 import json
+import ipaddress
 import os
+import re
 import sys
 
 PROFILES = {
@@ -76,6 +78,26 @@ def build_profile(name, host, root_pw, overrides=None):
     for k, v in (overrides or {}).items():
         if v is not None:
             p[k] = v
+    if p["subnet"] != PROFILES[name]["subnet"]:
+        # --subnet replaces the address space, including inherited addresses.
+        # Preserve host offsets (.1 for wg0, .5 for the default phone), while
+        # rejecting an override too small to contain those hosts before SSH.
+        old_net = ipaddress.IPv4Network(PROFILES[name]["subnet"], strict=False)
+        new_net = ipaddress.IPv4Network(p["subnet"], strict=False)
+
+        def rebase(address):
+            old = ipaddress.IPv4Address(address)
+            offset = int(old) - int(old_net.network_address)
+            if old not in old_net or not 0 < offset < new_net.num_addresses - 1:
+                raise ValueError("адрес %s не помещается в подсеть %s" % (address, new_net))
+            return str(new_net.network_address + offset)
+
+        if not (overrides or {}).get("wg_ip"):
+            p["wg_ip"] = rebase(PROFILES[name].get("wg_ip")
+                                or str(old_net.network_address + 1))
+        if (overrides or {}).get("clients") is None:
+            for client in p["clients"]:
+                client["addr"] = rebase(client["addr"])
     # производные
     p.setdefault("wg_ip", p["subnet"].split("/")[0].rsplit(".", 1)[0] + ".1")
     p["wg_addr"] = "%s/%s" % (p["wg_ip"], p["subnet"].split("/")[1])
@@ -92,10 +114,65 @@ def effective_wg_ip(profile, subnet):
     (подсеть 10.10.10.0/24) профилем node1 (wg_ip 10.8.0.1) прописало бы wg0
     адрес чужой подсети и после ребута у клиентов умер бы DNS (ревью Ф2).
     """
-    first = (subnet or "").split("/")[0].rsplit(".", 1)[0] + ".1"
+    network = ipaddress.IPv4Network(str(subnet), strict=False)
+    if network.num_addresses < 4:
+        raise ValueError("подсеть %s не содержит отдельного адреса wg0" % network)
+    first = str(network.network_address + 1)
     if subnet and (profile or {}).get("subnet") != subnet:
         return first
     return (profile or {}).get("wg_ip") or first
+
+
+def parse_clients(spec, subnet, allow_empty=False):
+    """Parse a client count/list and validate every address against *subnet*.
+
+    Plain names receive consecutive addresses from network offset 2.  An item
+    may also preserve an existing address as ``name:IPv4`` during an update.
+    """
+    network = ipaddress.IPv4Network(str(subnet), strict=False)
+    value = str(spec or "").strip()
+    if re.fullmatch(r"\d+", value):
+        count = int(value)
+        if count > max(0, network.num_addresses - 3):
+            raise ValueError("клиент %s не помещается в подсеть %s" %
+                             (count, network))
+        entries = ["client%d" % i for i in range(1, count + 1)]
+    else:
+        entries = [item.strip() for item in value.split(",") if item.strip()]
+    if not entries:
+        if allow_empty:
+            return []
+        raise ValueError("список клиентов должен содержать хотя бы одного клиента")
+
+    reserved = {network.network_address, network.broadcast_address}
+    if network.num_addresses >= 2:
+        reserved.add(network.network_address + 1)  # wg0 server address
+    used = set()
+    used_names = set()
+    clients = []
+    for offset, entry in enumerate(entries, start=2):
+        if ":" in entry:
+            name, raw_address = (part.strip() for part in entry.split(":", 1))
+            try:
+                address = ipaddress.IPv4Address(raw_address)
+            except ipaddress.AddressValueError:
+                raise ValueError("неверный IPv4-адрес клиента %s" % entry)
+        else:
+            name = entry
+            address = network.network_address + offset
+        if not name:
+            raise ValueError("имя клиента не может быть пустым")
+        if name in used_names:
+            raise ValueError("имя клиента %s повторяется" % name)
+        if address not in network or address in reserved:
+            raise ValueError("адрес клиента %s не помещается в подсеть %s" %
+                             (address, network))
+        if address in used:
+            raise ValueError("адрес клиента %s повторяется" % address)
+        used_names.add(name)
+        used.add(address)
+        clients.append({"name": name, "addr": str(address)})
+    return clients
 
 
 def _shq(v):

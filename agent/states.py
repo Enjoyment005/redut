@@ -837,7 +837,12 @@ def _probe(pool, providers, row, current_host, cfg=None, persist=True):
     res = probe_mod.probe(row, provider_check=_check_cb(providers, row))
     is_cur = (row.get("host") == current_host)
     res["score"] = probe_mod.score(row, res, is_current=is_cur, cfg=cfg)
-    if persist and pool.get(row["uid"]):
+    classification = health_mod.classify_probe_result(res, cfg=cfg)
+    res["persistence_outcome"] = classification["outcome"]
+    if classification["decision"] is not None:
+        res["health_decision"] = classification["decision"]
+    if (persist and classification["outcome"] != health_mod.PROBE_INCONCLUSIVE
+            and pool.get(row["uid"])):
         pool.record_probe(row["uid"], res, is_current=is_cur,
                           strategy=country_mod.strategy(cfg))
     return res
@@ -1201,8 +1206,12 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
     reconcile_strategy_override(cfg, pool, log)
     try:
         current_host = apply_mod.current_upstream(apply_mod.load_json(cfg["singbox_config"]))
-    except (OSError, ValueError, KeyError):
-        current_host = None
+    except (OSError, ValueError, KeyError) as error:
+        # An unreadable snapshot does not prove the pinned channel disappeared.
+        # Preserve the owner's intent and stop before any failover/purchase.
+        detail = "не удалось прочитать sing-box config: %s" % type(error).__name__
+        pool.log_event("rotate", actor=actor, result="config-unavailable", detail=detail)
+        return _transition_failed(pool, result, state_before, "config-unavailable", detail)
     selection = selection_state(pool, cfg, current_host)
     if (selection["mode"] == SELECTION_MANUAL
             and selection.get("manual_host") != current_host):
@@ -1513,6 +1522,8 @@ def try_retune(cfg, providers, pool, alerter, log, actor, prior_evidence=None):
             evidence = list(prior_evidence or []) + list(res.get("evidence") or [])
             decision = health_mod.proxy_fault_decision(evidence, cfg=cfg)
             if decision["proxy_fault"]:
+                res["persistence_outcome"] = health_mod.PROBE_CONFIRMED_FAILURE
+                res["health_decision"] = decision
                 if pool.get(row["uid"]):
                     pool.record_probe(row["uid"], res, is_current=True,
                                       strategy=country_mod.strategy(cfg))

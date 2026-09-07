@@ -379,6 +379,33 @@ _ADD_COLUMNS = (
 
 def migrate(conn, db_path=None):
     """Идемпотентная миграция: повторный вызов ничего не ломает и не теряет."""
+    existing_user_tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+    dns_state_preexisting = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dns_rescue_state'"
+    ).fetchone() is not None
+    dns_operation_preexisting = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dns_rescue_operation'"
+    ).fetchone() is not None
+    setting_preexisting = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='setting'"
+    ).fetchone() is not None
+    dns_descriptor_residue = False
+    pre_dns_schema = not existing_user_tables
+    if setting_preexisting:
+        dns_descriptor_residue = conn.execute(
+            "SELECT 1 FROM setting WHERE key IN "
+            "('dns_boot_resume','dns_exit_resume','dns_incident_id','manual_emergency_ref') "
+            "AND COALESCE(value,'')<>'' LIMIT 1").fetchone() is not None
+        schema_row = conn.execute(
+            "SELECT value FROM setting WHERE key='schema_version'").fetchone()
+        schema_value = str(schema_row[0] if schema_row else "")
+        pre_dns_schema = (bool(schema_value) and schema_value.isascii()
+                          and schema_value.isdigit() and int(schema_value) <= 7)
+    initialize_dns_singleton = (not dns_state_preexisting
+                                and not dns_operation_preexisting
+                                and not dns_descriptor_residue
+                                and pre_dns_schema)
     for stmt in _SCHEMA:
         conn.execute(stmt)
     for table, col, typ in _ADD_COLUMNS:
@@ -394,6 +421,14 @@ def migrate(conn, db_path=None):
         " AND value<>'' AND value NOT GLOB '*[^0-9]*'"
         " AND CAST(value AS INTEGER) < ?",
         (SCHEMA_VERSION, int(SCHEMA_VERSION)))
+    # Materialize only a genuinely new/pre-DNS schema. An existing DNS table
+    # without its singleton is ambiguous and remains fail-closed; setup.sh owns
+    # the one exact v1.13.0 compatibility repair under the node-wide lock.
+    if initialize_dns_singleton:
+        conn.execute(
+            "INSERT OR IGNORE INTO dns_rescue_state"
+            "(singleton,phase,configured_mode,updated_at) "
+            "VALUES(1,'idle','disabled',?)", (now_iso(),))
     conn.commit()
     _migrate_roles_v2(conn, db_path)
 
@@ -960,88 +995,29 @@ class Pool:
         notes = []     # (action, uid, result, detail) — пишутся после commit
         for name, prov in providers.items():
             try:
-                items = prov.list()
+                # Complete and validate the response before taking SQLite's writer
+                # lock. Network waits for the next provider must not block heartbeats.
+                items = list(prov.list())
+                seen_ids = set()
+                for item in items:
+                    ext_id = item.get("ext_id") if isinstance(item, dict) else None
+                    if (not isinstance(item, dict) or item.get("provider") != name
+                            or not isinstance(ext_id, str) or not ext_id.strip()
+                            or ext_id != ext_id.strip()):
+                        raise ValueError("invalid normalized provider listing")
+                    uid = "%s:%s" % (name, ext_id)
+                    if uid in seen_ids:
+                        raise ValueError("duplicate uid in provider listing")
+                    seen_ids.add(uid)
             except Exception as e:
                 summary["errors"][name] = str(e)
                 continue
-            seen = []
-            added = updated = 0
-            if items:      # выдача снова непустая — подозрение снято
-                self.conn.execute("INSERT OR REPLACE INTO setting(key, value) VALUES(?, ?)",
-                                  ("empty-listing:%s" % name, "0"))
-            for it in items:
-                uid = "%s:%s" % (it["provider"], it["ext_id"])
-                seen.append(uid)
-                row = self.conn.execute("SELECT uid FROM proxy WHERE uid=?", (uid,)).fetchone()
-                if row:
-                    sets = ", ".join("%s=?" % f for f in _REFRESH_FIELDS)
-                    self.conn.execute(
-                        "UPDATE proxy SET %s, gone=0 WHERE uid=?" % sets,
-                        tuple(it.get(f) for f in _REFRESH_FIELDS) + (uid,))
-                    updated += 1
-                else:
-                    # вернулся тот же uid — поднимаем посмертную память (роль off,
-                    # cooldown, счётчик провалов), иначе воскресшая запись пришла бы
-                    # «чистой» и автоматика забыла бы решение владельца
-                    memo = self._take_memo(uid)
-                    self.conn.execute(
-                        "INSERT INTO proxy(uid, provider, ext_id, %s, role, gone)"
-                        " VALUES(%s)" % (", ".join(_REFRESH_FIELDS),
-                                         ",".join("?" * (3 + len(_REFRESH_FIELDS) + 2))),
-                        (uid, it["provider"], it["ext_id"])
-                        + tuple(it.get(f) for f in _REFRESH_FIELDS)
-                        + ((memo or {}).get("role") or DEFAULT_ROLE.get(name, "auto"), 0))
-                    if memo:
-                        self.conn.execute(
-                            "UPDATE proxy SET fail_count=?, cooldown_until=?, note=? WHERE uid=?",
-                            (memo.get("fail_count") or 0, memo.get("cooldown_until"),
-                             memo.get("note") or "", uid))
-                    added += 1
-            # ушедшие из выдачи: только у этого провайдера, только при успешном list()
-            qmarks = ",".join("?" * len(seen)) or "''"
-            missing = [dict(r) for r in self.conn.execute(
-                "SELECT * FROM proxy WHERE provider=? AND uid NOT IN (%s)" % qmarks,
-                (name, *seen)).fetchall()]
-            gone = removed = kept = 0
-            if missing and not items and not self._empty_listing_repeated(name):
-                # успешный, но пустой ответ при непустом пуле: похоже на сбой у
-                # провайдера — метим мягко и ждём подтверждения следующим опросом
-                cur = self.conn.execute(
-                    "UPDATE proxy SET gone=1 WHERE provider=?", (name,))
-                gone = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
-                summary["suspect"][name] = gone
-                # события пишем ПОСЛЕ commit: log_event идёт своей транзакцией,
-                # а здесь открыта наша (run_transaction вложенность запрещает)
-                notes.append(("pool-refresh", None, "empty-listing",
-                              "%s ответил успешно, но не вернул ни одного прокси —"
-                              " %d строк оставлены в пуле с меткой «пропал» до"
-                              " следующего опроса" % (name, gone)))
-            else:
-                for row in missing:
-                    if row["host"] and row["host"] in keep:
-                        # боевой канал: панель должна видеть, на чём сидит трафик
-                        self.conn.execute("UPDATE proxy SET gone=1 WHERE uid=?", (row["uid"],))
-                        gone += 1
-                        kept += 1
-                        continue
-                    self._save_memo(row)
-                    self.conn.execute("DELETE FROM proxy WHERE uid=?", (row["uid"],))
-                    removed += 1
-                    summary["vanished"].append({
-                        "uid": row["uid"], "provider": name, "host": row["host"],
-                        "country": row["country"], "exit_cc": row.get("exit_cc"),
-                        "date_end": row["date_end"], "role": row["role"]})
-                    notes.append((
-                        "proxy-vanished", row["uid"], "removed",
-                        "%s больше не отдаёт этот прокси (%s) — строка убрана из пула;"
-                        " аренда была оплачена до %s"
-                        % (name, row["host"] or "?", row["date_end"] or "?")))
-            summary["providers"][name] = {
-                "total": len(items), "added": added, "updated": updated,
-                "gone": gone, "removed": removed, "kept": kept,
-            }
-        if summary["vanished"]:
-            self._queue_vanished(summary["vanished"])
+            merged, provider_notes = self.run_transaction(
+                lambda conn: self._merge_provider_listing(name, items, keep))
+            summary["providers"].update(merged["providers"])
+            summary["suspect"].update(merged["suspect"])
+            summary["vanished"].extend(merged["vanished"])
+            notes.extend(provider_notes)
         if active is not None:
             known = {r[0] for r in self.conn.execute("SELECT DISTINCT provider FROM proxy")}
             for name in sorted(known - set(active)):
@@ -1055,6 +1031,90 @@ class Pool:
                        result="ok" if not summary["errors"] else "partial",
                        detail=json.dumps(summary, ensure_ascii=False))
         return summary
+
+    def _merge_provider_listing(self, name, items, keep):
+        """Merge one validated listing inside run_transaction; never call the API here."""
+        summary = {"providers": {}, "suspect": {}, "vanished": []}
+        notes = []
+        seen = []
+        added = updated = 0
+        if items:      # выдача снова непустая — подозрение снято
+            self.conn.execute("INSERT OR REPLACE INTO setting(key, value) VALUES(?, ?)",
+                              ("empty-listing:%s" % name, "0"))
+        for it in items:
+            uid = "%s:%s" % (it["provider"], it["ext_id"])
+            seen.append(uid)
+            row = self.conn.execute("SELECT uid FROM proxy WHERE uid=?", (uid,)).fetchone()
+            if row:
+                sets = ", ".join("%s=?" % f for f in _REFRESH_FIELDS)
+                self.conn.execute(
+                    "UPDATE proxy SET %s, gone=0 WHERE uid=?" % sets,
+                    tuple(it.get(f) for f in _REFRESH_FIELDS) + (uid,))
+                updated += 1
+            else:
+                # вернулся тот же uid — поднимаем посмертную память (роль off,
+                # cooldown, счётчик провалов), иначе воскресшая запись пришла бы
+                # «чистой» и автоматика забыла бы решение владельца
+                memo = self._take_memo(uid)
+                self.conn.execute(
+                    "INSERT INTO proxy(uid, provider, ext_id, %s, role, gone)"
+                    " VALUES(%s)" % (", ".join(_REFRESH_FIELDS),
+                                     ",".join("?" * (3 + len(_REFRESH_FIELDS) + 2))),
+                    (uid, it["provider"], it["ext_id"])
+                    + tuple(it.get(f) for f in _REFRESH_FIELDS)
+                    + ((memo or {}).get("role") or DEFAULT_ROLE.get(name, "auto"), 0))
+                if memo:
+                    self.conn.execute(
+                        "UPDATE proxy SET fail_count=?, cooldown_until=?, note=? WHERE uid=?",
+                        (memo.get("fail_count") or 0, memo.get("cooldown_until"),
+                         memo.get("note") or "", uid))
+                added += 1
+        # ушедшие из выдачи: только у этого провайдера, только при успешном list()
+        qmarks = ",".join("?" * len(seen)) or "''"
+        missing = [dict(r) for r in self.conn.execute(
+            "SELECT * FROM proxy WHERE provider=? AND uid NOT IN (%s)" % qmarks,
+            (name, *seen)).fetchall()]
+        gone = removed = kept = 0
+        if missing and not items and not self._empty_listing_repeated(name):
+            # успешный, но пустой ответ при непустом пуле: похоже на сбой у
+            # провайдера — метим мягко и ждём подтверждения следующим опросом
+            cur = self.conn.execute(
+                "UPDATE proxy SET gone=1 WHERE provider=?", (name,))
+            gone = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            summary["suspect"][name] = gone
+            # события пишем ПОСЛЕ commit: log_event идёт своей транзакцией,
+            # а здесь открыта наша (run_transaction вложенность запрещает)
+            notes.append(("pool-refresh", None, "empty-listing",
+                          "%s ответил успешно, но не вернул ни одного прокси —"
+                          " %d строк оставлены в пуле с меткой «пропал» до"
+                          " следующего опроса" % (name, gone)))
+        else:
+            for row in missing:
+                if row["host"] and row["host"] in keep:
+                    # боевой канал: панель должна видеть, на чём сидит трафик
+                    self.conn.execute("UPDATE proxy SET gone=1 WHERE uid=?", (row["uid"],))
+                    gone += 1
+                    kept += 1
+                    continue
+                self._save_memo(row)
+                self.conn.execute("DELETE FROM proxy WHERE uid=?", (row["uid"],))
+                removed += 1
+                summary["vanished"].append({
+                    "uid": row["uid"], "provider": name, "host": row["host"],
+                    "country": row["country"], "exit_cc": row.get("exit_cc"),
+                    "date_end": row["date_end"], "role": row["role"]})
+                notes.append((
+                    "proxy-vanished", row["uid"], "removed",
+                    "%s больше не отдаёт этот прокси (%s) — строка убрана из пула;"
+                    " аренда была оплачена до %s"
+                    % (name, row["host"] or "?", row["date_end"] or "?")))
+        summary["providers"][name] = {
+            "total": len(items), "added": added, "updated": updated,
+            "gone": gone, "removed": removed, "kept": kept,
+        }
+        if summary["vanished"]:
+            self._queue_vanished(summary["vanished"])
+        return summary, notes
 
     def purge_provider(self, name, keep_hosts=None):
         """П7-2 (1.6.0): провайдер без ключа выбывает целиком — его строки удаляются.
@@ -1139,6 +1199,8 @@ class Pool:
         cooldown -> «пул исчерпан» -> REPLENISH/EMERGENCY при живых прокси.
         Успешная проба заодно снимает активный cooldown (раньше снятие было
         только при успешной ротации)."""
+        if res.get("persistence_outcome") == "inconclusive":
+            return False
         stamp = now_iso()
 
         def write(conn):

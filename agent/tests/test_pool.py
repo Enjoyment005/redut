@@ -54,6 +54,52 @@ class TestPool(unittest.TestCase):
             "SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertLessEqual({"proxy", "event", "money", "setting"}, tables)
 
+    def test_migration_materializes_and_preserves_dns_singleton(self):
+        row = self.pool.conn.execute(
+            "SELECT phase,configured_mode FROM dns_rescue_state WHERE singleton=1"
+        ).fetchone()
+        self.assertEqual(tuple(row), ("idle", "disabled"))
+
+        self.pool.conn.execute(
+            "UPDATE dns_rescue_state SET phase='failed',last_error='sentinel' "
+            "WHERE singleton=1")
+        self.pool.conn.commit()
+        pool_mod.migrate(self.pool.conn)
+        row = self.pool.conn.execute(
+            "SELECT phase,last_error FROM dns_rescue_state WHERE singleton=1"
+        ).fetchone()
+        self.assertEqual(tuple(row), ("failed", "sentinel"))
+
+    def test_migration_never_masks_missing_singleton_with_dns_residue(self):
+        self.pool.conn.execute("DELETE FROM dns_rescue_state")
+        self.pool.conn.execute(
+            "INSERT INTO dns_rescue_operation"
+            "(id,incident_id,kind,phase,scope,actor,requested_at,updated_at,idempotency_key) "
+            "VALUES('op','incident','enter','running','all','test','t','t','key')")
+        self.pool.conn.execute(
+            "INSERT OR REPLACE INTO setting(key,value) VALUES('dns_exit_resume','opaque')")
+        self.pool.conn.commit()
+        pool_mod.migrate(self.pool.conn)
+        self.assertIsNone(self.pool.conn.execute(
+            "SELECT phase FROM dns_rescue_state WHERE singleton=1").fetchone())
+
+    def test_migration_never_masks_post_dns_table_loss(self):
+        self.pool.conn.execute("DROP TABLE dns_rescue_operation")
+        self.pool.conn.execute("DROP TABLE dns_rescue_state")
+        self.pool.conn.commit()
+        pool_mod.migrate(self.pool.conn)
+        self.assertIsNone(self.pool.conn.execute(
+            "SELECT phase FROM dns_rescue_state WHERE singleton=1").fetchone())
+
+    def test_migration_never_calls_existing_database_new_when_marker_is_lost(self):
+        self.pool.conn.execute("DROP TABLE dns_rescue_operation")
+        self.pool.conn.execute("DROP TABLE dns_rescue_state")
+        self.pool.conn.execute("DROP TABLE setting")
+        self.pool.conn.commit()
+        pool_mod.migrate(self.pool.conn)
+        self.assertIsNone(self.pool.conn.execute(
+            "SELECT phase FROM dns_rescue_state WHERE singleton=1").fetchone())
+
     def test_uid_format(self):
         self.pool.refresh({"proxy6": FakeProvider("proxy6", p6_items()),
                            "proxyline": FakeProvider("proxyline", pl_items())})

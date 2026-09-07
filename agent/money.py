@@ -378,6 +378,18 @@ def _date_value(value):
         return None
 
 
+def _expiry_advanced(before_value, after_value):
+    """Compare provider expiries without guessing a missing timezone."""
+    before, after = _date_value(before_value), _date_value(after_value)
+    if before is None or after is None:
+        return False
+    try:
+        return after > before
+    except TypeError:
+        # Mixed aware/naive timestamps are not proof of an extension.
+        return False
+
+
 def _ledger_rows_for_buy(op, proxies, price, response):
     count = len(proxies)
     if count < 1:
@@ -480,20 +492,18 @@ def _finalize_prolong(pool, op, response, new_end, *, actor, src_ip, recovered):
 
 def _recover_prolong(pool, op, provider, *, actor="auto", src_ip=""):
     request = op.get("request") or {}
-    before = _date_value(request.get("date_before"))
-    remote = _find_remote_proxy(provider, request.get("ext_id"))
-    after = _date_value((remote or {}).get("date_end"))
-    if before is None or after is None or after <= before:
-        pool.log_event("prolong", actor=actor, to_uid=op.get("uid"),
-                       result="unconfirmed", src_ip=src_ip,
-                       detail="продление НЕ подтверждено; durable intent сохраняется")
-        raise SpendDenied(
-            "предыдущее продление %s остаётся неподтверждённым; новая трата заблокирована"
-            % (op.get("uid") or request.get("ext_id")))
-    response = {"price": op["quote_price"], "currency": op["currency"],
-                "balance": None, "order_id": None}
-    return _finalize_prolong(pool, op, response, (remote or {}).get("date_end"),
-                             actor=actor, src_ip=src_ip, recovered=True)
+    # Neither supported provider accepts our durable request id. A later
+    # date_end increase therefore cannot be attributed to this exact request:
+    # another node or a human may have prolonged the same proxy concurrently.
+    # Keep the submitted intent as the stop-gate instead of inventing a charge.
+    pool.log_event("prolong", actor=actor, to_uid=op.get("uid"),
+                   result="unconfirmed", src_ip=src_ip,
+                   detail="продление НЕ подтверждено: нет корреляции операции; "
+                          "durable intent сохраняется")
+    raise SpendDenied(
+        "предыдущее продление %s остаётся неподтверждённым; "
+        "нужна ручная сверка, новая трата заблокирована"
+        % (op.get("uid") or request.get("ext_id")))
 
 
 def _validate_bound_request(op, kind, provider, expected, uid=None):
@@ -865,8 +875,8 @@ def prolong_with_limits(pool, provider, cfg, *, row, days, actor="auto", src_ip=
     """Продлить один прокси на days (§6.3) под гейтами трат + запись в money.
 
     row — запись пула (provider, ext_id, uid, descr). Для PROXY6 сверяем цену
-    через getprice ДО траты; у ProxyLine getprice нет — гейтим тумблером и пишем
-    цену из ответа /renew/ (валюта USD)."""
+    через getprice ДО траты. ProxyLine не даёт доверенной preflight-цены
+    и коррелируемого request id, поэтому его продление блокируем до мутации."""
     with _spend_lock(pool):
         return _prolong_with_limits_locked(
             pool, provider, cfg, row=row, days=days, actor=actor, src_ip=src_ip,
@@ -903,11 +913,19 @@ def _prolong_with_limits_locked(pool, provider, cfg, *, row, days,
     if not lim["buy_enabled"]:
         raise pre_submit_denial(
             "траты выключены тумблером buy_enabled — продление недоступно (§6.2)")
+    if pname != "proxy6":
+        # ProxyLine exposes neither a trusted preflight quote nor an idempotency
+        # key. Reusing the RUB numeric limits as USD already allowed a 200 USD
+        # mutation under an owner limit of 150 RUB. Unknown-price mutations are
+        # blocked before provider.list/prolong until a correlated quote exists.
+        raise pre_submit_denial(
+            "%s: нет доверенной предварительной цены и отдельного бюджета в валюте "
+            "провайдера — продление через Редут заблокировано" % pname)
     if existing is None:
         _guard_new_request(pool, {pname: provider}, actor=actor, src_ip=src_ip)
     price = None
     bal = None
-    currency = _currency(lim["currency"] if pname == "proxy6" else "USD")
+    currency = _currency(lim["currency"])
     if currency is None:
         raise pre_submit_denial(
             "валюта денежного лимита некорректна — продление отменено")
@@ -936,20 +954,11 @@ def _prolong_with_limits_locked(pool, provider, cfg, *, row, days,
         if (bal - price) < lim["min_balance_reserve"]:
             raise pre_submit_denial(
                 "продление опустит баланс ниже неснижаемого остатка (§6.2)")
-    else:
-        # У ProxyLine нет доверенной preflight-цены: резервируем верхний лимит,
-        # чтобы malformed ответ не превратил продление в бесплатное для ledger.
-        price = _num(lim["max_price_per_buy"])
-        if price is None or price <= 0:
-            raise pre_submit_denial(
-                "max_price_per_buy некорректен — продление отменено")
-        if _safe_spent_today(pool, currency) + price > lim["max_spend_per_day"]:
-            raise pre_submit_denial("суточный лимит трат превышен продлением (§6.2)")
-
-    date_before = row.get("date_end")
-    if _date_value(date_before) is None:
-        remote_before = _find_remote_proxy(provider, ext_id)
-        date_before = (remote_before or {}).get("date_end")
+    # A cached expiry may predate another node's/manual extension. Comparing a
+    # failed request against it would incorrectly attribute that older extension
+    # to this attempt and commit a fictitious charge. Take a live baseline.
+    remote_before = _find_remote_proxy(provider, ext_id)
+    date_before = (remote_before or {}).get("date_end")
     if _date_value(date_before) is None:
         raise pre_submit_denial(
             "не удалось зафиксировать date_end до продления — трата отменена")
@@ -1003,20 +1012,11 @@ def _prolong_with_limits_locked(pool, provider, cfg, *, row, days,
         if isinstance(proxy_map, dict):
             target = proxy_map.get(str(ext_id)) or {}
             new_end = target.get("date_end") if isinstance(target, dict) else None
-        if (_date_value(new_end) is None
-                or _date_value(new_end) <= _date_value(date_before)):
-            pool.log_event("prolong", actor=actor, to_uid=uid, result="unconfirmed",
-                           src_ip=src_ip,
-                           detail="ответ prolong не подтверждает новый date_end; intent сохранён")
-            raise SpendDenied("ответ prolong не подтверждает новый date_end; повтор заблокирован")
-    else:
-        acknowledged = (resp or {}).get("proxies")
-        if not isinstance(acknowledged, (list, tuple, set)) or str(ext_id) not in {
-                str(value) for value in acknowledged}:
-            pool.log_event("prolong", actor=actor, to_uid=uid, result="unconfirmed",
-                           src_ip=src_ip,
-                           detail="ответ prolong не подтверждает proxy id; intent сохранён")
-            raise SpendDenied("ответ prolong не подтверждает proxy id; повтор заблокирован")
+    if not _expiry_advanced(date_before, new_end):
+        pool.log_event("prolong", actor=actor, to_uid=uid, result="unconfirmed",
+                       src_ip=src_ip,
+                       detail="ответ prolong не подтверждает новый date_end; intent сохранён")
+        raise SpendDenied("ответ prolong не подтверждает новый date_end; повтор заблокирован")
     result = _finalize_prolong(pool, op, resp, new_end, actor=actor,
                                src_ip=src_ip, recovered=False)
     return _deliver_result(pool, result, rid)

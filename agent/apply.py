@@ -29,6 +29,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import uuid
 
@@ -170,13 +171,22 @@ def load_json(path):
 
 
 def dump_json_replace(obj, path):
-    tmp = "%s.%s.tmp" % (path, uuid.uuid4().hex)
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    """Publish private JSON atomically, without leaving partial credentials."""
+    parent = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=".%s." % os.path.basename(path),
+                               suffix=".tmp", dir=parent)
+    try:
+        # mkstemp creates mode 0600 from the first byte, regardless of umask.
+        # The staged inode becomes live via os.replace, retaining that mode.
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def atomic_copy_replace(src, dst):
@@ -288,7 +298,13 @@ def antiloop_replace(new_ip, old_ip, gw, wan):
     """ip route replace <new>/32 via gw dev wan; маршрут старого убрать (§9.5)."""
     if not (gw and wan):
         return "нет gw/wan в конфиге — anti-loop пропущен"
-    run_cmd(["ip", "route", "replace", "%s/32" % new_ip, "via", gw, "dev", wan])
+    rc, out = run_cmd(["ip", "route", "replace", "%s/32" % new_ip,
+                       "via", gw, "dev", wan])
+    if rc != 0:
+        # Keep the previous escape route until the successor is installed.
+        # Raising leaves a post-mutation saga recoverable instead of claiming
+        # a completed switch while the new proxy can loop through tun0.
+        raise ApplyError("anti-loop: не установлен маршрут %s/32: %s" % (new_ip, out))
     if old_ip and probe_mod.is_ipv4(old_ip) and old_ip != new_ip:
         run_cmd(["ip", "route", "del", "%s/32" % old_ip])
     return "anti-loop: %s/32 via %s dev %s" % (new_ip, gw, wan)
@@ -315,7 +331,10 @@ def patch_boot_script(path, old_ip, new_ip):
     with open(path, encoding="utf-8") as f:
         text = f.read()
     if old_ip:
-        new_text = re.sub(re.escape(old_ip), new_ip, text)
+        # An upstream can be a substring of a different gateway/server IP:
+        # replacing 1.2.3.4 must never turn 11.2.3.4 into 18.8.8.8.
+        exact_ip = r"(?<![0-9.])" + re.escape(old_ip) + r"(?![0-9]|\.[0-9])"
+        new_text = re.sub(exact_ip, new_ip, text)
     else:
         put = lambda m: m.group(1) + new_ip + m.group(3)  # noqa: E731
         new_text = _BOOT_ANTILOOP_RE.sub(put, _BOOT_UPHOST_RE.sub(put, text))
@@ -341,11 +360,12 @@ def verify_egress(expect_host=None):
     rc, ip = run_cmd(["curl", "-s", "--max-time", str(VERIFY_TIMEOUT),
                       "--interface", "tun0", probe_mod.IPIFY_URL], timeout=VERIFY_TIMEOUT + 10)
     ip = ip.strip()
-    out = {"egress_ip": ip if probe_mod.looks_like_ip(ip) else None,
+    ip_ok = rc == 0 and probe_mod.looks_like_ip(ip)
+    out = {"egress_ip": ip if ip_ok else None,
            "exit_cc": None, "tg_code": None, "ok": False, "why": "", "why_kind": "",
            "evidence": [health_mod.evidence(
-               "http", bool(probe_mod.looks_like_ip(ip)), target=probe_mod.IPIFY_URL,
-               via_proxy=True, error_kind="" if probe_mod.looks_like_ip(ip)
+               "http", bool(ip_ok), target=probe_mod.IPIFY_URL,
+               via_proxy=True, error_kind="" if ip_ok
                else "external-or-transport", detail="tun0 curl_rc=%s" % rc)]}
     if not out["egress_ip"]:
         out["why"], out["why_kind"] = "egress через tun0 пуст", "no-ip"
@@ -368,7 +388,7 @@ def verify_egress(expect_host=None):
                         "-o", "/dev/null", "-w", "%{http_code}", probe_mod.TG_URL],
                        timeout=VERIFY_TIMEOUT + 10)
     out["tg_code"] = code if rc == 0 else "000"
-    tg_ok = bool(code.isdigit() and 200 <= int(code) <= 499)
+    tg_ok = bool(rc == 0 and code.isdigit() and 200 <= int(code) <= 499)
     out["evidence"].append(health_mod.evidence(
         "telegram", tg_ok, target=probe_mod.TG_URL, via_proxy=True,
         error_kind="" if tg_ok else ("tcp-refused" if rc == 7 else "transport-error"),
@@ -382,10 +402,12 @@ def verify_egress(expect_host=None):
 
 
 def restart_singbox():
-    run_cmd(["systemctl", "restart", "sing-box"], timeout=60)
+    rc, _out = run_cmd(["systemctl", "restart", "sing-box"], timeout=60)
+    if rc != 0:
+        return False
     time.sleep(3)
     rc, act = run_cmd(["systemctl", "is-active", "sing-box"])
-    return act.strip() == "active"
+    return rc == 0 and act.strip() == "active"
 
 
 # ------------------------------------------------------------------ оркестрация

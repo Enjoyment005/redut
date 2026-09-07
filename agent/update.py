@@ -20,6 +20,7 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
 import time
 
 PANEL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -147,14 +148,33 @@ def load_state(cfg):
 
 
 def save_state(cfg, st):
-    """Атомарно: оборванная запись не должна оставить битый JSON (по образцу set_version).
-    Имя tmp — с pid: крон и кнопка панели могут писать одновременно, и общий .tmp
-    ронял бы второго на os.replace (ревью Ф1)."""
+    """Atomic snapshot; runtime read-modify-write callers use mutate_state."""
     path = state_path(cfg)
-    tmp = "%s.%d.tmp" % (path, os.getpid())
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(st, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(prefix=".redut-update-", suffix=".tmp",
+                               dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def mutate_state(cfg, mutator):
+    """Serialize each complete read-modify-write across check/apply processes.
+
+    The network request happens outside this lock. Reuse the config writer's
+    cross-platform locking primitive, keyed to update.json instead of config.
+    """
+    import config_store
+    with config_store.writer({"_source": state_path(cfg)}, create=True):
+        st = load_state(cfg)
+        mutator(st)
+        save_state(cfg, st)
+        return st
 
 
 def _seen(st, key, version):
@@ -272,7 +292,6 @@ def check(cfg, pool=None, alerter=None, log=None):
     log = log or (lambda m: None)
     u = update_cfg(cfg)
     local = node_version()
-    st = load_state(cfg)
     out = {"local": local, "remote": None, "newer": False, "bad": False,
            "error": None, "repo": u["repo"], "auto": u["auto"]}
     try:
@@ -280,25 +299,30 @@ def check(cfg, pool=None, alerter=None, log=None):
         out["remote"] = remote
     except UpdateError as e:
         out["error"] = str(e)
-        st.update(last_check=now_iso(), last_error=str(e))
-        save_state(cfg, st)
+        mutate_state(cfg, lambda st: st.update(last_check=now_iso(), last_error=str(e)))
         log("проверка обновлений: %s" % e)
         return out
-    out["newer"] = is_newer(remote, local)
-    out["bad"] = remote in (st.get("bad_versions") or [])
-    news = out["newer"] and not out["bad"]
-    event_new = news and not _seen(st, "notified_versions", remote)
-    mail_new = news and not _seen(st, "mailed_versions", remote)
-    st.update(last_check=now_iso(), latest_seen=remote, last_error=None)
-    if event_new:
-        _mark(st, "notified_versions", remote)
-    # Письмо помечаем отправленным ТОЛЬКО по факту (send()==True) или когда SMTP не
-    # настроен (ждать нечего): иначе разовый сбой почты терял письмо о версии навсегда
-    # (ревью Ф1: notified ставился до send, а send по своей философии не бросает).
+    event_new = mail_new = False
+
+    def record_check(st):
+        nonlocal event_new, mail_new
+        out["newer"] = is_newer(remote, local)
+        out["bad"] = remote in (st.get("bad_versions") or [])
+        news = out["newer"] and not out["bad"]
+        event_new = news and not _seen(st, "notified_versions", remote)
+        mail_new = news and not _seen(st, "mailed_versions", remote)
+        st.update(last_check=now_iso(), latest_seen=remote, last_error=None)
+        if event_new:
+            _mark(st, "notified_versions", remote)
+
+    mutate_state(cfg, record_check)
+    # SMTP must not hold the state/config writer lock. Keep the existing
+    # at-least-once behavior: only a successful send (or absent SMTP config)
+    # marks delivery, in a separate mutation preserving concurrent apply state.
     if mail_new and alerter is not None:
-        if not getattr(alerter, "configured", True):
-            _mark(st, "mailed_versions", remote)
-        elif alerter.send(
+        mailed = not getattr(alerter, "configured", True)
+        if not mailed:
+            mailed = alerter.send(
                 "Редут: вышла версия %s" % remote,
                 "На узле «%s» сейчас Редут %s, в репозитории %s появилась версия %s.\n\n"
                 "%s\n\nОбновить вручную: панель, карточка «Обновления» -> «Обновить сейчас», "
@@ -306,9 +330,9 @@ def check(cfg, pool=None, alerter=None, log=None):
                 % (cfg.get("server") or "?", local or "?", u["repo"], remote,
                    ("Автообновление включено — узел сам обновится в окно %s (по времени сервера)."
                     % u["window"]) if u["auto"] else
-                   "Автообновление выключено — узел сам ничего делать не будет.")):
-            _mark(st, "mailed_versions", remote)
-    save_state(cfg, st)
+                   "Автообновление выключено — узел сам ничего делать не будет."))
+        if mailed:
+            mutate_state(cfg, lambda st: _mark(st, "mailed_versions", remote))
     log("узел %s, маяк %s (%s)" % (local or "?", remote,
                                    "новее — доступно обновление" if out["newer"] else "не новее"))
     if event_new and pool is not None:
@@ -954,10 +978,9 @@ def _apply_install(cfg, pool, alerter, log, target, manual, res, baseline,
 
     if ok_v:
         res["ok"] = True
-        st = load_state(cfg)
-        st["last_apply"] = {"ts": now_iso(), "from": local, "to": target,
-                            "ok": True, "manual": manual, "force": bool(force)}
-        save_state(cfg, st)
+        mutate_state(cfg, lambda st: st.update(last_apply={
+            "ts": now_iso(), "from": local, "to": target,
+            "ok": True, "manual": manual, "force": bool(force)}))
         status_write("done", ok=True, to=target, frm=local)
         _event(pool, "update-apply", target,
                "с %s%s" % (local or "?",
@@ -998,18 +1021,19 @@ def _apply_install(cfg, pool, alerter, log, target, manual, res, baseline,
     else:
         log("Прежнего дерева нет (%s) — откатывать нечем, нужен человек" % REDUT_PREV)
 
-    st = load_state(cfg)
     # Чёрный список — про «на эту версию не ОБНОВЛЯТЬСЯ»: провал переустановки ТОЙ ЖЕ
     # версии (force) туда не пишем — автоматика на неё и так не пойдёт (не новее),
     # а помечать работающую версию узла «проблемной» — только путать карточку.
-    if target != local:
-        bad = set(st.get("bad_versions") or [])
-        bad.add(target)
-        st["bad_versions"] = sorted(bad)
-    st["last_apply"] = {"ts": now_iso(), "from": local, "to": target, "ok": False,
-                        "rolled_back": rolled, "why": why_v, "manual": manual,
-                        "force": bool(force)}
-    save_state(cfg, st)
+    def record_failure(st):
+        if target != local:
+            bad = set(st.get("bad_versions") or [])
+            bad.add(target)
+            st["bad_versions"] = sorted(bad)
+        st["last_apply"] = {"ts": now_iso(), "from": local, "to": target, "ok": False,
+                            "rolled_back": rolled, "why": why_v, "manual": manual,
+                            "force": bool(force)}
+
+    mutate_state(cfg, record_failure)
     res.update(rolled_back=rolled, why=why_v)
     status_write("failed", why=why_v, rolled_back=rolled, to=target, frm=local)
     _event(pool, "update-fail", target, "%s; откат %s" % (why_v, "успешен" if rolled else "НЕ УДАЛСЯ"))

@@ -56,6 +56,9 @@ class FakeProxy6:
         self.find_descr = descr
         return [dict(x, descr=descr) for x in self.found]
 
+    def list(self):
+        return [self._mk("fi", "")]
+
     def prolong(self, ids, period, on_submit=None):
         if on_submit is not None:
             on_submit()
@@ -713,6 +716,101 @@ class TestIdempotency(Base):
 
 
 class TestProlong(Base):
+    def test_stale_local_expiry_cannot_confirm_unsuccessful_prolong(self):
+        class StaleLocal(FakeProxy6):
+            prolong_calls = 0
+
+            def list(inner_self):
+                return [dict(inner_self._mk("fi", ""),
+                             date_end="2026-09-20T10:00:00")]
+
+            def prolong(inner_self, ids, period, on_submit=None):
+                on_submit()
+                inner_self.prolong_calls += 1
+                raise ProviderError("response lost", network=True)
+
+        provider = StaleLocal()
+        row = dict(provider._mk("fi", ""), uid="proxy6:50")
+        with self.assertRaises(money.SpendDenied):
+            money.prolong_with_limits(self.pool, provider, cfg(), row=row, days=30,
+                                      request_id="stale-local-expiry-request")
+        self.assertEqual(provider.prolong_calls, 1)
+        self.assertEqual(self.money_rows("prolong"), [])
+        self.assertEqual(self.pool.pending_spend_operations()[0]["phase"], "submitted")
+
+    def test_unavailable_remote_expiry_denies_before_submit(self):
+        provider = FakeProxy6()
+        row = dict(provider._mk("fi", ""), uid="proxy6:50")
+        provider.list = lambda: []
+        submitted = []
+        provider.prolong = lambda *args, **kwargs: submitted.append(True)
+        with self.assertRaises(money.SpendDenied):
+            money.prolong_with_limits(self.pool, provider, cfg(), row=row, days=30)
+        self.assertEqual(submitted, [])
+        self.assertEqual(self.money_rows("prolong"), [])
+
+    def test_proxyline_is_denied_before_unquoted_mutation(self):
+        class EchoOnly(FakeProxy6):
+            name = "proxyline"
+            prolong_calls = 0
+
+            def list(inner_self):
+                return [dict(inner_self._mk("fi", ""), provider="proxyline")]
+
+            def prolong(inner_self, ids, period, on_submit=None):
+                on_submit()
+                inner_self.prolong_calls += 1
+                return {"proxies": [str(ids)], "price": 1.2, "currency": "USD"}
+
+        provider = EchoOnly()
+        row = dict(provider.list()[0], uid="proxyline:50")
+        with self.assertRaises(money.SpendDenied):
+            money.prolong_with_limits(self.pool, provider, cfg(), row=row, days=30,
+                                      request_id="unconfirmed-proxyline-request")
+        self.assertEqual(provider.prolong_calls, 0)
+        self.assertEqual(self.money_rows("prolong"), [])
+
+    def test_proxyline_observed_extension_still_cannot_supply_a_preflight_quote(self):
+        class Confirmed(FakeProxy6):
+            name = "proxyline"
+            prolong_calls = 0
+            remote_end = "2026-08-21T10:00:00+00:00"
+
+            def list(inner_self):
+                return [dict(inner_self._mk("fi", ""), provider="proxyline",
+                             date_end=inner_self.remote_end)]
+
+            def prolong(inner_self, ids, period, on_submit=None):
+                on_submit()
+                inner_self.prolong_calls += 1
+                inner_self.remote_end = "2026-09-20T10:00:00+00:00"
+                return {"proxies": [str(ids)], "price": 1.2, "currency": "USD"}
+
+        provider = Confirmed()
+        self.pool.upsert_proxy(provider.list()[0], role="auto")
+        with self.assertRaises(money.SpendDenied):
+            money.prolong_with_limits(
+                self.pool, provider, cfg(), row=self.pool.get("proxyline:50"), days=30,
+                request_id="confirmed-proxyline-request")
+        self.assertEqual(provider.prolong_calls, 0)
+        self.assertEqual(self.money_rows("prolong"), [])
+
+    def test_incomparable_expiries_preserve_pending_intent(self):
+        provider = FakeProxy6()
+        row = dict(provider._mk("fi", ""), uid="proxy6:50")
+        original = provider.prolong
+
+        def mismatched_timezone(*args, **kwargs):
+            result = original(*args, **kwargs)
+            result["proxies"]["50"]["date_end"] = "2026-09-20T10:00:00+00:00"
+            return result
+
+        provider.prolong = mismatched_timezone
+        with self.assertRaises(money.SpendDenied):
+            money.prolong_with_limits(self.pool, provider, cfg(), row=row, days=30)
+        self.assertEqual(self.pool.pending_spend_operations()[0]["phase"], "submitted")
+        self.assertEqual(self.money_rows("prolong"), [])
+
     def test_records_and_updates_date_end(self):
         prov = FakeProxy6(price=120.0)
         self.pool.upsert_proxy({"provider": "proxy6", "ext_id": "50", "ip": "1.2.3.4",
@@ -756,7 +854,7 @@ class TestProlong(Base):
                         self.pool, provider, cfg(max_price_per_buy=200), row=row, days=30)
         self.assertEqual(self.money_rows("prolong"), [])
 
-    def test_kill_after_prolong_acceptance_recovers_after_reopen(self):
+    def test_kill_after_prolong_acceptance_requires_manual_reconciliation(self):
         class KillAfterAccept(FakeProxy6):
             def __init__(inner_self):
                 super().__init__(price=120)
@@ -788,14 +886,46 @@ class TestProlong(Base):
                                       row=row, days=30, request_id=request_id)
         self.pool.close()
         self.pool = pool_mod.Pool(self.db, server="node1")
-        result = money.prolong_with_limits(
-            self.pool, prov, cfg(max_price_per_buy=200),
-            row=self.pool.get("proxy6:50"), days=30, request_id=request_id)
-        self.assertTrue(result["recovered"])
+        with self.assertRaises(money.SpendDenied):
+            money.prolong_with_limits(
+                self.pool, prov, cfg(max_price_per_buy=200),
+                row=self.pool.get("proxy6:50"), days=30, request_id=request_id)
         self.assertEqual(prov.prolong_calls, 1)
-        self.assertEqual(len(self.money_rows("prolong")), 1)
+        self.assertEqual(self.money_rows("prolong"), [])
+        self.assertEqual(self.pool.pending_spend_operations()[0]["phase"], "submitted")
         self.assertEqual(self.pool.get("proxy6:50")["date_end"],
-                         "2026-09-20T10:00:00")
+                         "2026-08-21T10:00:00")
+
+    def test_unrelated_expiry_change_cannot_reconcile_lost_response(self):
+        class ChangedElsewhere(FakeProxy6):
+            def __init__(inner_self):
+                super().__init__(price=120)
+                inner_self.list_calls = 0
+                inner_self.prolong_calls = 0
+
+            def list(inner_self):
+                inner_self.list_calls += 1
+                end = ("2026-08-21T10:00:00" if inner_self.list_calls == 1
+                       else "2026-09-20T10:00:00")
+                item = inner_self._mk("fi", "")
+                item["date_end"] = end
+                return [item]
+
+            def prolong(inner_self, ids, period, on_submit=None):
+                on_submit()
+                inner_self.prolong_calls += 1
+                raise ProviderError("response lost", network=True)
+
+        provider = ChangedElsewhere()
+        row = dict(provider._mk("fi", ""), uid="proxy6:50")
+        with self.assertRaises(money.SpendDenied):
+            money.prolong_with_limits(self.pool, provider, cfg(max_price_per_buy=200),
+                                      row=row, days=30,
+                                      request_id="unrelated-expiry-change")
+        self.assertEqual(provider.prolong_calls, 1)
+        self.assertEqual(provider.list_calls, 1)
+        self.assertEqual(self.money_rows("prolong"), [])
+        self.assertEqual(self.pool.pending_spend_operations()[0]["phase"], "submitted")
 
 
 class TestCanDelete(unittest.TestCase):

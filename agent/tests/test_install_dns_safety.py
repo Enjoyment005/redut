@@ -1,6 +1,14 @@
 # -*- coding: utf-8 -*-
+import contextlib
+import io
+import json
 import os
+import sqlite3
+import subprocess
+import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -15,6 +23,147 @@ def read_layout(canonical, public):
     """Read a file whose allowlisted public destination differs."""
     canonical_path = os.path.join(ROOT, canonical)
     return read(canonical if os.path.exists(canonical_path) else public)
+
+
+class TestLegacyDNSPreflightMaterialization(unittest.TestCase):
+    STATE_SCHEMA = """CREATE TABLE dns_rescue_state(
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1), phase TEXT NOT NULL,
+        configured_mode TEXT NOT NULL, incident_id TEXT, active_scope TEXT,
+        active_slot TEXT, activated_at TEXT,
+        attempt_used INTEGER NOT NULL DEFAULT 0,
+        return_successes INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+        updated_at TEXT NOT NULL)"""
+    OPERATION_SCHEMA = """CREATE TABLE dns_rescue_operation(
+        id TEXT PRIMARY KEY, incident_id TEXT NOT NULL, kind TEXT NOT NULL,
+        phase TEXT NOT NULL, slot_id TEXT, scope TEXT NOT NULL,
+        actor TEXT NOT NULL, requested_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        finished_at TEXT, error TEXT, idempotency_key TEXT NOT NULL UNIQUE)"""
+
+    @staticmethod
+    def _program():
+        setup = read_layout("install/setup.sh", "setup.sh")
+        block = setup.split("python3 - <<'PY' || die", 1)[1].split("\nPY\n", 1)[0]
+        return block.split("\n", 1)[1]
+
+    def _exercise(self, version="1.13.0", dns=None, operation=False,
+                  descriptor=False, artifact=False, firewall=False,
+                  process=False, unit="inactive", malformed_schema=False,
+                  blank_state=False, repeat=False):
+        dns = ({"mode": "disabled", "owner_approved": False,
+                "automatic_ready": False} if dns is None else dns)
+        program = self._program()
+        real_connect = sqlite3.connect
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "state.db")
+            conn = real_connect(db)
+            conn.execute("CREATE TABLE setting(key TEXT PRIMARY KEY,value TEXT)")
+            state_schema = (self.STATE_SCHEMA.replace(", last_error TEXT", "")
+                            if malformed_schema else self.STATE_SCHEMA)
+            conn.execute(state_schema)
+            conn.execute(self.OPERATION_SCHEMA)
+            if blank_state:
+                conn.execute(
+                    "INSERT INTO dns_rescue_state(singleton,phase,configured_mode,updated_at) "
+                    "VALUES(1,'','disabled','old')")
+            if operation:
+                conn.execute(
+                    "INSERT INTO dns_rescue_operation"
+                    "(id,incident_id,kind,phase,scope,actor,requested_at,updated_at,idempotency_key) "
+                    "VALUES('op','incident','enter','done','all','test','t','t','key')")
+            if descriptor:
+                conn.execute("INSERT INTO setting(key,value) VALUES('dns_exit_resume','opaque')")
+            conn.commit()
+            conn.close()
+
+            config_text = json.dumps({"db": "/var/lib/vpn-panel/state.db",
+                                      "dns_rescue": dns})
+            artifact_paths = {
+                "/etc/redut-dns-rescue", "/var/lib/redut-dns-rescue",
+                "/run/redut-dns-rescue", "/run/redut-dns-rescue-controller",
+            }
+
+            def fake_open(path, *args, **kwargs):
+                if path == "/etc/vpn-panel/config.json":
+                    return io.StringIO(config_text)
+                if path == "/opt/vpn-panel/VERSION":
+                    return io.StringIO(version)
+                raise FileNotFoundError(path)
+
+            def fake_run(command, **_kwargs):
+                if command[:2] == ["systemctl", "is-active"]:
+                    return SimpleNamespace(returncode=0, stdout=unit + "\n", stderr="")
+                if command[:2] == ["systemctl", "show"]:
+                    return SimpleNamespace(returncode=0, stdout="loaded\n", stderr="")
+                if command[0].endswith("iptables-save"):
+                    output = ("*nat\n:REDUT_DNS_TEST - [0:0]\n" if firewall else "")
+                    return SimpleNamespace(returncode=0, stdout=output, stderr="")
+                if command[:3] == ["ps", "-eo", "pid=,ppid=,args="]:
+                    output = "%d 1 python3 -c redut-dns-rescue-guard\n1 0 init\n" % os.getpid()
+                    output += ("999 1 sing-box run -c /etc/redut-dns-rescue/config.json\n"
+                               if process else
+                               "998 1 sing-box run -c /etc/sing-box/config.json\n")
+                    return SimpleNamespace(returncode=0, stdout=output, stderr="")
+                raise AssertionError(command)
+
+            def fake_lexists(path):
+                return path in ({"/etc/vpn-panel/config.json",
+                                 "/opt/vpn-panel/VERSION",
+                                 "/var/lib/vpn-panel/state.db"} | artifact_paths)
+
+            def fake_isfile(path):
+                return path in {"/opt/vpn-panel/VERSION",
+                                "/var/lib/vpn-panel/state.db"}
+
+            def fake_connect(_path, **_kwargs):
+                return real_connect(db, timeout=2.0)
+
+            def fake_listdir(path):
+                if path in artifact_paths:
+                    return ["residue"] if artifact else []
+                raise FileNotFoundError(path)
+
+            error = None
+            with mock.patch("builtins.open", side_effect=fake_open), \
+                 mock.patch("os.path.lexists", side_effect=fake_lexists), \
+                 mock.patch("os.path.isfile", side_effect=fake_isfile), \
+                 mock.patch("os.path.islink", return_value=False), \
+                 mock.patch("os.path.isdir", side_effect=lambda p: p in artifact_paths), \
+                 mock.patch("os.listdir", side_effect=fake_listdir), \
+                 mock.patch("sqlite3.connect", side_effect=fake_connect), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    for _index in range(2 if repeat else 1):
+                        exec(program, {"__name__": "dns_preflight_test"})
+                except SystemExit as exc:
+                    error = str(exc)
+            conn = real_connect(db)
+            rows = conn.execute(
+                "SELECT singleton,phase,configured_mode FROM dns_rescue_state").fetchall()
+            conn.close()
+            return error, rows
+
+    def test_exact_legacy_empty_state_is_materialized_once(self):
+        error, rows = self._exercise(repeat=True)
+        self.assertIsNone(error)
+        self.assertEqual(rows, [(1, "idle", "disabled")])
+
+    def test_unsafe_or_unknown_legacy_state_is_never_materialized(self):
+        cases = (
+            {"version": "1.13.1"},
+            {"dns": {"mode": "automatic", "owner_approved": False,
+                     "automatic_ready": False}},
+            {"dns": {"mode": "disabled", "owner_approved": True,
+                     "automatic_ready": False}},
+            {"operation": True}, {"descriptor": True}, {"artifact": True},
+            {"firewall": True}, {"process": True}, {"unit": "active"},
+            {"malformed_schema": True}, {"blank_state": True},
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                error, rows = self._exercise(**case)
+                self.assertIsNotNone(error)
+                self.assertNotEqual(rows, [(1, "idle", "disabled")])
 
 
 class TestBootOwnership(unittest.TestCase):
@@ -186,6 +335,7 @@ class TestSupplyChain(unittest.TestCase):
         self.assertLess(preflight, apt)
         self.assertIn("DNS_PREFLIGHT_REQUIRED=0", setup)
         self.assertIn("DNS Rescue state singleton/phase is missing", setup)
+        self.assertIn("_materialize_legacy_1130_idle", setup)
         locked_preflight = setup.index("DNS_PREFLIGHT_REQUIRED=0", lock)
         self.assertLess(lock, locked_preflight)
         self.assertLess(locked_preflight, apt)

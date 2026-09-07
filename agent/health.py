@@ -7,6 +7,9 @@ import time
 
 DEFAULT_QUORUM = {"quorum_window_seconds": 60.0, "quorum_min_targets": 2}
 _PROXY_SIGNALS = frozenset({"socks", "http", "telegram"})
+PROBE_HEALTHY = "healthy"
+PROBE_CONFIRMED_FAILURE = "confirmed_failure"
+PROBE_INCONCLUSIVE = "inconclusive"
 
 
 def evidence(signal, ok, target="", observed_at=None, error_kind="", via_proxy=False,
@@ -109,3 +112,21 @@ def proxy_fault_decision(items, cfg=None, now=None):
             "successful_signals": len(successes),
             "window_seconds": policy["quorum_window_seconds"],
             "threshold": policy["quorum_min_targets"]}
+
+
+def classify_probe_result(result, cfg=None):
+    """Return an explicit persistence outcome for a completed proxy probe.
+
+    A failed port/protocol matrix against one external target is not evidence
+    that the proxy itself failed.  Only quorum-confirmed ``no-combo`` results
+    may poison durable health; ordinary validation failures remain definitive.
+    """
+    if (result or {}).get("ok"):
+        return {"outcome": PROBE_HEALTHY, "decision": None}
+    disqualified = (result or {}).get("disqualified")
+    if disqualified in ("no-combo", "provider-check-dead+no-combo"):
+        decision = proxy_fault_decision((result or {}).get("evidence") or [], cfg=cfg)
+        outcome = (PROBE_CONFIRMED_FAILURE if decision.get("proxy_fault")
+                   else PROBE_INCONCLUSIVE)
+        return {"outcome": outcome, "decision": decision}
+    return {"outcome": PROBE_CONFIRMED_FAILURE, "decision": None}

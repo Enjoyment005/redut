@@ -10,6 +10,7 @@ Telegram-проба (CONNECT по домену), латентность = мед
 """
 import json
 import datetime
+import ipaddress
 import math
 import re
 import socket
@@ -32,8 +33,6 @@ TG_URL = "https://api.telegram.org"     # проба CONNECT по домену (
 LAT_URL = "https://www.gstatic.com/generate_204"
 CURL_TIMEOUT = 12
 GEO_TIMEOUT = 8
-
-_RE_IPV4 = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 
 DEFAULT_FRESHNESS = {"fresh_seconds": 7200, "stale_seconds": 86400}
 
@@ -89,15 +88,19 @@ def freshness_weight(row, cfg=None, now=None):
 
 
 def is_ipv4(s):
-    return bool(_RE_IPV4.match((s or "").strip()))
+    try:
+        return ipaddress.ip_address((s or "").strip()).version == 4
+    except (ValueError, AttributeError, TypeError):
+        return False
 
 
 def looks_like_ip(s):
     """IPv4 или IPv6 (у PROXY6 version=6 выход — IPv6, ipify вернёт его)."""
-    s = (s or "").strip()
-    if is_ipv4(s):
+    try:
+        ipaddress.ip_address((s or "").strip())
         return True
-    return ":" in s and bool(re.fullmatch(r"[0-9a-fA-F:]+", s))
+    except (ValueError, AttributeError, TypeError):
+        return False
 
 
 def _run_curl(args, timeout=CURL_TIMEOUT):
@@ -113,9 +116,12 @@ def _run_curl(args, timeout=CURL_TIMEOUT):
 def _proxy_args(proto, host, port, user, password):
     """Аргументы curl для прохода через кандидата указанным протоколом."""
     cred = ["--proxy-user", "%s:%s" % (user, password)] if user or password else []
+    # NO_PROXY/no_proxy override even explicitly selected curl proxies.  A
+    # candidate probe must never mistake the server's direct exit for its own.
+    force_proxy = ["--noproxy", ""]
     if proto == "socks":
-        return ["--socks5-hostname", "%s:%s" % (host, port)] + cred
-    return ["-x", "http://%s:%s" % (host, port)] + cred
+        return force_proxy + ["--socks5-hostname", "%s:%s" % (host, port)] + cred
+    return force_proxy + ["-x", "http://%s:%s" % (host, port)] + cred
 
 
 def fetch_via(proto, host, port, user, password, url, timeout=CURL_TIMEOUT):

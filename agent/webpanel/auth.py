@@ -455,7 +455,7 @@ def write_admin_credentials_atomic(secrets_path, payload, store, force=False,
         return replacement, epoch
 
 
-def consume_recovery_code(conn, secrets_path, code):
+def consume_recovery_code(conn, secrets_path, code, *, expected_epoch=None):
     """Проверить recovery-код и вычеркнуть его (одноразовость). -> bool.
 
     Мутирует secrets.json на диске (os.replace) — вычеркнутый код становится "".
@@ -464,6 +464,9 @@ def consume_recovery_code(conn, secrets_path, code):
 
     def consume(data):
         admin = data.get("admin") or {}
+        if expected_epoch is not None and not hmac.compare_digest(
+                admin_credential_epoch(admin), str(expected_epoch)):
+            return data
         hashes = list(admin.get("recovery") or [])
         idx = recovery_match(code, hashes)
         if idx < 0:

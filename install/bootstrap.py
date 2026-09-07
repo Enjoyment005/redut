@@ -160,13 +160,8 @@ def render_params_preview(p, net):
 
 # ─────────────────────────── параметры / профиль ─────────────────────────
 def parse_clients(spec, subnet):
-    """--clients: число N (client1..N) или список имён. Адреса — с .2 по .(N+1)."""
-    base = subnet.split("/")[0].rsplit(".", 1)[0]
-    if re.fullmatch(r"\d+", str(spec)):
-        names = ["client%d" % i for i in range(1, int(spec) + 1)]
-    else:
-        names = [x.strip() for x in str(spec).split(",") if x.strip()]
-    return [{"name": n, "addr": "%s.%d" % (base, 2 + i)} for i, n in enumerate(names)]
+    """--clients: N or names, assigned from network offset 2 onward."""
+    return profiles.parse_clients(spec, subnet)
 
 
 def build(args):
@@ -177,6 +172,9 @@ def build(args):
         overrides["panel_port"] = args.panel_port
     if args.dnsmasq is not None:
         overrides["dnsmasq"] = args.dnsmasq
+    if args.clients:
+        subnet = args.subnet or profiles.PROFILES[args.profile or args.name]["subnet"]
+        overrides["clients"] = parse_clients(args.clients, subnet)
     if args.upstream:
         parts = args.upstream.split(":")
         if len(parts) != 5:
@@ -188,8 +186,6 @@ def build(args):
     p = profiles.build_profile(args.profile or args.name, args.host, args.pw, overrides)
     p["name"] = args.name
     p["role"] = "vpn-%s" % args.name
-    if args.clients:
-        p["clients"] = parse_clients(args.clients, p["subnet"])
     return p
 
 
@@ -381,8 +377,10 @@ def verify(c, p, net, with_panel):
         bad("microsocks: заглушка CHANGE_ME в кредах или нет /etc/microsocks.env (%s)" % ms.replace("\n", " "))
 
     if with_panel:
-        hz = run(c, "curl -sk --max-time 10 https://127.0.0.1:%d/healthz" % p["panel_port"])
-        (ok if "ok" in hz.lower() else bad)("панель /healthz: %s" % (hz or "пусто"))
+        hz_rc, hz = run_result(
+            c, "curl -fsk --max-time 10 https://127.0.0.1:%d/healthz" % p["panel_port"])
+        (ok if hz_rc == 0 and hz.strip() == "ok" else bad)(
+            "панель /healthz: %s" % (hz or "rc=%s" % hz_rc))
         adm = run(c, "python3 -c \"import json;print('admin' in json.load(open('/etc/vpn-panel/secrets.json')))\" 2>/dev/null")
         (ok if adm.strip() == "True" else warn)("admin панели настроен")
 
@@ -471,6 +469,8 @@ def main(argv=None):
         panel_ok = False
         if not a.no_panel:
             panel_ok = deploy_panel(p, net, a)
+            if not panel_ok:
+                raise SystemExit("панель/агент не установлены; bootstrap не завершён")
             if panel_ok and a.seed_secrets:      # чистая установка: admin заводит мастер /setup
                 admin_out = ensure_admin(c, p, a)
 

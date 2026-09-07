@@ -226,6 +226,35 @@ class TestStateAndCheck(unittest.TestCase):
             f.write("{битый json")
         self.assertEqual(update.load_state(self.cfg), {})   # битый файл = пустое состояние
 
+    def test_slow_beacon_check_preserves_newer_failed_apply_state(self):
+        completed = {"bad_versions": ["1.3.0"],
+                     "last_apply": {"ts": "2026-09-07T10:00:00", "ok": False}}
+
+        def beacon(*_args, **_kwargs):
+            # Another updater finished while this request waited on GitHub.
+            update.save_state(self.cfg, completed)
+            return "1.3.0"
+
+        with mock.patch.object(update, "fetch_beacon", side_effect=beacon):
+            result = update.check(self.cfg, pool=self.pool, alerter=self.alerter)
+        state = update.load_state(self.cfg)
+        self.assertEqual(state.get("bad_versions"), completed["bad_versions"])
+        self.assertEqual(state.get("last_apply"), completed["last_apply"])
+        self.assertTrue(result["bad"])
+        self.assertEqual(self.alerter.sent, [])
+
+    def test_slow_failed_check_preserves_newer_apply_state(self):
+        completed = {"last_apply": {"ts": "2026-09-07T10:00:00", "ok": True}}
+
+        def beacon(*_args, **_kwargs):
+            update.save_state(self.cfg, completed)
+            raise update.UpdateError("offline", network=True)
+
+        with mock.patch.object(update, "fetch_beacon", side_effect=beacon):
+            update.check(self.cfg)
+        self.assertEqual(update.load_state(self.cfg).get("last_apply"),
+                         completed["last_apply"])
+
     def test_check_asks_the_api_source_first(self):
         asked = []
         def f(url, **kw):
