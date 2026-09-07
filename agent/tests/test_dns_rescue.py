@@ -987,15 +987,30 @@ class TestCoordinator(unittest.TestCase):
             phase="active_isolated", configured_mode="manual_canary", incident_id="manual-test",
             active_scope="peer:10.77.0.9", active_slot="cloudflare-proxy",
             active_kind="isolated_manual", activated_at="2999-01-01 00:00:00",
-            expires_at="2999-01-01 00:15:00")
+            expires_at="2999-01-01 00:15:00",
+            expires_monotonic=time.monotonic() + 900.0,
+            generation="generation-test", scope_identity="scope-test",
+            boot_id="boot-test")
         with mock.patch.object(dns_rescue.os, "name", "posix"), \
+             mock.patch.object(dns_rescue, "_boot_id", return_value="boot-test"), \
+             mock.patch.object(dns_rescue.dns_runtime,
+                               "scrub_candidate_sidecar"), \
+             mock.patch.object(dns_rescue.dns_runtime,
+                               "scrub_primary_test_bypass"), \
              mock.patch.object(dns_rescue.dns_runtime, "firewall_attached", return_value=True), \
              mock.patch.object(dns_rescue.dns_runtime, "firewall_effective", return_value=True), \
              mock.patch.object(dns_rescue.dns_runtime, "service_state", return_value="active"), \
+             mock.patch.object(dns_rescue.dns_runtime,
+                               "wireguard_scope_identity_state",
+                               return_value={"status": "valid",
+                                             "identity": "scope-test"}), \
+             mock.patch.object(dns_rescue.dns_runtime,
+                               "deactivate_redirect") as detach, \
              mock.patch.object(dns_rescue, "probe_backend",
                                side_effect=AssertionError("reconcile must not health-probe")):
             state = dns_rescue.reconcile(self.cfg, self.pool, _locked=True)
         self.assertEqual(state["active_scope"], "peer:10.77.0.9")
+        detach.assert_not_called()
 
     def test_reconcile_preserves_proven_active_rescue_after_config_gate_closes(self):
         self.cfg["dns_rescue"]["mode"] = "disabled"
@@ -1003,13 +1018,28 @@ class TestCoordinator(unittest.TestCase):
             phase="active_isolated", configured_mode="manual_canary",
             incident_id="manual-test", active_scope="peer:10.77.0.9",
             active_slot="cloudflare-proxy", active_kind="isolated_manual",
-            expires_at="2999-01-01 00:15:00")
+            expires_at="2999-01-01 00:15:00",
+            expires_monotonic=time.monotonic() + 900.0,
+            generation="generation-test", scope_identity="scope-test",
+            boot_id="boot-test")
         with mock.patch.object(dns_rescue.os, "name", "posix"), \
+             mock.patch.object(dns_rescue, "_boot_id", return_value="boot-test"), \
+             mock.patch.object(dns_rescue.dns_runtime,
+                               "scrub_candidate_sidecar"), \
+             mock.patch.object(dns_rescue.dns_runtime,
+                               "scrub_primary_test_bypass"), \
              mock.patch.object(dns_rescue.dns_runtime, "firewall_attached", return_value=True), \
              mock.patch.object(dns_rescue.dns_runtime, "firewall_effective", return_value=True), \
-             mock.patch.object(dns_rescue.dns_runtime, "service_active", return_value=True):
+             mock.patch.object(dns_rescue.dns_runtime, "service_state", return_value="active"), \
+             mock.patch.object(dns_rescue.dns_runtime,
+                               "wireguard_scope_identity_state",
+                               return_value={"status": "valid",
+                                             "identity": "scope-test"}), \
+             mock.patch.object(dns_rescue.dns_runtime,
+                               "deactivate_redirect") as detach:
             state = dns_rescue.reconcile(self.cfg, self.pool, _locked=True)
         self.assertEqual(state["active_scope"], "peer:10.77.0.9")
+        detach.assert_not_called()
 
     def test_reconcile_unknown_service_inspection_preserves_proven_nat(self):
         self.pool.set_dns_state(
