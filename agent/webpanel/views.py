@@ -1145,6 +1145,7 @@ async function loadStatus(){const s=await api('/api/status');window.__S=s;
   fillBuyCC();
   document.getElementById('ts').textContent='обновлено '+new Date().toLocaleTimeString('ru-RU');
   const cur=s.upstream||{};
+  const dr=s.dns_rescue||{},drs=dr.state||{},drc=dr.coverage||{};
   const AUTL={ROTATING:'перебор пула',DEGRADED:'TG недоступен, канал жив',SUSPECT:'перепроверяю сбой'};
   const aut=s.emergency?('<span class="bad">АВАРИЯ'+(s.emergency_since?(' с '+esc(s.emergency_since)):'')+'</span>')
     :(AUTL[s.automat]?('<span class="warn">'+AUTL[s.automat]+'</span>')

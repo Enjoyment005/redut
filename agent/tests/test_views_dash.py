@@ -70,6 +70,15 @@ class TestCleanupMarkup(unittest.TestCase):
 
 
 class TestDNSRescueBeacon(unittest.TestCase):
+    def test_status_declares_dns_payload_before_rendering_it(self):
+        html = views._DASH_HTML
+        start = html.index("async function loadStatus()")
+        end = html.index("async function doFreeze()", start)
+        body = html[start:end]
+        declaration = "const dr=s.dns_rescue||{},drs=dr.state||{},drc=dr.coverage||{};"
+        self.assertIn(declaration, body)
+        self.assertLess(body.index(declaration), body.index("drs.phase"))
+
     def test_active_rescue_can_never_render_as_all_green(self):
         html = views._DASH_HTML
         rescue_guard = html.find("else if(drPhaseActive&&!drProven)")
