@@ -8,8 +8,8 @@ EMERGENCY (прямой выход). Диагностика (§8) идёт СТ�
         нет -> FROZEN_NET: НИЧЕГО не менять, НЕ ПОКУПАТЬ, алерт.
         Без этого шага первый же обрыв у хостера заставил бы агента перебрать
         и «сжечь» весь пул, а теперь ещё и накупить прокси (§8, §19).
-  2. egress через tun0 жив?  да -> OK (чинить нечего; при выходе из аварии — снять).
-     sing-box / tun0 / маршрут middleman в порядке?  нет -> self-heal (рестарт).
+  2. sing-box / tun0 / полный policy-route клиента в порядке?  нет -> self-heal.
+     Только затем egress через tun0 жив?  да -> OK (при выходе из аварии — снять).
   3. текущий прокси жив по ДРУГОМУ протоколу?  да -> RETUNE (§7.3): сменить только
         тип outbound, IP не трогать (без нового anti-loop, без сгоревших дней).
   4. значит виноват прокси -> ROTATING (перебор пула) -> REPLENISH (покупка) ->
@@ -118,10 +118,10 @@ def decide(net_alive, egress_ok, singbox_ok):
     """
     if not net_alive:
         return "frozen_net"          # шаг 1 — раньше всего, иначе сожжём пул
-    if egress_ok:
-        return "ok"                  # выход через tun0 жив — чинить нечего
     if not singbox_ok:
-        return "self_heal"           # шаг 2 — виноват sing-box/tun0/маршрут
+        return "self_heal"           # шаг 2 — клиентский путь важнее локального curl
+    if egress_ok:
+        return "ok"                  # весь путь и выход через tun0 доказаны
     return "proxy_fault"             # шаги 3-4 — разбираемся с прокси
 
 
@@ -532,20 +532,72 @@ def net_alive(cfg, log, with_evidence=False):
     return result if with_evidence else result[:2]
 
 
-def singbox_health(cfg):
-    """Шаг 2 (§8): sing-box active + tun0 carrier + маршрут middleman default."""
+def _middleman_policy_rule_count_text(output):
+    """Count only the exact agent-owned fwmark rule in `ip -4 rule show`."""
+    count = 0
+    for line in (output or "").splitlines():
+        try:
+            priority, body = line.split(":", 1)
+            tokens = body.split()
+            if int(priority.strip()) != 100 or tokens[:3] != ["from", "all", "fwmark"]:
+                continue
+            mark = tokens[3].split("/", 1)
+            if int(mark[0], 0) != 0x64:
+                continue
+            if len(mark) == 2 and int(mark[1], 0) != 0xFFFFFFFF:
+                continue
+            if tokens[4:] == ["lookup", "middleman"]:
+                count += 1
+        except (ValueError, IndexError):
+            continue
+    return count
+
+
+def _middleman_policy_rule_count():
+    rc, out = apply_mod.run_cmd(["ip", "-4", "rule", "show"])
+    return None if rc != 0 else _middleman_policy_rule_count_text(out)
+
+
+def _marked_route_output_matches(output, dev):
+    lines = [line.strip() for line in (output or "").splitlines() if line.strip()]
+    if not lines:
+        return False
+    tokens = lines[0].split()
+    if tokens.count("dev") != 1 or tokens.count("table") != 1:
+        return False
+    try:
+        return (tokens[tokens.index("dev") + 1] == str(dev)
+                and tokens[tokens.index("table") + 1] == "middleman")
+    except (ValueError, IndexError):
+        return False
+
+
+def _marked_middleman_route_matches(dev):
+    rc, out = apply_mod.run_cmd(
+        ["ip", "-4", "route", "get", "8.8.8.8", "mark", "0x64"])
+    return rc == 0 and _marked_route_output_matches(out, dev)
+
+
+def singbox_health(cfg, direct=False):
+    """Prove service, TUN and the effective marked client path end to end."""
     rc, act = apply_mod.run_cmd(["systemctl", "is-active", "sing-box"])
-    active = act.strip() == "active"
+    active = rc == 0 and act.strip() == "active"
     tun0 = False
     try:
         with open("/sys/class/net/tun0/carrier") as f:
             tun0 = f.read().strip() == "1"
     except OSError:
         pass
-    rc, route = apply_mod.run_cmd(["ip", "route", "show", "table", "middleman"])
-    route_ok = "default dev tun0" in (route or "")
+    expected_dev = ((cfg or {}).get("wan") or "ens3") if direct else "tun0"
+    expected_gw = (cfg or {}).get("gw") if direct else None
+    route_ok = _middleman_default_matches(expected_dev, expected_gw)
+    policy_count = _middleman_policy_rule_count()
+    policy_ok = policy_count == 1
+    marked_route_ok = _marked_middleman_route_matches(expected_dev)
     return {"active": active, "tun0": tun0, "route_ok": route_ok,
-            "ok": active and tun0 and route_ok}
+            "policy_count": policy_count, "policy_ok": policy_ok,
+            "marked_route_ok": marked_route_ok,
+            "ok": active and tun0 and route_ok and policy_ok and marked_route_ok}
 
 
 def try_self_heal(cfg, log, keep_direct=False):
@@ -555,13 +607,76 @@ def try_self_heal(cfg, log, keep_direct=False):
     раньше каждый ретрай безусловно возвращал default в мёртвый tun0 на всё
     время попытки, и клиенты моргали минутами (node1/README §12.6). Маршрут
     вернёт _leave_direct после подтверждённого живого egress."""
-    log("  self-heal: рестарт sing-box%s" % ("" if keep_direct else " + маршрут middleman"))
-    if not keep_direct:
-        apply_mod.run_cmd(["ip", "route", "replace", "default", "dev", "tun0", "table", "middleman"])
+    def restore_route():
+        rc, out = apply_mod.run_cmd(
+            ["ip", "route", "replace", "default", "dev", "tun0",
+             "table", "middleman"])
+        if rc != 0:
+            log("  self-heal: middleman default не восстановлен: %s"
+                % str(out or "command-failed")[:200])
+            return False
+        return True
+
+    def restore_policy(count):
+        if count is None:
+            log("  self-heal: состояние fwmark rule неизвестно")
+            return False
+        # Remove only duplicate instances of the exact agent-owned rule.  A
+        # conflicting foreign rule remains visible to the effective FIB proof
+        # and therefore cannot be silently accepted.
+        if count > 1:
+            # Keep one working rule present throughout normalization.  A
+            # delete failure may leave duplicates, but never a fall-through
+            # window to the main/WAN table.
+            for _index in range(count - 1):
+                rc, out = apply_mod.run_cmd(
+                    ["ip", "-4", "rule", "del", "priority", "100",
+                     "fwmark", "0x64", "lookup", "middleman"])
+                if rc != 0:
+                    log("  self-heal: duplicate fwmark rule не удалён: %s"
+                        % str(out or "command-failed")[:200])
+                    return False
+            count = 1
+        if count == 0:
+            rc, out = apply_mod.run_cmd(
+                ["ip", "-4", "rule", "add", "priority", "100",
+                 "fwmark", "0x64", "lookup", "middleman"])
+            if rc != 0:
+                log("  self-heal: fwmark rule не восстановлен: %s"
+                    % str(out or "command-failed")[:200])
+                return False
+        return True
+
+    def repair_path(current):
+        if not current["active"] or not current["tun0"]:
+            return False
+        if keep_direct and not current["route_ok"]:
+            # Do not attach the fwmark rule to an unproven emergency table;
+            # that could turn a harmless missing rule into a client blackhole.
+            return False
+        if not keep_direct and not current["route_ok"] and not restore_route():
+            return False
+        if not current["policy_ok"] and not restore_policy(current["policy_count"]):
+            return False
+        # This second snapshot is mandatory: successful mutation exit codes do
+        # not prove the marked lookup actually uses the owned table and device.
+        return singbox_health(cfg, direct=keep_direct)["ok"]
+
+    current = singbox_health(cfg, direct=keep_direct)
+    if current["active"] and current["tun0"]:
+        # A policy-only drift does not justify interrupting a healthy tunnel.
+        # In direct mode this may restore the rule, but never changes the
+        # emergency default away from WAN.
+        log("  self-heal: восстанавливаю только policy-route")
+        return repair_path(current)
+
+    log("  self-heal: рестарт sing-box%s"
+        % ("" if keep_direct else " + маршрут middleman после tun0"))
     apply_mod.restart_singbox()
     apply_mod.wait_tun0()
-    h = singbox_health(cfg)
-    return h["ok"] or (keep_direct and h["active"] and h["tun0"])
+    # Restart recreates tun0 and the kernel removes routes bound to the old
+    # interface.  Re-read first, then publish/verify the full path.
+    return repair_path(singbox_health(cfg, direct=keep_direct))
 
 
 # ----------------------------------------------------------- работа с текущим
@@ -1234,12 +1349,11 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
         "server_network", alive, target=via or "direct", via_proxy=False)])
     egress = apply_mod.verify_egress()
     pool.set_egress(egress)          # дашборд показывает эту метку, сам пробу не гоняет
-    sb_h = singbox_health(cfg)
     in_direct = (state_before in (EMERGENCY, ROTATING)
                  or os.path.exists(EMERGENCY_FLAG) or os.path.exists(_emergency_intent(cfg)))
-    # F6: в прямом выходе middleman-маршрут СОЗНАТЕЛЬНО не tun0 — здоровье sing-box
-    # считаем без него, иначе каждый ретрай уходил бы в self-heal и дёргал маршрут.
-    sb_ok = sb_h["ok"] or (in_direct and sb_h["active"] and sb_h["tun0"])
+    # In direct mode the expected marked path is the owned WAN route, not tun0.
+    sb_h = singbox_health(cfg, direct=in_direct)
+    sb_ok = sb_h["ok"]
     d = decide(alive, egress["ok"], sb_ok)
     log("диагностика (§8): сеть=%s egress=%s sing-box=%s -> %s"
         % ("жива" if alive else "МЕРТВА", "ok" if egress["ok"] else "нет",
@@ -1285,8 +1399,19 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
             _reset_streaks(pool)
             if in_direct and not _leave_direct(
                     cfg, pool, alerter, apply_mod.verify_egress(), log, actor, state_before):
-                return _direct_exit_failed(pool, result, state_before)
+                    return _direct_exit_failed(pool, result, state_before)
             return _state(pool, result, OK, "self-heal", "sing-box восстановлен")
+        if egress.get("ok"):
+            # A successful tunnel probe proves the provider is alive, while
+            # the failed path repair proves only a local kernel/service fault.
+            # Never spend, retune or rotate on that evidence combination.
+            detail = ("локальный policy-route не восстановлен при живом egress — "
+                      "proxy и покупки не трогаю")
+            pool.log_event("self-heal", actor=actor,
+                           result="local-path-failed", detail=detail)
+            hold = (state_before if in_direct and state_before in (EMERGENCY, ROTATING)
+                    else DEGRADED)
+            return _state(pool, result, hold, "self-heal-failed", detail)
         log("  self-heal не помог — вероятно, виноват прокси, иду дальше")
 
     # --- ШАГ 3: RETUNE (текущий прокси жив по другому протоколу) ---

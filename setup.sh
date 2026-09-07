@@ -606,11 +606,33 @@ fi
 if [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || true)" != "1" ]; then
     printf '  \033[1;31m✖\033[0m boot invariant: net.ipv4.ip_forward != 1\n'; fail=1
 fi
-if ! ip route show table middleman 2>/dev/null | grep -q '^default '; then
-    printf '  \033[1;31m✖\033[0m boot invariant: в table middleman нет default route\n'; fail=1
+EXPECTED_MIDDLEMAN_DEV="tun0"
+EXPECTED_MIDDLEMAN_GW=""
+if [ -f /var/lib/vpn-panel/emergency.intent ] || [ -z "$UP_NOW" ]; then
+    EXPECTED_MIDDLEMAN_DEV="$WAN"
+    EXPECTED_MIDDLEMAN_GW="$GW"
 fi
-if ! ip rule show 2>/dev/null | grep -Eq 'fwmark (0x)?64 .*lookup middleman'; then
-    printf '  \033[1;31m✖\033[0m boot invariant: нет fwmark 0x64 lookup middleman\n'; fail=1
+if ! PYTHONPATH=/opt/vpn-panel \
+        EXPECTED_MIDDLEMAN_DEV="$EXPECTED_MIDDLEMAN_DEV" \
+        EXPECTED_MIDDLEMAN_GW="$EXPECTED_MIDDLEMAN_GW" \
+        python3 - <<'PY'
+import os
+import sys
+import states
+
+dev = os.environ["EXPECTED_MIDDLEMAN_DEV"]
+gw = os.environ.get("EXPECTED_MIDDLEMAN_GW") or None
+route_ok = states._middleman_default_matches(dev, gw)
+rule_ok = states._middleman_policy_rule_count() == 1
+effective_ok = states._marked_middleman_route_matches(dev)
+if not (route_ok and rule_ok and effective_ok):
+    print("route=%s rule=%s effective=%s expected_dev=%s"
+          % (route_ok, rule_ok, effective_ok, dev))
+    sys.exit(1)
+PY
+then
+    printf '  \033[1;31m✖\033[0m boot invariant: policy-route middleman не совпадает с ожидаемым %s\n' "$EXPECTED_MIDDLEMAN_DEV"
+    fail=1
 fi
 if ! iptables -t mangle -C PREROUTING -s "$SUBNET" -j REDUT_PREROUTING 2>/dev/null; then
     printf '  \033[1;31m✖\033[0m boot invariant: нет PREROUTING -> REDUT_PREROUTING для %s\n' "$SUBNET"; fail=1

@@ -27,6 +27,53 @@ throttled_log(){ # $1=stamp-файл $2=сообщение
     fi
 }
 
+# Read-only proof of the normal client policy path.  Every mutation remains in
+# vpn-agent under /run/vpn-agent.lock; this observer merely makes rule-only and
+# effective-FIB drift reachable by the reconciler.
+policy_path_ok(){
+    local defaults rules marked count
+    defaults="$($IP -4 route show table middleman default 2>/dev/null)" || return 1
+    printf '%s\n' "$defaults" | awk '
+        $1 == "default" {
+            n++; dev=""; devs=0; vias=0; nexthops=0
+            for (i=1; i<=NF; i++) {
+                if ($i == "dev") { devs++; dev=$(i+1) }
+                if ($i == "via") vias++
+                if ($i == "nexthop") nexthops++
+            }
+            if (devs == 1 && dev == "tun0" && vias == 0 && nexthops == 0) good++
+        }
+        END { exit !(n == 1 && good == 1) }
+    ' || return 1
+
+    rules="$($IP -4 rule show 2>/dev/null)" || return 1
+    count="$(printf '%s\n' "$rules" | awk '
+        $1 == "100:" && $2 == "from" && $3 == "all" && $4 == "fwmark" &&
+        ($5 == "0x64" || $5 == "0x64/0xffffffff") &&
+        $6 == "lookup" && $7 == "middleman" && NF == 7 { n++ }
+        END { print n+0 }
+    ')"
+    [ "$count" = "1" ] || return 1
+
+    marked="$($IP -4 route get 8.8.8.8 mark 0x64 2>/dev/null)" || return 1
+    printf '%s\n' "$marked" | awk '
+        NR == 1 {
+            dev=""; table=""; devs=0; tables=0
+            for (i=1; i<=NF; i++) {
+                if ($i == "dev") { devs++; dev=$(i+1) }
+                if ($i == "table") { tables++; table=$(i+1) }
+            }
+            ok=(devs == 1 && dev == "tun0" && tables == 1 && table == "middleman")
+        }
+        END { exit !ok }
+    '
+}
+
+# Allows the regression suite to source and exercise only the read-only proof.
+if [ "${REDUT_WATCHDOG_SOURCE_ONLY:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 # Аварийный режим агента: он владеет маршрутами (middleman -> WAN). Сторож ничего
 # не «чинит» (иначе вернул бы default в мёртвый tun0 и убил бы прямой выход) —
 # только даёт агенту повторить попытку восстановиться (агент сам держит backoff, §8/F6).
@@ -52,10 +99,11 @@ if [ "$(cat /sys/class/net/tun0/carrier 2>/dev/null)" != "1" ]; then
     [ -x "$AGENT" ] && "$AGENT" rotate --reason watchdog >> "$LOG" 2>&1 || true
     exit 0
 fi
-# Route ownership belongs to vpn-agent.  Watchdog observes and asks the agent to
+# Route ownership belongs to vpn-agent. Watchdog proves the exact singleton
+# default, fwmark rule and effective marked FIB, then only asks the agent to
 # reconcile; it never races a panel click by writing middleman directly.
-if ! $IP route show table middleman 2>/dev/null | grep -q '^default dev tun0'; then
-    log "middleman default drift -> vpn-agent rotate"
+if ! policy_path_ok; then
+    log "middleman policy-path drift -> vpn-agent rotate"
     if [ -x "$AGENT" ]; then "$AGENT" rotate --reason watchdog >> "$LOG" 2>&1; fi
     exit 0
 fi

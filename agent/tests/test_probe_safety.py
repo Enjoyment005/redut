@@ -49,6 +49,35 @@ class TestManualConfigFailure(unittest.TestCase):
                 release.assert_not_called()
 
 
+class TestLocalPathFailure(unittest.TestCase):
+    def test_live_egress_and_failed_path_repair_never_reaches_provider(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.closing(
+                pool_mod.Pool(os.path.join(tmp, "state.db"), server="test")) as pool:
+            cfg = {"singbox_config": os.path.join(tmp, "singbox.json"),
+                   "countries": {"strategy": "reputation"}}
+            egress = {"ok": True, "egress_ip": "203.0.113.10",
+                      "exit_cc": "lv", "tg_code": "204",
+                      "why": "", "why_kind": ""}
+            with mock.patch.object(states, "reconcile_strategy_override"), \
+                 mock.patch.object(states.apply_mod, "load_json", return_value={}), \
+                 mock.patch.object(states.apply_mod, "current_upstream",
+                                   return_value="192.0.2.50"), \
+                 mock.patch.object(states, "net_alive", return_value=(True, "direct")), \
+                 mock.patch.object(states.apply_mod, "verify_egress",
+                                   return_value=egress), \
+                 mock.patch.object(states, "singbox_health",
+                                   return_value={"ok": False}), \
+                 mock.patch.object(states, "try_self_heal", return_value=False), \
+                 mock.patch.object(states, "try_retune") as retune:
+                result = states._rotate_locked(
+                    cfg, {}, pool, mock.Mock(), "watchdog", "auto",
+                    lambda *_args: None, {}, states.OK)
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["state"], states.DEGRADED)
+            self.assertEqual(result["action"], "self-heal-failed")
+            retune.assert_not_called()
+
+
 class TestProbeIPValidation(unittest.TestCase):
     def test_invalid_ipify_responses_cannot_make_a_healthy_matrix(self):
         for response in ("999.999.999.999", ":", "1:2:3", ":::1"):

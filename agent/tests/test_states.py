@@ -8,6 +8,7 @@ import datetime
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import _ctx  # noqa: F401  (кладёт panel/ в sys.path)
 import pool as pool_mod
@@ -72,13 +73,192 @@ class TestDecideLadder(unittest.TestCase):
 
     def test_ok_when_egress_alive(self):
         self.assertEqual(states.decide(True, True, True), "ok")
-        self.assertEqual(states.decide(True, True, False), "ok")  # egress жив — чинить нечего
+
+    def test_egress_alone_cannot_hide_broken_client_path(self):
+        self.assertEqual(states.decide(True, True, False), "self_heal")
 
     def test_self_heal_when_singbox_broken(self):
         self.assertEqual(states.decide(True, False, False), "self_heal")
 
     def test_proxy_fault_is_last(self):
         self.assertEqual(states.decide(True, False, True), "proxy_fault")
+
+
+class TestSelfHeal(unittest.TestCase):
+    def test_route_only_drift_is_repaired_without_restart(self):
+        broken = {"active": True, "tun0": True, "route_ok": False,
+                  "policy_count": 1, "policy_ok": True,
+                  "marked_route_ok": False, "ok": False}
+        healthy = {"active": True, "tun0": True, "route_ok": True,
+                   "policy_count": 1, "policy_ok": True,
+                   "marked_route_ok": True, "ok": True}
+        with mock.patch.object(states, "singbox_health",
+                               side_effect=[broken, healthy]) as health, \
+             mock.patch.object(states.apply_mod, "run_cmd",
+                               return_value=(0, "")) as run, \
+             mock.patch.object(states.apply_mod, "restart_singbox") as restart:
+            self.assertTrue(states.try_self_heal({}, lambda _message: None))
+        self.assertEqual(health.call_count, 2)
+        run.assert_called_once_with(
+            ["ip", "route", "replace", "default", "dev", "tun0",
+             "table", "middleman"])
+        restart.assert_not_called()
+
+    def test_restart_restores_route_only_after_new_tun_exists(self):
+        stopped = {"active": False, "tun0": False, "route_ok": False,
+                   "policy_count": 1, "policy_ok": True,
+                   "marked_route_ok": False, "ok": False}
+        route_missing = {"active": True, "tun0": True, "route_ok": False,
+                         "policy_count": 1, "policy_ok": True,
+                         "marked_route_ok": False, "ok": False}
+        healthy = {"active": True, "tun0": True, "route_ok": True,
+                   "policy_count": 1, "policy_ok": True,
+                   "marked_route_ok": True, "ok": True}
+        events = []
+        with mock.patch.object(states, "singbox_health",
+                               side_effect=[stopped, route_missing, healthy]), \
+             mock.patch.object(states.apply_mod, "restart_singbox",
+                               side_effect=lambda: events.append("restart")), \
+             mock.patch.object(states.apply_mod, "wait_tun0",
+                               side_effect=lambda: events.append("wait")), \
+             mock.patch.object(states.apply_mod, "run_cmd",
+                               side_effect=lambda *_args, **_kwargs:
+                               (events.append("route") or (0, ""))):
+            self.assertTrue(states.try_self_heal({}, lambda _message: None))
+        self.assertEqual(events, ["restart", "wait", "route"])
+
+    def test_missing_policy_rule_is_repaired_and_effectively_rechecked(self):
+        broken = {"active": True, "tun0": True, "route_ok": True,
+                  "policy_count": 0, "policy_ok": False,
+                  "marked_route_ok": False, "ok": False}
+        healthy = dict(broken, policy_count=1, policy_ok=True,
+                       marked_route_ok=True, ok=True)
+        with mock.patch.object(states, "singbox_health",
+                               side_effect=[broken, healthy]), \
+             mock.patch.object(states.apply_mod, "run_cmd",
+                               return_value=(0, "")) as run, \
+             mock.patch.object(states.apply_mod, "restart_singbox") as restart:
+            self.assertTrue(states.try_self_heal({}, lambda _message: None))
+        run.assert_called_once_with(
+            ["ip", "-4", "rule", "add", "priority", "100",
+             "fwmark", "0x64", "lookup", "middleman"])
+        restart.assert_not_called()
+
+    def test_duplicate_rules_remove_only_excess_without_zero_rule_gap(self):
+        duplicate = {"active": True, "tun0": True, "route_ok": True,
+                     "policy_count": 2, "policy_ok": False,
+                     "marked_route_ok": True, "ok": False}
+        healthy = dict(duplicate, policy_count=1, policy_ok=True, ok=True)
+        with mock.patch.object(states, "singbox_health",
+                               side_effect=[duplicate, healthy]), \
+             mock.patch.object(states.apply_mod, "run_cmd",
+                               return_value=(0, "")) as run:
+            self.assertTrue(states.try_self_heal({}, lambda _message: None))
+        run.assert_called_once_with(
+            ["ip", "-4", "rule", "del", "priority", "100",
+             "fwmark", "0x64", "lookup", "middleman"])
+
+    def test_duplicate_delete_failure_never_attempts_destructive_rebuild(self):
+        duplicate = {"active": True, "tun0": True, "route_ok": True,
+                     "policy_count": 2, "policy_ok": False,
+                     "marked_route_ok": True, "ok": False}
+        with mock.patch.object(states, "singbox_health", return_value=duplicate), \
+             mock.patch.object(states.apply_mod, "run_cmd",
+                               return_value=(2, "delete-failed")) as run:
+            self.assertFalse(states.try_self_heal({}, lambda _message: None))
+        self.assertEqual(run.call_count, 1)
+        self.assertNotIn("add", run.call_args.args[0])
+
+    def test_post_repair_mismatch_is_not_reported_healthy(self):
+        broken = {"active": True, "tun0": True, "route_ok": False,
+                  "policy_count": 1, "policy_ok": True,
+                  "marked_route_ok": False, "ok": False}
+        still_wrong = dict(broken, route_ok=True)
+        with mock.patch.object(states, "singbox_health",
+                               side_effect=[broken, still_wrong]), \
+             mock.patch.object(states.apply_mod, "run_cmd", return_value=(0, "")):
+            self.assertFalse(states.try_self_heal({}, lambda _message: None))
+
+    def test_keep_direct_never_writes_tun_default(self):
+        direct_drift = {"active": True, "tun0": True, "route_ok": False,
+                        "policy_count": 0, "policy_ok": False,
+                        "marked_route_ok": False, "ok": False}
+        with mock.patch.object(states, "singbox_health", return_value=direct_drift), \
+             mock.patch.object(states.apply_mod, "run_cmd") as run, \
+             mock.patch.object(states.apply_mod, "restart_singbox") as restart:
+            self.assertFalse(states.try_self_heal(
+                {"wan": "ens3", "gw": "192.0.2.1"},
+                lambda _message: None, keep_direct=True))
+        run.assert_not_called()
+        restart.assert_not_called()
+
+
+class TestPolicyRouteProof(unittest.TestCase):
+    def test_exact_single_fwmark_rule_is_required(self):
+        exact = "100: from all fwmark 0x64 lookup middleman\n"
+        self.assertEqual(states._middleman_policy_rule_count_text(exact), 1)
+        self.assertEqual(states._middleman_policy_rule_count_text(exact + exact), 2)
+        self.assertEqual(states._middleman_policy_rule_count_text(
+            "100: from all fwmark 0x64 lookup main\n"), 0)
+        self.assertEqual(states._middleman_policy_rule_count_text(
+            "90: from all fwmark 0x64 lookup middleman\n"), 0)
+
+    def test_marked_lookup_must_use_owned_table_and_expected_device(self):
+        good = "8.8.8.8 dev tun0 table middleman src 198.18.0.1 mark 0x64\n"
+        self.assertTrue(states._marked_route_output_matches(good, "tun0"))
+        self.assertFalse(states._marked_route_output_matches(
+            "8.8.8.8 via 192.0.2.1 dev ens3 src 192.0.2.10 mark 0x64\n",
+            "tun0"))
+        self.assertFalse(states._marked_route_output_matches(
+            "8.8.8.8 dev tun0 table other src 198.18.0.1 mark 0x64\n",
+            "tun0"))
+
+    def _health(self, rules, marked, routes="default dev tun0 scope link\n",
+                cfg=None, direct=False):
+        def command(args, *_unused, **_kwargs):
+            if args[:2] == ["systemctl", "is-active"]:
+                return 0, "active"
+            if args == ["ip", "route", "show", "table", "middleman"]:
+                return 0, routes
+            if args == ["ip", "-4", "rule", "show"]:
+                return 0, rules
+            if args == ["ip", "-4", "route", "get", "8.8.8.8", "mark", "0x64"]:
+                return 0, marked
+            raise AssertionError(args)
+
+        with mock.patch("builtins.open", mock.mock_open(read_data="1")), \
+             mock.patch.object(states.apply_mod, "run_cmd", side_effect=command):
+            return states.singbox_health(cfg or {}, direct=direct)
+
+    def test_missing_rule_makes_health_false(self):
+        health = self._health(
+            "", "8.8.8.8 dev tun0 table middleman src 198.18.0.1 mark 0x64\n")
+        self.assertFalse(health["policy_ok"])
+        self.assertFalse(health["ok"])
+
+    def test_marked_lookup_via_wan_makes_health_false(self):
+        health = self._health(
+            "100: from all fwmark 0x64 lookup middleman\n",
+            "8.8.8.8 via 192.0.2.1 dev ens3 src 192.0.2.10 mark 0x64\n")
+        self.assertFalse(health["marked_route_ok"])
+        self.assertFalse(health["ok"])
+
+    def test_duplicate_defaults_make_health_false(self):
+        health = self._health(
+            "100: from all fwmark 0x64 lookup middleman\n",
+            "8.8.8.8 dev tun0 table middleman src 198.18.0.1 mark 0x64\n",
+            routes="default dev tun0\ndefault via 192.0.2.1 dev ens3\n")
+        self.assertFalse(health["route_ok"])
+        self.assertFalse(health["ok"])
+
+    def test_direct_mode_requires_effective_owned_wan_path(self):
+        health = self._health(
+            "100: from all fwmark 0x64 lookup middleman\n",
+            "8.8.8.8 via 192.0.2.1 dev ens3 table middleman "
+            "src 192.0.2.10 mark 0x64\n",
+            routes="default via 192.0.2.1 dev ens3\n",
+            cfg={"wan": "ens3", "gw": "192.0.2.1"}, direct=True)
+        self.assertTrue(health["ok"])
 
 
 class TestCooldown(unittest.TestCase):

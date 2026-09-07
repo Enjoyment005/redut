@@ -213,7 +213,10 @@ class TestBootOwnership(unittest.TestCase):
         self.assertNotIn('bash /usr/local/bin/vpn-boot-setup.sh || true', install)
         self.assertIn('systemctl start --no-block vpn-boot-setup', setup)
         verify = setup[setup.index("# ── 6. Проверка"):]
-        self.assertIn("boot invariant: в table middleman нет default route", verify)
+        self.assertIn("_middleman_default_matches", verify)
+        self.assertIn("_middleman_policy_rule_count", verify)
+        self.assertIn("_marked_middleman_route_matches", verify)
+        self.assertIn("policy-route middleman не совпадает", verify)
         self.assertIn("boot invariant: нет PREROUTING -> REDUT_PREROUTING", verify)
         self.assertIn('if [ "$fail" != "0" ]; then\n    exit 1', verify)
 

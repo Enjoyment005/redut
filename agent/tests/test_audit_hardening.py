@@ -299,6 +299,10 @@ class TestStaticInstallerContracts(unittest.TestCase):
         legacy = self.read_layout("singbox/singbox-watchdog.sh",
                                   "node/singbox-watchdog.sh")
         self.assertEqual(canonical, legacy)
+        self.assertIn("if ! policy_path_ok; then", canonical)
+        self.assertIn("middleman policy-path drift -> vpn-agent rotate", canonical)
+        self.assertLess(canonical.index("if ! policy_path_ok; then"),
+                        canonical.index("# 3) реальный выход через tun0"))
         self.assertNotIn("systemctl restart sing-box", canonical)
         self.assertNotIn("systemctl start sing-box", canonical)
         self.assertNotIn("route replace default", canonical)
