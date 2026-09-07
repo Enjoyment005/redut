@@ -23,6 +23,12 @@ except ImportError:  # Allows static/unit validation from the Windows dev host.
 SYS_PIDFD_GETFD_X86_64 = 438
 
 
+class PidfdHandoffError(RuntimeError):
+    def __init__(self, stage, error):
+        self.errno = getattr(error, "errno", None)
+        super().__init__("%s failed: %s" % (stage, error))
+
+
 def _lock_tuple(path):
     st = os.stat(path)
     return os.major(st.st_dev), os.minor(st.st_dev), st.st_ino
@@ -98,7 +104,10 @@ def main(argv=None):
     # Pin the process identity before any /proc-by-number inspection. A second
     # PPID check closes the death/reparent window around pidfd_open; all getfd
     # calls below reuse this pidfd, so PID reuse can never redirect the proof.
-    pidfd = os.pidfd_open(args.owner, 0)
+    try:
+        pidfd = os.pidfd_open(args.owner, 0)
+    except OSError as error:
+        raise PidfdHandoffError("pidfd_open", error) from error
     inherited_fd = None
     candidates = []
     try:
@@ -120,7 +129,10 @@ def main(argv=None):
         # lock and be mistaken for a continuous handoff.
         try:
             for owner_fd in owner_fds:
-                candidate = _pidfd_getfd(pidfd, owner_fd)
+                try:
+                    candidate = _pidfd_getfd(pidfd, owner_fd)
+                except OSError as error:
+                    raise PidfdHandoffError("pidfd_getfd", error) from error
                 candidates.append(candidate)
         except BaseException:
             for candidate in candidates:
@@ -167,5 +179,8 @@ if __name__ == "__main__":
         main()
     except Exception as error:
         print("legacy updater lock handoff failed: %s" % error, file=sys.stderr)
-        sys.exit(75 if isinstance(error, OSError) and error.errno in
-                 (errno.EPERM, errno.ENOSYS, errno.ESRCH) else 1)
+        retryable = (
+            isinstance(error, PidfdHandoffError)
+            and error.errno in (errno.EPERM, errno.EACCES, errno.ENOSYS, errno.ESRCH)
+        )
+        sys.exit(75 if retryable else 1)

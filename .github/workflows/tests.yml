@@ -29,9 +29,9 @@ jobs:
       - name: Python syntax
         run: python -m compileall -q agent install
       - name: Public unit suite
-        env:
-          PYTHONDONTWRITEBYTECODE: "1"
-        run: python -m unittest discover -s agent/tests -p 'test_*.py' -v
+        run: >-
+          sudo env PYTHONDONTWRITEBYTECODE=1 "$(command -v python)"
+          -m unittest discover -s agent/tests -p 'test_*.py' -v
 
   debian13-python313:
     name: Debian 13 / Python 3.13 / isolated unit suite

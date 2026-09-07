@@ -46,7 +46,7 @@
 
 ## Локальный контроль
 
-- полный public suite: **1107 tests, OK (skipped=2)**; на Windows пропущены только
+- полный public suite: **1108 tests, OK (skipped=2)**; на Windows пропущены только
   Linux-only реальные `flock` process gate и `pidfd_getfd` handoff;
 - независимые фокусные проверки A01–A19 и финальный сквозной аудит: PASS;
 - `py_compile`/`compileall`, JSON parse, `bash -n`, `git diff --check`: PASS;

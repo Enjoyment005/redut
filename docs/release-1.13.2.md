@@ -27,7 +27,7 @@ Patch-релиз закрывает подтверждённые A01–A19 по�
 
 ## Проверки
 
-- public и canonical: **1107 tests, OK (skipped=2 на Windows)**;
+- public и canonical: **1108 tests, OK (skipped=2 на Windows)**;
 - независимый аудит каждого шага и итогового diff: PASS;
 - real-shell RU recovery matrix: 6 методов, все forward/rollback/commit subcases — PASS;
 - Python compile, 9 JSON, `bash -n`, `git diff --check` — PASS.

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """A01: verified lock migration from the executing legacy updater process."""
 import builtins
+import errno
 import importlib.util
 import io
 import os
@@ -22,7 +23,26 @@ handoff = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(handoff)
 
 
+def _pidfd_policy_blocked(run):
+    if run.returncode != 75:
+        return False
+    stages = ("pidfd_open", "pidfd_getfd")
+    codes = (errno.EPERM, errno.EACCES)
+    return any("%s failed: [Errno %d]" % (stage, code) in run.stderr
+               for stage in stages for code in codes)
+
+
 class TestLegacyLockProof(unittest.TestCase):
+    def test_policy_skip_is_limited_to_pidfd_stages(self):
+        self.assertTrue(_pidfd_policy_blocked(SimpleNamespace(
+            returncode=75,
+            stderr="legacy updater lock handoff failed: "
+                   "pidfd_getfd failed: [Errno 1] Operation not permitted")))
+        self.assertFalse(_pidfd_policy_blocked(SimpleNamespace(
+            returncode=75,
+            stderr="legacy updater lock handoff failed: "
+                   "[Errno 1] Operation not permitted")))
+
     def test_proc_lock_parser_requires_exact_exclusive_flock_owner_and_inode(self):
         rows = """\
 11: POSIX  ADVISORY  WRITE 4242 00:2a:999 0 EOF
@@ -122,7 +142,9 @@ class TestLegacyLockProof(unittest.TestCase):
              mock.patch.object(handoff, "_pidfd_getfd",
                                side_effect=[30, OSError("parent exited")]), \
              mock.patch.object(handoff.os, "close") as close:
-            with self.assertRaisesRegex(OSError, "parent exited"):
+            with self.assertRaisesRegex(
+                    handoff.PidfdHandoffError,
+                    "pidfd_getfd failed: parent exited"):
                 handoff.main(["--owner", "42", "--lock", "/run/test.lock",
                               "--script", "/tmp/setup.sh"])
         self.assertIn(mock.call(30), close.call_args_list)
@@ -177,6 +199,8 @@ class TestLinuxLegacyProcessHandoff(unittest.TestCase):
                     [sys.executable, str(HELPER), "--owner", str(os.getpid()),
                      "--lock", lock_path, "--script", setup, "--",
                      lock_path, marker], capture_output=True, text=True, timeout=10)
+            if _pidfd_policy_blocked(run):
+                self.skipTest("pidfd_getfd blocked by the host kernel security policy")
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertEqual(pathlib.Path(marker).read_text(encoding="ascii"),
                              "LOCK_CONFIRMED")
