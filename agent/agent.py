@@ -37,6 +37,7 @@ import probe as probe_mod           # noqa: E402
 import states as states_mod         # noqa: E402
 import alerts as alerts_mod         # noqa: E402
 import update as update_mod         # noqa: E402
+from webpanel import clients as clients_mod  # noqa: E402
 from providers import make_providers, ProviderError  # noqa: E402
 
 ETC_CONFIG = "/etc/vpn-panel/config.json"
@@ -932,22 +933,74 @@ def cmd_dns_rescue(cfg, args):
     p = open_pool(cfg)
     try:
         action = args.dns_action
+        reconcile_state = None
+        if action in ("activate", "tick", "reconcile"):
+            # If an old client transaction and an active Rescue overlap, DNS
+            # must fail open first; membership reconciliation is guarded from
+            # mutating a Rescue-owned cohort.
+            reconcile_state = dns_rescue_mod.reconcile(cfg, p, actor="watchdog")
+            try:
+                clients_mod.reconcile_client_operation(cfg, dns_pool=p)
+            except clients_mod.ClientError:
+                print(json.dumps({"ok": False, "action": "client-reconcile-pending",
+                                  "error": "WireGuard client membership is not reconciled"},
+                                 ensure_ascii=False, sort_keys=True))
+                return 1
         if action == "status":
             result = dns_rescue_mod.status(cfg, p)
         elif action == "observe":
             result = dns_rescue_mod.observe(cfg, p)
         elif action == "activate":
             result = dns_rescue_mod.activate(cfg, p, scope=args.scope,
-                                             slot_id=args.slot, actor="user")
+                                             slot_id=args.slot, actor="user",
+                                             profile_class=args.profile)
         elif action == "deactivate":
             result = dns_rescue_mod.deactivate(cfg, p, actor="user")
+        elif action == "tick":
+            reconcile_state = dns_rescue_mod.reconcile(cfg, p, actor="watchdog")
+            result = dns_rescue_mod.automatic_tick(
+                cfg, p, p.get_setting("automat_state") or states_mod.OK,
+                manual_emergency=p.get_setting("emergency_manual") == "1", log=print)
         else:
             result = {"ok": True, "state": dns_rescue_mod.reconcile(cfg, p)}
-        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True,
+        # CLI output may be relayed by the web panel. Never print the raw saga
+        # result: isolated state contains the exact test peer address. Status()
+        # redacts it and limits operation fields.
+        public = dns_rescue_mod.status(cfg, p)
+        public.update({"ok": bool(result.get("ok", action in ("status", "reconcile"))),
+                       "action": result.get("action") or action})
+        if action == "observe":
+            public["probes"] = [
+                {key: item.get(key) for key in
+                 ("ok", "slot", "transports", "application_dns", "controls",
+                  "error_kind")}
+                for item in (result.get("results") or [])]
+        print(json.dumps(public, ensure_ascii=False, indent=2, sort_keys=True,
                          allow_nan=False))
-        return 0 if result.get("ok", action in ("status", "reconcile")) else 1
-    except dns_rescue_mod.DNSRescueError as error:
-        print("DNS Rescue: %s" % error)
+        if action == "tick":
+            # Closed gates, idle operation and a backend miss below its durable
+            # threshold are expected watchdog outcomes, not failed systemd jobs.
+            reconcile_error = ((reconcile_state or {}).get("phase") == "recovering"
+                               or str((reconcile_state or {}).get("last_error") or "")
+                               .startswith("cleanup:"))
+            reconcile_last_error = str(
+                (reconcile_state or {}).get("last_error") or "")
+            continuation_terminal = (
+                reconcile_last_error in {
+                    "boot-resume-exhausted", "exit-resume-exhausted",
+                    "boot-resume-invalid", "boot-resume-incident-changed",
+                    "boot-resume-contract-changed",
+                    "exit-resume-incident-changed"}
+                or result.get("action") in {
+                    "boot-resume-exhausted", "resume-exhausted",
+                    "boot-resume-invalid", "resume-invalid",
+                    "boot-resume-cancelled", "resume-cancelled"})
+            fatal = (reconcile_error or result.get("action") in
+                     ("fail-open-blocked",) or continuation_terminal)
+            return 1 if fatal else 0
+        return 0 if public["ok"] else 1
+    except dns_rescue_mod.DNSRescueError:
+        print("DNS Rescue: действие отклонено безопасным гейтом")
         return 1
     finally:
         p.close()
@@ -1037,10 +1090,22 @@ def cmd_heartbeat_check(cfg, args):
     providers = make_providers(secrets)
     p = open_pool(cfg)
     alerter = _make_alerter(cfg, secrets)
+    # Rescue is reconciled first so a legacy overlapping client marker cannot
+    # alter a cohort that is still under DNS NAT/ACL ownership.
     dns_rescue_mod.reconcile(cfg, p, actor="recovery")
-    dns_rescue_mod.automatic_tick(
-        cfg, p, p.get_setting("automat_state") or states_mod.OK,
-        manual_emergency=p.get_setting("emergency_manual") == "1", log=print)
+    try:
+        clients_mod.reconcile_client_operation(cfg, dns_pool=p)
+    except clients_mod.ClientError:
+        print("WireGuard client membership reconcile отложен")
+    dns_rescue_mod.reconcile(cfg, p, actor="recovery")
+    dns_state = p.dns_state()
+    # Pause forbids a new automatic activation, but an already active rescue
+    # must still receive TTL/health fail-open maintenance.
+    if (p.get_setting("automat_frozen") != "1"
+            or dns_state.get("phase") in dns_rescue_mod.ACTIVE_PHASES):
+        dns_rescue_mod.automatic_tick(
+            cfg, p, p.get_setting("automat_state") or states_mod.OK,
+            manual_emergency=p.get_setting("emergency_manual") == "1", log=print)
     r = states_mod.heartbeat_check(p, alerter)
     if r["stale"]:
         print("⚠️ Пульс агента устарел (%.1f ч)%s"
@@ -1117,10 +1182,14 @@ def main(argv=None):
     dns_sub.add_parser("status", help="режим, фаза, охват и незавершённые операции")
     dns_sub.add_parser("observe", help="UDP/TCP probe без перехвата")
     act = dns_sub.add_parser("activate", help="ручной canary activation")
-    act.add_argument("--scope", default="all", help="all или peer:<IPv4>")
+    act.add_argument("--scope", required=True,
+                     help="peer:<IPv4> для isolated canary; all только из sticky manual EMERGENCY")
     act.add_argument("--slot", help="id безопасного resolver slot")
+    act.add_argument("--profile", choices=["wg-ip", "external-ip"],
+                     help="класс exact peer для isolated canary; при scope=all не нужен")
     dns_sub.add_parser("deactivate", help="убрать redirect и остановить gateway")
     dns_sub.add_parser("reconcile", help="закрыть прерванную DNS saga")
+    dns_sub.add_parser("tick", help=argparse.SUPPRESS)
     sp = sub.add_parser("switch-provider",
                         help="П7-2: увести боевой канал с провайдера без ключа (после удаления ключа)")
     sp.add_argument("--from", dest="from_provider", required=True,

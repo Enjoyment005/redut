@@ -245,13 +245,25 @@ ok "параметры готовы"
 
 # ── 4. База: WireGuard, sing-box, маршруты, самолечение ─────────────────────
 say "Ставлю базу узла (это самый долгий шаг, пара минут)"
+# From the first live mutation through panel installation, setup owns the same
+# open lock description as install.sh, the RU updater and setup_panel.py. This
+# closes the former watchdog replacement gap between two separately locked
+# children. An inherited claim is accepted only with the exact proven fd.
+LOCK_FD="${REDUT_LOCK_FD:-}"
+if [ "${REDUT_LOCK_HELD:-0}" != "1" ] \
+        || [[ ! "$LOCK_FD" =~ ^[0-9]+$ ]] \
+        || [ "$(readlink "/proc/$$/fd/$LOCK_FD" 2>/dev/null || true)" != "/run/vpn-agent.lock" ]; then
+    exec 8>/run/vpn-agent.lock
+    flock -n 8 || die "vpn-agent занят; установка отложена"
+    LOCK_FD=8
+fi
+flock -n "$LOCK_FD" || die "общий lock установки не подтверждён"
+export REDUT_LOCK_HELD=1
+export REDUT_LOCK_FD="$LOCK_FD"
 bash "$WORKDIR/install/install.sh" 2>&1 | sed 's/^/  /'
 
-# сторож самолечения (в публичной раскладке лежит в node/)
-if [ -f "$WORKDIR/node/singbox-watchdog.sh" ]; then
-    install -m 0755 "$WORKDIR/node/singbox-watchdog.sh" /usr/local/bin/singbox-watchdog.sh
-    ok "сторож самолечения установлен"
-fi
+# install/install.sh is the single canonical watchdog installer.  Do not
+# overwrite it with a second copy from the developer-only node/ layout.
 
 # ── 5. Агент и веб-панель ───────────────────────────────────────────────────
 say "Ставлю агента и веб-панель"
@@ -272,6 +284,7 @@ json="$(echo "$out" | tail -1)"
 SERVER_IP="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('server_ip',''))" "$json")"
 CERT_FP="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('cert_fp',''))" "$json")"
 FRESH="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('fresh_setup'))" "$json")"
+BOOTSTRAP_SECRET="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('bootstrap_secret',''))" "$json")"
 
 # ── 5b. Исходящий канал ещё не выбран (первая установка публичной сборки) ────
 # Пока владелец не ввёл ключ провайдера в мастере, у sing-box нет upstream и туннель
@@ -370,8 +383,10 @@ fi
 if [ "$FRESH" = "True" ]; then
     printf '  Открой в браузере и пройди мастер первого входа:\n\n'
     printf '      \033[1;97mhttps://%s:%s/setup\033[0m\n\n' "$SERVER_IP" "$PANEL_PORT"
-    printf '  \033[1;33mВАЖНО:\033[0m первый вход не защищён паролем — панель займёт тот,\n'
-    printf '  кто откроет её первым. Пройди мастер сразу.\n\n'
+    printf '  Одноразовый код владельца (действует 24 часа):\n\n'
+    printf '      \033[1;97m%s\033[0m\n\n' "$BOOTSTRAP_SECRET"
+    printf '  Код хранится только в root:0600 и нужен до создания администратора.\n'
+    printf '  Если код потерян или истёк — повторный запуск установщика выпустит новый.\n\n'
 else
     printf '  Панель уже настроена: https://%s:%s/\n\n' "$SERVER_IP" "$PANEL_PORT"
 fi

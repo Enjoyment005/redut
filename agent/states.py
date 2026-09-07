@@ -30,6 +30,7 @@ import os
 import re
 import time
 import urllib.parse
+import uuid
 
 import apply as apply_mod
 import config_store
@@ -339,37 +340,133 @@ def release_manual_on_fault(cfg, pool, actor="auto", reason="confirmed-proxy-fau
     return r
 
 
+def _prepare_dns_emergency_exit(cfg, pool, actor="auto", log=print):
+    """Снять DNS ownership перед выходом из прямого аварийного маршрута.
+
+    Импорт локальный: dns_rescue является ортогональным coordinator и не должен
+    становиться обязательной зависимостью загрузки базовой машины состояний.
+    Вызывающий уже держит общий network flock.
+    """
+    try:
+        import dns_rescue as dns_rescue_mod
+        return dns_rescue_mod.prepare_for_emergency_exit(
+            cfg, pool, actor=actor, log=log, _locked=True)
+    except Exception as error:
+        pool.log_event("dns-rescue", actor=actor, result="exit-failed",
+                       detail=type(error).__name__)
+        return {"ok": False, "action": "failed", "error": str(error),
+                "state": pool.dns_state()}
+
+
+def _close_dns_incident(cfg, pool, settings=None):
+    """Закрыть durable DNS incident только после подтверждённого normal exit."""
+    import dns_rescue as dns_rescue_mod
+    return dns_rescue_mod.close_incident(cfg, pool, settings=settings)
+
+
+def _restore_dns_after_exit_failure(cfg, pool, actor="auto", log=print):
+    """Compensate DNS teardown when the data-plane could not leave EMERGENCY."""
+    try:
+        import dns_rescue as dns_rescue_mod
+        return dns_rescue_mod.resume_after_emergency_exit_failure(
+            cfg, pool, actor=actor, log=log, _locked=True)
+    except Exception as error:
+        pool.log_event("dns-rescue", actor=actor, result="resume-failed",
+                       detail=type(error).__name__)
+        return {"ok": False, "action": "failed", "error": str(error)}
+
+
+def _compensate_failed_emergency_exit(cfg, pool, actor="auto", log=print):
+    """Restore WAN first, then DNS, after a partially applied normal-route exit.
+
+    emergency_off may have already replaced the route with tun0 before a later
+    intent/flag proof fails. DNS must not be reattached until the exact direct
+    EMERGENCY route is proven again.
+    """
+    route_ok = emergency_on(cfg, log)
+    dns_result = ({"ok": False, "action": "route-unavailable"}
+                  if not route_ok else
+                  _restore_dns_after_exit_failure(cfg, pool, actor=actor, log=log))
+    pool.log_event(
+        "dns-rescue", actor=actor,
+        result="exit-compensated" if route_ok else "exit-unavailable",
+        detail=("прямой маршрут восстановлен; DNS resume=%s" %
+                (dns_result.get("action") or ("ok" if dns_result.get("ok") else "failed"))
+                if route_ok else
+                "не удалось доказанно восстановить прямой маршрут; DNS не подключён"))
+    return {"route_ok": route_ok, "dns": dns_result}
+
+
 def finish_explicit_apply(cfg, pool, uid, host, verify=None, source="manual",
-                          actor="user", log=print):
+                          actor="user", log=print, _locked=False):
     """Зафиксировать успешный apply и нормализовать маршрут/режим выбора.
 
     source=manual закрепляет канал. strategy/setup/recovery оставляют AUTO. Если
     apply победил из EMERGENCY/ROTATING, прямой WAN-маршрут обязательно снимается.
     """
-    state_before = pool.get_setting("automat_state") or OK
-    if (state_before in (EMERGENCY, ROTATING) or os.path.exists(EMERGENCY_FLAG)
-            or os.path.exists(_emergency_intent(cfg))):
-        if not emergency_off(cfg, log):
-            hold_state = state_before if state_before in (EMERGENCY, ROTATING) else EMERGENCY
-            pool.set_setting("automat_state", hold_state)
-            pool.log_event("explicit-apply", actor=actor, to_uid=uid,
-                           result="leave-direct-failed",
-                           detail="%s: proxy применён, но выход из прямого режима не подтверждён"
-                                  % source)
-            selection = selection_state(pool, cfg, host)
-            selection.update(ok=False, state=hold_state,
-                             error="выход из прямого режима не подтверждён")
-            return selection
-        pool.set_settings({"emergency_since": None, "rotating_since": None,
-                           "emergency_retry_n": None, "emergency_manual": None})
-        pool.log_event("explicit-apply", actor=actor, to_uid=uid, result="leave-direct",
-                       detail="%s: рабочий канал применён, прямой WAN-выход снят" % source)
-    pool.set_setting("automat_state", OK)
-    if verify:
-        pool.set_egress(verify)
-    if source == "manual":
-        return set_manual_selection(pool, uid, host, actor=actor, reason="ручное «В бой»")
-    return set_auto_selection(pool, cfg, actor=actor, reason="apply source=%s" % source)
+    def finish():
+        state_before = pool.get_setting("automat_state") or OK
+        in_direct = (state_before in (EMERGENCY, ROTATING)
+                     or os.path.exists(EMERGENCY_FLAG)
+                     or os.path.exists(_emergency_intent(cfg)))
+        if in_direct:
+            prepared = _prepare_dns_emergency_exit(cfg, pool, actor=actor, log=log)
+            if not prepared.get("ok"):
+                hold_state = (state_before if state_before in (EMERGENCY, ROTATING)
+                              else EMERGENCY)
+                pool.set_setting("automat_state", hold_state)
+                pool.log_event("explicit-apply", actor=actor, to_uid=uid,
+                               result="leave-direct-failed",
+                               detail="%s: DNS coordinator: %s"
+                                      % (source, prepared.get("action") or "failed"))
+                selection = selection_state(pool, cfg, host)
+                selection.update(ok=False, state=hold_state,
+                                 error="DNS coordinator не подготовил выход из аварии")
+                return selection
+            if not emergency_off(cfg, log):
+                compensation = _compensate_failed_emergency_exit(
+                    cfg, pool, actor=actor, log=log)
+                hold_state = (state_before if state_before in (EMERGENCY, ROTATING)
+                              else EMERGENCY)
+                pool.set_setting("automat_state", hold_state)
+                pool.log_event("explicit-apply", actor=actor, to_uid=uid,
+                               result="leave-direct-failed",
+                               detail=("%s: выход из прямого режима не подтверждён; "
+                                       "прямой маршрут %s" %
+                                       (source, "восстановлен" if compensation["route_ok"]
+                                        else "недоступен")))
+                selection = selection_state(pool, cfg, host)
+                selection.update(ok=False, state=hold_state,
+                                 error="выход из прямого режима не подтверждён")
+                return selection
+            _close_dns_incident(cfg, pool, settings={
+                "automat_state": OK,
+                "emergency_since": None, "rotating_since": None,
+                "emergency_retry_n": None, "emergency_manual": None,
+                "manual_emergency_ref": None,
+            })
+            pool.log_event("explicit-apply", actor=actor, to_uid=uid, result="leave-direct",
+                           detail="%s: рабочий канал применён, прямой WAN-выход снят" % source)
+        else:
+            pool.set_setting("automat_state", OK)
+        if verify:
+            pool.set_egress(verify)
+        if source == "manual":
+            return set_manual_selection(pool, uid, host, actor=actor,
+                                        reason="ручное «В бой»")
+        return set_auto_selection(pool, cfg, actor=actor,
+                                  reason="apply source=%s" % source)
+
+    if _locked:
+        return finish()
+    try:
+        with apply_mod.Flock(cfg.get("lock") or "/run/vpn-agent.lock"):
+            return finish()
+    except apply_mod.ApplyError as error:
+        selection = selection_state(pool, cfg, host)
+        selection.update(ok=False, state=pool.get_setting("automat_state") or OK,
+                         error="flock занят: %s" % error)
+        return selection
 
 
 def recover_apply_post_state(cfg, pool, operation, verify=None, log=print):
@@ -389,7 +486,8 @@ def recover_apply_post_state(cfg, pool, operation, verify=None, log=print):
     if source in ("manual", "strategy", "setup", "recovery"):
         post = finish_explicit_apply(
             cfg, pool, uid or ("live:%s" % host), host, verify,
-            source=source, actor=operation.get("requested_by") or "auto", log=log)
+            source=source, actor=operation.get("requested_by") or "auto", log=log,
+            _locked=True)
         if post.get("ok") is False:
             raise apply_mod.ApplyError(post.get("error") or "apply post-state не завершён")
     elif verify:
@@ -964,7 +1062,7 @@ def _converge_strategy_locked(cfg, providers, pool, log=print, actor="user"):
         pool.clear_cooldown(row["uid"])
         post = finish_explicit_apply(
             cfg, pool, row["uid"], row["host"], applied.get("verify"),
-            source="strategy", actor=actor, log=log)
+            source="strategy", actor=actor, log=log, _locked=True)
         if post.get("ok") is False:
             emit_strategy("post-state-pending", post["error"], reranked,
                           to_uid=row["uid"], policy=decision)
@@ -1200,10 +1298,13 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
                       decision.get("reason"), len(decision.get("failed_targets") or []),
                       decision.get("successful_signals"), decision.get("threshold")))
         pool.log_event("health-quorum", actor=actor, result="held", detail=detail)
-        if in_direct and not _leave_direct(cfg, pool, alerter, egress, log, actor, state_before):
-            return _direct_exit_failed(pool, result, state_before)
-        return _state(pool, result, DEGRADED, "quorum-held",
-                      detail + " — IP не меняю")
+        # Quorum says only that a proxy-specific fault is not proven.  The
+        # current egress proof is still negative, so it is not authority to
+        # remove the already-working direct EMERGENCY route (or DNS Rescue).
+        # Stay in the current direct state until a positive normal-path verify.
+        hold = state_before if in_direct and state_before in (EMERGENCY, ROTATING) else DEGRADED
+        return _state(pool, result, hold, "quorum-held",
+                      detail + " — IP и аварийный маршрут не меняю")
 
     # F1/F2: перед деструктивными шагами отказ должен быть ПОДТВЕРЖДЁН.
     # В EMERGENCY/ROTATING он подтверждён самим состоянием; исход «прокси жив,
@@ -1267,7 +1368,7 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
         if not _enter_emergency(
                 cfg, pool, alerter,
                 "лимит замен ≤%d/час исчерпан (антифлаппинг §8)" % MAX_REPLACEMENTS_PER_HOUR,
-                log, actor, state_before):
+                log, actor, state_before, recovery_exhausted=False):
             return _transition_failed(
                 pool, result, state_before, "emergency-enter-failed",
                 "лимит замен исчерпан, но прямой аварийный выход не подтверждён")
@@ -1315,9 +1416,11 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
         return _state(pool, result, OK, "replenish", rep.get("detail", "докупка ок"))
 
     # --- EMERGENCY ---
+    recovery_exhausted = bool(rot.get("exhausted") and not rot.get("capped")
+                              and not rep.get("ok") and not rep.get("have_candidates"))
     if not _enter_emergency(
             cfg, pool, alerter, rep.get("reason") or "живых кандидатов нет и купить нельзя",
-            log, actor, state_before):
+            log, actor, state_before, recovery_exhausted=recovery_exhausted):
         return _transition_failed(
             pool, result, state_before, "emergency-enter-failed",
             "прямой аварийный выход не подтверждён; состояние не изменено")
@@ -2146,18 +2249,26 @@ def emergency_off(cfg, log=print):
 
 
 def _middleman_default():
-    """Строка default-маршрута таблицы middleman ('' если нет / не Linux)."""
+    """Единственный default таблицы middleman; неоднозначность = нет доказательства."""
     rc, out = apply_mod.run_cmd(["ip", "route", "show", "table", "middleman"])
-    for ln in (out or "").splitlines():
-        if ln.startswith("default"):
-            return ln
-    return ""
+    if rc != 0:
+        return ""
+    defaults = [line.strip() for line in (out or "").splitlines()
+                if line.strip().split()[:1] == ["default"]]
+    return defaults[0] if len(defaults) == 1 else ""
 
 
 def _middleman_default_matches(dev, gw=None):
     """Проверить effective default таблицы middleman без substring-совпадений."""
-    tokens = _middleman_default().split()
+    route = _middleman_default()
+    if "\n" in route or "\r" in route:
+        return False
+    tokens = route.split()
     if not tokens or tokens[0] != "default":
+        return False
+    if "nexthop" in tokens or tokens.count("default") != 1:
+        return False
+    if tokens.count("dev") != 1 or tokens.count("via") > 1:
         return False
     try:
         actual_dev = tokens[tokens.index("dev") + 1]
@@ -2194,41 +2305,68 @@ def restore_emergency_routes(cfg, pool, log=print, actor="auto"):
     return True
 
 
-def _enter_emergency(cfg, pool, alerter, reason, log, actor, state_before):
+def _enter_emergency(cfg, pool, alerter, reason, log, actor, state_before,
+                     recovery_exhausted=False, manual_emergency_ref=None):
     ok = emergency_on(cfg, log)
     if not ok:
         pool.log_event("emergency", actor=actor, result="on-failed",
                        detail="прямой выход не подтверждён; состояние не изменено: %s" % reason)
         return False
-    pool.set_setting("automat_state", EMERGENCY)
-    pool.set_setting("emergency_last_retry", _now_iso())
-    pool.set_setting("rotating_since", None)
+    settings = {"automat_state": EMERGENCY,
+                "emergency_last_retry": _now_iso(),
+                "rotating_since": None}
     if state_before != EMERGENCY:
-        pool.set_setting("emergency_since", _now_iso())
-        pool.set_setting("emergency_retry_n", "0")   # F6: backoff с начала (2 мин)
+        settings.update({
+            "emergency_since": _now_iso(),
+            "emergency_retry_n": "0",   # F6: backoff с начала (2 мин)
         # авто-вход — не ручной: остаток emergency_manual от прежней ручной аварии
         # сделал бы ЭТУ аварию несгораемой для автоматики (ревью 1.3.0)
-        pool.set_setting("emergency_manual", None)
+            "emergency_manual": None,
+            "manual_emergency_ref": None,
+        })
+    if manual_emergency_ref:
+        settings.update({"emergency_manual": "1",
+                         "manual_emergency_ref": manual_emergency_ref})
+    if state_before != EMERGENCY and not recovery_exhausted:
+        # A new rate-limited/manual/unknown emergency must not inherit a stale
+        # eligibility marker from an older release or already closed episode.
+        settings.update({"dns_incident_id": None,
+                         "dns_recovery_exhausted": None})
+    # Eligibility is an explicit outcome of the completed recovery ladder.  It
+    # is deliberately outside the new-entry branch: a rate-limited EMERGENCY may
+    # later exhaust rotation/replenish during a retry of the same incident.
+    if recovery_exhausted:
+        incident_id = (pool.get_setting("dns_incident_id")
+                       if state_before == EMERGENCY else None)
+        if not incident_id:
+            incident_id = "dns-%s" % uuid.uuid4().hex
+        settings.update({"dns_incident_id": incident_id,
+                         "dns_recovery_exhausted": "1"})
+    # One durable publication owns the proven direct route and, when eligible,
+    # its DNS incident.  A crash after this point can always compensate safely.
+    if manual_emergency_ref:
+        pool.publish_manual_emergency(settings, manual_emergency_ref)
+    else:
+        pool.set_settings(settings)
+    if state_before != EMERGENCY:
         pool.log_event("emergency", actor=actor, result="on", detail=reason)
-        if actor != "user":
-            incident_id = "dns-%s" % _now_iso().replace(" ", "T").replace(":", "")
-            pool.set_settings({"dns_incident_id": incident_id,
-                               "dns_recovery_exhausted": "1"})
         alerter.emergency(reason=reason)             # письмо один раз при входе
-        if actor != "user":
-            try:
-                import dns_rescue as dns_rescue_mod
-                rescue = dns_rescue_mod.automatic_tick(
-                    cfg, pool, EMERGENCY, manual_emergency=False, log=log, _locked=True)
-                if rescue.get("action") not in ("ineligible", "active"):
-                    log("  dns-rescue: %s" % rescue.get("action"))
-            except Exception as error:
-                # DNS isolation failure must not undo the confirmed direct WAN
-                # fallback or broaden authority to proxy/money operations.
-                pool.log_event("dns-rescue", actor="auto", result="isolated-failure",
-                               detail=type(error).__name__)
     else:
         pool.log_event("emergency", actor=actor, result="retry", detail=reason)
+    if recovery_exhausted:
+        try:
+            import dns_rescue as dns_rescue_mod
+            rescue = dns_rescue_mod.automatic_tick(
+                cfg, pool, EMERGENCY,
+                manual_emergency=pool.get_setting("emergency_manual") == "1",
+                log=log, _locked=True)
+            if rescue.get("action") not in ("ineligible", "active"):
+                log("  dns-rescue: %s" % rescue.get("action"))
+        except Exception as error:
+            # DNS isolation failure must not undo the confirmed direct WAN
+            # fallback or broaden authority to proxy/money operations.
+            pool.log_event("dns-rescue", actor="auto", result="isolated-failure",
+                           detail=type(error).__name__)
     return ok
 
 
@@ -2236,15 +2374,32 @@ def _leave_direct(cfg, pool, alerter, verify, log, actor, state_before=EMERGENCY
     """Снять прямой выход WAN — ЕДИНЫЙ путь для EMERGENCY и ROTATING (инвариант
     флага): маршрут возвращается в tun0, флаг снимается, счётчики чистятся.
     Письмо recovered — только про аварию: ROTATING входил без письма."""
-    if not emergency_off(cfg, log):
+    if not isinstance(verify, dict) or not verify.get("ok"):
+        pool.log_event("emergency", actor=actor, result="off-held",
+                       detail="normal-path verify отсутствует или отрицателен")
+        return False
+    prepared = _prepare_dns_emergency_exit(cfg, pool, actor=actor, log=log)
+    if not prepared.get("ok"):
         action = "rotating" if state_before == ROTATING else "emergency"
         pool.log_event(action, actor=actor, result="off-failed",
-                       detail="маршрут tun0/runtime-флаг не подтверждены; прямой режим сохранён")
+                       detail="DNS coordinator не подготовил выход: %s"
+                              % (prepared.get("action") or "failed"))
         return False
-    pool.set_setting("emergency_since", None)
-    pool.set_setting("rotating_since", None)
-    pool.set_setting("emergency_retry_n", None)
-    pool.set_setting("emergency_manual", None)
+    if not emergency_off(cfg, log):
+        compensation = _compensate_failed_emergency_exit(
+            cfg, pool, actor=actor, log=log)
+        action = "rotating" if state_before == ROTATING else "emergency"
+        pool.log_event(action, actor=actor, result="off-failed",
+                       detail=("маршрут tun0/runtime-флаг не подтверждены; прямой маршрут %s"
+                               % ("восстановлен" if compensation["route_ok"]
+                                  else "недоступен")))
+        return False
+    _close_dns_incident(cfg, pool, settings={
+        "automat_state": OK,
+        "emergency_since": None, "rotating_since": None,
+        "emergency_retry_n": None, "emergency_manual": None,
+        "manual_emergency_ref": None,
+    })
     if state_before == ROTATING:
         pool.log_event("rotating", actor=actor, result="off",
                        detail="перебор завершён — рабочий выход egress=%s, прямой выход снят"
@@ -2275,24 +2430,59 @@ def set_emergency(cfg, pool, alerter, on, log=print, actor="user", _locked=False
         # Re-read after flock: the button/cron state seen before waiting is stale.
         state_before = pool.get_setting("automat_state") or OK
         if on:
+            manual_ref = (pool.get_setting("manual_emergency_ref")
+                          if (state_before == EMERGENCY
+                              and pool.get_setting("emergency_manual") == "1")
+                          else None) or ("manual-emergency-" + uuid.uuid4().hex)
             if not _enter_emergency(cfg, pool, alerter, "включён вручную", log, actor,
-                                    state_before):
+                                    state_before,
+                                    manual_emergency_ref=manual_ref):
                 return {"ok": False, "state": state_before,
                         "error": "прямой выход не подтверждён"}
-            pool.set_setting("emergency_manual", "1")
             return {"ok": True, "state": EMERGENCY}
-        if not emergency_off(cfg, log):
+        prepared = _prepare_dns_emergency_exit(cfg, pool, actor=actor, log=log)
+        if not prepared.get("ok"):
             pool.log_event("emergency", actor=actor, result="off-manual-failed",
-                           detail="ручное выключение не подтверждено; состояние сохранено")
+                           detail="DNS coordinator не подготовил выход: %s"
+                                  % (prepared.get("action") or "failed"))
+            return {"ok": False, "state": state_before,
+                    "error": "DNS coordinator не подготовил выход из аварии"}
+        if not emergency_off(cfg, log):
+            compensation = _compensate_failed_emergency_exit(
+                cfg, pool, actor=actor, log=log)
+            pool.log_event("emergency", actor=actor, result="off-manual-failed",
+                           detail=("ручное выключение не подтверждено; прямой маршрут %s"
+                                   % ("восстановлен" if compensation["route_ok"]
+                                      else "недоступен")))
             return {"ok": False, "state": state_before,
                     "error": "маршрут tun0/runtime-флаг не подтверждены"}
-        pool.set_settings({"automat_state": OK, "emergency_since": None,
-                           "emergency_manual": None, "emergency_retry_n": None,
-                           "dns_recovery_exhausted": None})
         v = None
         if os.name == "posix":
             v = apply_mod.verify_egress()
             pool.set_egress(v)
+            if not v.get("ok"):
+                compensation = _compensate_failed_emergency_exit(
+                    cfg, pool, actor=actor, log=log)
+                route_restored = compensation["route_ok"]
+                pool.set_settings({
+                    "automat_state": EMERGENCY,
+                    "emergency_since": pool.get_setting("emergency_since") or _now(),
+                    "emergency_manual": "1",
+                    "manual_emergency_ref": (pool.get_setting("manual_emergency_ref")
+                                             or "manual-emergency-" + uuid.uuid4().hex),
+                })
+                detail = ("ручное выключение отменено: normal-path verify провален; "
+                          "прямой маршрут %s" %
+                          ("восстановлен" if route_restored else "восстановить не удалось"))
+                pool.log_event("emergency", actor=actor, result="off-manual-failed",
+                               detail=detail)
+                return {"ok": False, "state": EMERGENCY, "verify": v,
+                        "error": detail}
+        _close_dns_incident(cfg, pool, settings={
+            "automat_state": OK, "emergency_since": None,
+            "rotating_since": None, "emergency_manual": None,
+            "emergency_retry_n": None, "manual_emergency_ref": None,
+        })
         detail = "выключен вручную"
         if v is not None:
             detail += "; verify: " + ("egress=%s cc=%s ok" % (v["egress_ip"], v["exit_cc"])

@@ -59,7 +59,8 @@ def whitelist_stat(has_dnsmasq, conf=WHITELIST_CONF, net_file=NET_IPSET_FILE):
 
 def _cleanup_run(run):
     """Один запуск из нового dict-формата или старого [timestamp, bytes]."""
-    precise = isinstance(run, dict) and "journal" in run
+    precise = isinstance(run, dict) and (
+        "journal" in run or run.get("scope") == "redut-owned")
     if isinstance(run, list) and len(run) == 2:
         run = {"at": run[0], "freed": run[1]}
     if not isinstance(run, dict):

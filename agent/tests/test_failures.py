@@ -126,6 +126,25 @@ class TestEmergencyKernelTransitions(unittest.TestCase):
                                return_value="default via 192.0.2.1 dev ens30"):
             self.assertFalse(states._middleman_default_matches("ens3", "192.0.2.1"))
 
+    def test_on_rejects_duplicate_default_routes(self):
+        routes = ("default via 192.0.2.1 dev ens3\n"
+                  "default via 192.0.2.2 dev ens4 metric 10\n")
+        with mock.patch.object(states.apply_mod, "run_cmd",
+                               side_effect=[(0, ""), (0, routes),
+                                            (0, ""), (0, "default dev tun0")]):
+            self.assertFalse(states.emergency_on(
+                {"gw": "192.0.2.1", "wan": "ens3"}, log=lambda *_: None))
+        self.assertFalse(os.path.exists(self.flag))
+
+    def test_off_rejects_multipath_default_and_keeps_flag(self):
+        self._set_flag()
+        multipath = ("default proto static nexthop via 192.0.2.1 dev tun0 weight 1 "
+                     "nexthop via 192.0.2.2 dev ens3 weight 1")
+        with mock.patch.object(states.apply_mod, "run_cmd",
+                               side_effect=[(0, ""), (0, multipath)]):
+            self.assertFalse(states.emergency_off({}, log=lambda *_: None))
+        self.assertTrue(os.path.exists(self.flag))
+
 
 class _DbBase(unittest.TestCase):
     def setUp(self):
@@ -379,7 +398,7 @@ class TestLeaveDirect(_DbBase):
         a = _SpyAlerter()
         self.pool.set_setting("emergency_retry_n", "3")
         states._leave_direct({"singbox_config": "x"}, self.pool, a,
-                             {"egress_ip": "5.5.5.5", "exit_cc": "fi"},
+                             {"ok": True, "egress_ip": "5.5.5.5", "exit_cc": "fi"},
                              lambda *a_: None, "auto", states.EMERGENCY)
         self.assertEqual(len(self.off_calls), 1)
         self.assertEqual([c[0] for c in a.calls], ["recovered"])
@@ -389,7 +408,8 @@ class TestLeaveDirect(_DbBase):
         a = _SpyAlerter()
         self.pool.set_setting("rotating_since", "2026-08-17 10:00:00")
         states._leave_direct({"singbox_config": "x"}, self.pool, a,
-                             {"egress_ip": "5.5.5.5"}, lambda *a_: None, "auto", states.ROTATING)
+                             {"ok": True, "egress_ip": "5.5.5.5"},
+                             lambda *a_: None, "auto", states.ROTATING)
         self.assertEqual(a.calls, [], "ROTATING входил без письма — выходит тоже тихо")
         self.assertIsNone(self.pool.get_setting("rotating_since"))
         ev = self.pool.conn.execute(
@@ -403,7 +423,7 @@ class TestLeaveDirect(_DbBase):
         states.emergency_off = lambda cfg, log=print: False
         self.assertFalse(states._leave_direct(
             {"singbox_config": "x"}, self.pool, a,
-            {"egress_ip": "5.5.5.5", "exit_cc": "fi"},
+            {"ok": True, "egress_ip": "5.5.5.5", "exit_cc": "fi"},
             lambda *a_: None, "auto", states.EMERGENCY))
         self.assertEqual(a.calls, [])
         self.assertEqual(self.pool.get_setting("automat_state"), states.EMERGENCY)

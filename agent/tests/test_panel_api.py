@@ -107,6 +107,47 @@ class TestStatusSysBlock(_AppHarness):
                 self.assertIn(k, out["sys"])
 
 
+class TestDNSRescueApiPrivacy(_AppHarness):
+    def test_post_never_reflects_raw_cli_peer_address(self):
+        self.app.pool.set_dns_state(
+            phase="active_isolated", active_scope="peer:10.77.0.9",
+            active_slot="slot-a", active_kind="isolated_manual")
+        handler = mock.Mock()
+        handler._body.return_value = json.dumps({"action": "reconcile"}).encode("utf-8")
+        handler._json.side_effect = lambda status, payload: (status, payload)
+        secret_output = '{"state":{"active_scope":"peer:10.77.0.9"}}'
+        with mock.patch.object(server, "_run_agent", return_value=(0, secret_output)):
+            status, payload = server.Handler._api_post(handler, "/api/dns-rescue")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["state"]["active_scope"], "peer")
+        self.assertNotIn("10.77.0.9", json.dumps(payload))
+        self.assertNotIn("output", payload)
+
+    def test_observe_returns_only_sanitized_transport_evidence(self):
+        handler = mock.Mock()
+        handler._body.return_value = json.dumps({"action": "observe"}).encode("utf-8")
+        handler._json.side_effect = lambda status, payload: (status, payload)
+        output = json.dumps({
+            "state": {"active_scope": "peer:10.77.0.9"},
+            "probes": [{
+                "slot": "cloudflare-proxy", "ok": False,
+                "transports": {"udp": True, "tcp": False},
+                "application_dns": False, "controls": True,
+                "error_kind": "ProofFailed",
+                "qname": "secret.canary.example", "endpoint": "https://1.1.1.1"}]})
+        with mock.patch.object(server, "_run_agent", return_value=(0, output)):
+            status, payload = server.Handler._api_post(handler, "/api/dns-rescue")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["probes"], [{
+            "slot": "cloudflare-proxy", "ok": False,
+            "transports": {"udp": True, "tcp": False},
+            "application_dns": False, "controls": True,
+            "error_kind": "ProofFailed"}])
+        rendered = json.dumps(payload)
+        self.assertNotIn("secret.canary.example", rendered)
+        self.assertNotIn("1.1.1.1", rendered)
+
+
 class TestPoolRowBlocked(_AppHarness):
     def test_clean_row_not_blocked(self):
         uid = self.put_proxy("1", country="fi", exit_cc="fi", exit_cc_alt="fi")

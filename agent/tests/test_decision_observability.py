@@ -74,7 +74,20 @@ class TestDecisionEventStorage(unittest.TestCase):
         self.pool.conn.commit()
         event = self.pool.events(1)[0]
         self.assertIsNone(event["decision"])
+        self.assertTrue(event["decision_invalid"])
         json.dumps(event, allow_nan=False)
+
+    def test_oversized_and_non_object_payloads_are_quarantined(self):
+        for raw in ('[1,2,3]', '{"reason":"' + ('x' * 70000) + '"}'):
+            with self.subTest(size=len(raw)):
+                self.pool.log_event("rotate", result="ok")
+                self.pool.conn.execute(
+                    "UPDATE event SET payload_json=? WHERE id=(SELECT MAX(id) FROM event)",
+                    (raw,))
+                self.pool.conn.commit()
+                event = self.pool.events(1)[0]
+                self.assertIsNone(event["decision"])
+                self.assertTrue(event["decision_invalid"])
 
     def test_migrates_existing_event_table_to_current_schema(self):
         self.pool.close()

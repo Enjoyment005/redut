@@ -1,9 +1,26 @@
 #!/bin/bash
 # Generic reference boot reconciler. install.sh renders the same policy with
 # node-specific values; this template reads /etc/vpn-panel/node.env.
-set -eu
+set -euo pipefail
 . /etc/vpn-panel/node.env
 IPTABLES=/usr/sbin/iptables
+
+# Serialize every route/firewall mutation with the agent, installer and DNS
+# Rescue.  An installer may pass its already-held descriptor; verify the fd so
+# environment variables alone cannot bypass the lock.
+LOCK_FD="${REDUT_LOCK_FD:-}"
+if [ "${REDUT_LOCK_HELD:-0}" = "1" ] \
+        && [[ "$LOCK_FD" =~ ^[0-9]+$ ]] \
+        && [ "$(readlink "/proc/$$/fd/$LOCK_FD" 2>/dev/null || true)" = "/run/vpn-agent.lock" ]; then
+    flock -n "$LOCK_FD" \
+        || { echo "vpn-boot-setup: inherited lock не подтверждён" >&2; exit 75; }
+else
+    exec 8>/run/vpn-agent.lock
+    flock -w 180 8 \
+        || { echo "vpn-boot-setup: общий lock не получен" >&2; exit 75; }
+    LOCK_FD=8
+fi
+export REDUT_LOCK_HELD=1 REDUT_LOCK_FD="$LOCK_FD"
 
 if ! /usr/sbin/ip link show wg0 >/dev/null 2>&1; then
     systemctl start wg-quick@wg0 2>/dev/null || wg-quick up wg0 2>/dev/null || true

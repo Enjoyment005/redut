@@ -69,7 +69,6 @@ import apply as apply_mod          # noqa: E402
 import config_store                # noqa: E402
 import config_schema               # noqa: E402
 import dns_rescue as dns_rescue_mod  # noqa: E402
-import dns_rescue as dns_rescue_mod  # noqa: E402
 import country as country_mod      # noqa: E402
 import metrics as metrics_mod      # noqa: E402
 import money as money_mod          # noqa: E402
@@ -86,12 +85,23 @@ from webpanel import hygiene as hygiene_mod   # noqa: E402
 
 ETC_CONFIG = "/etc/vpn-panel/config.json"
 ETC_SECRETS = "/etc/vpn-panel/secrets.json"
+ETC_BOOTSTRAP = "/etc/vpn-panel/bootstrap.json"
 CERT = "/etc/vpn-panel/panel.crt"
 KEY = "/etc/vpn-panel/panel.key"
 
 _DB_LOCK = threading.RLock()       # sqlite из потоков http-сервера — сериализуем доступ
-_SECRETS_LOCK = threading.Lock()   # secrets.json правят и мастер, и экран ключей — по одному
 _CONFIG_LOCK = threading.Lock()    # config.json: панель правит из него ровно одну настройку
+_SETUP_LOCK = threading.RLock()    # один владелец/последовательность шагов мастера
+_AUTH_SLOTS = threading.BoundedSemaphore(4)  # не дать scrypt исчерпать маленький VPS
+MAX_REQUEST_BODY = 64 * 1024
+SETUP_CLAIM_TTL = 30 * 60
+
+
+class RequestBodyError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = int(status)
+        self.message = message
 
 
 def _has(row, col):
@@ -203,6 +213,45 @@ def _run_agent(args, timeout=240):
         return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
     except Exception as e:
         return -1, str(e)
+
+
+_DNS_OBSERVE_SLOT = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+_DNS_OBSERVE_ERROR = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,63}$")
+
+
+def _sanitized_dns_observe_output(output):
+    """Parse only the fixed redacted probe schema; discard all other stdout."""
+    try:
+        payload = json.loads(output or "")
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(payload, dict) or not isinstance(payload.get("probes"), list):
+        return []
+    sanitized = []
+    for item in payload["probes"][:16]:
+        if not isinstance(item, dict) or not isinstance(item.get("ok"), bool):
+            continue
+        slot = item.get("slot")
+        transports = item.get("transports")
+        error_kind = item.get("error_kind")
+        if (not isinstance(slot, str) or not _DNS_OBSERVE_SLOT.fullmatch(slot)
+                or not isinstance(transports, dict)
+                or set(transports) != {"udp", "tcp"}
+                or not all(isinstance(transports[key], bool)
+                           for key in ("udp", "tcp"))
+                or not isinstance(item.get("application_dns"), bool)
+                or not isinstance(item.get("controls"), bool)
+                or (error_kind is not None
+                    and (not isinstance(error_kind, str)
+                         or not _DNS_OBSERVE_ERROR.fullmatch(error_kind)))):
+            continue
+        sanitized.append({
+            "slot": slot, "ok": item["ok"],
+            "transports": {"udp": transports["udp"],
+                           "tcp": transports["tcp"]},
+            "application_dns": item["application_dns"],
+            "controls": item["controls"], "error_kind": error_kind})
+    return sanitized
 
 
 def _first_channel_kick():
@@ -411,8 +460,12 @@ class App:
         self.store = auth.AuthStore(self.pool.conn)
         # мастер первого входа (чистая установка): пока нет admin — режим онбординга.
         self.setup = {}                       # незаписанные шаги мастера (в памяти)
-        self.setup_csrf = auth.new_csrf_token()
+        self.setup_claim_token = None
+        self.setup_claim_expires = 0.0
         self._load_secrets()
+        default_bootstrap = os.path.join(os.path.dirname(self.secrets_path or ETC_SECRETS),
+                                         "bootstrap.json")
+        self.bootstrap_path = os.environ.get("VPN_PANEL_BOOTSTRAP", default_bootstrap)
 
     def _load_secrets(self):
         self.secrets, self.secrets_path = load_secrets()
@@ -435,14 +488,7 @@ class App:
     def write_secrets(self, data):
         """Атомарно записать secrets.json (0600) и перечитать состояние."""
         path = self.secrets_path or ETC_SECRETS
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp, path)
+        auth.write_secrets_atomic(path, data)
         self.reload_secrets()
 
     def save_provider_key(self, name, key):
@@ -451,11 +497,28 @@ class App:
         Файл перечитываем с диска под локом, а не пишем копию из памяти: recovery-коды
         вычёркивает auth.consume_recovery_code мимо этого объекта, и запись устаревшей
         копии воскресила бы уже использованный код."""
-        with _SECRETS_LOCK:
-            data, _ = load_secrets()
-            if not data:
-                data = dict(self.secrets or {})
-            self.write_secrets(merge_key(data, name, key))
+        path = self.secrets_path or ETC_SECRETS
+        auth.update_secrets_atomic(path, lambda data: merge_key(data, name, key))
+        self.reload_secrets()
+
+    def claim_setup(self, supplied):
+        """Bind unprovisioned setup to proof obtained from the SSH console."""
+        with _SETUP_LOCK:
+            if self.provisioned:
+                return None
+            if not auth.bootstrap_secret_valid(self.bootstrap_path, supplied):
+                return None
+            self.setup = {}
+            self.setup_claim_token = auth.new_session_token()
+            self.setup_claim_expires = time.time() + SETUP_CLAIM_TTL
+            return self.setup_claim_token
+
+    def setup_claim_valid(self, token):
+        with _SETUP_LOCK:
+            if (not token or not self.setup_claim_token
+                    or time.time() > self.setup_claim_expires):
+                return False
+            return auth.hmac.compare_digest(token, self.setup_claim_token)
 
     def save_strategy(self, name, _locked=False):
         """Записать стратегию стран в config.json и применить без рестарта.
@@ -607,9 +670,35 @@ class Handler(BaseHTTPRequestHandler):
         tok = self.headers.get("X-CSRF-Token")
         return bool(tok and s and auth.hmac.compare_digest(tok, s["csrf"]))
 
-    def _body(self):
-        ln = int(self.headers.get("Content-Length") or 0)
-        return self.rfile.read(ln) if ln else b""
+    def _body(self, limit=None):
+        """Read one bounded, unambiguous HTTP request body."""
+        limit = MAX_REQUEST_BODY if limit is None else max(0, int(limit))
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            raise RequestBodyError(400, "Transfer-Encoding не поддерживается")
+        lengths = self.headers.get_all("Content-Length") or []
+        if len(lengths) != 1:
+            self.close_connection = True
+            raise RequestBodyError(411 if not lengths else 400,
+                                   "нужен один корректный Content-Length")
+        try:
+            ln = int(lengths[0], 10)
+        except (TypeError, ValueError):
+            self.close_connection = True
+            raise RequestBodyError(400, "Content-Length должен быть целым числом")
+        if ln < 0:
+            self.close_connection = True
+            raise RequestBodyError(400, "Content-Length не может быть отрицательным")
+        if ln > limit:
+            self.close_connection = True
+            raise RequestBodyError(413, "тело запроса слишком большое")
+        if not ln:
+            return b""
+        data = self.rfile.read(ln)
+        if len(data) != ln:
+            self.close_connection = True
+            raise RequestBodyError(400, "тело запроса короче Content-Length")
+        return data
 
     def log_message(self, fmt, *args):
         pass  # без access-логов (OPSEC); значимое пишем в event
@@ -622,7 +711,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, "ok", "text/plain; charset=utf-8")
         if not APP.provisioned:                     # чистая установка -> мастер первого входа
             if path == "/setup":
-                return self._send(200, views.setup_page(APP.setup_csrf))
+                return self._send(200, views.setup_page())
             return self._redirect("/setup")
         if path == "/setup":
             return self._redirect("/login")         # уже настроено — мастер закрыт
@@ -648,9 +737,6 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/dns-rescue":
             with _DB_LOCK:
                 return self._json(200, dns_rescue_mod.status(APP.cfg, APP.pool))
-        if path == "/api/dns-rescue":
-            with _DB_LOCK:
-                return self._json(200, dns_rescue_mod.status(APP.cfg, APP.pool))
         if path == "/api/pool":
             with _DB_LOCK:
                 rows = APP.pool.list(include_gone=True)
@@ -663,7 +749,8 @@ class Handler(BaseHTTPRequestHandler):
             limit = events_limit(qs)
             with _DB_LOCK:
                 evs = APP.pool.events(limit)
-            public_fields = ("ts", "actor", "action", "result", "detail", "decision")
+            public_fields = ("ts", "actor", "action", "result", "detail",
+                             "decision", "decision_invalid")
             return self._json(200, {"events": [
                 {key: event.get(key) for key in public_fields} for event in evs]})
         if path == "/api/metrics":
@@ -764,6 +851,12 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------ POST
     def do_POST(self):
+        try:
+            return self._do_POST_inner()
+        except RequestBodyError as error:
+            return self._json(error.status, {"error": error.message})
+
+    def _do_POST_inner(self):
         u = urlparse(self.path)
         path = u.path
         if path.startswith("/api/setup/"):
@@ -906,25 +999,28 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "неизвестное действие DNS Rescue"})
             command = ["dns-rescue", action]
             if action == "activate":
-                command += ["--scope", str(body.get("scope") or "all")]
+                scope = str(body.get("scope") or "")
+                if not scope:
+                    return self._json(400, {"error": "scope обязателен"})
+                command += ["--scope", scope]
                 if body.get("slot"):
                     command += ["--slot", str(body["slot"])]
+                if scope != "all":
+                    profile = str(body.get("profile") or "")
+                    if profile not in ("wg-ip", "external-ip"):
+                        return self._json(400, {"error": "profile wg-ip|external-ip обязателен"})
+                    command += ["--profile", profile]
             rc, output = _run_agent(command, timeout=90)
-            return self._json(200 if rc == 0 else 409,
-                              {"ok": rc == 0, "output": (output or "")[-1500:]})
-        if path == "/api/dns-rescue":
-            body = json.loads(self._body() or b"{}") or {}
-            action = body.get("action")
-            if action not in ("observe", "activate", "deactivate", "reconcile"):
-                return self._json(400, {"error": "неизвестное действие DNS Rescue"})
-            command = ["dns-rescue", action]
-            if action == "activate":
-                command += ["--scope", str(body.get("scope") or "all")]
-                if body.get("slot"):
-                    command += ["--slot", str(body["slot"])]
-            rc, output = _run_agent(command, timeout=90)
-            return self._json(200 if rc == 0 else 409,
-                              {"ok": rc == 0, "output": (output or "")[-1500:]})
+            # Never reflect CLI stdout: raw activation state historically
+            # contained peer:<IPv4>. Return a fresh, centrally redacted view.
+            with _DB_LOCK:
+                public = dns_rescue_mod.status(APP.cfg, APP.pool)
+            public.update({"ok": rc == 0, "action": action})
+            if action == "observe":
+                public["probes"] = _sanitized_dns_observe_output(output)
+            if rc != 0:
+                public["error"] = "DNS Rescue action was rejected or failed"
+            return self._json(200 if rc == 0 else 409, public)
 
         parts = path.strip("/").split("/")   # api proxy <uid> <action>
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "proxy":
@@ -954,7 +1050,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/clients":
             body = json.loads(self._body() or b"{}") or {}
             try:
-                r = clients_mod.add_client(APP.cfg, (body.get("name") or "").strip())
+                r = clients_mod.add_client(
+                    APP.cfg, (body.get("name") or "").strip(),
+                    dns_pool=APP.saga_pool)
             except clients_mod.ClientError as e:
                 return self._json(400, {"error": str(e)})
             with _DB_LOCK:
@@ -964,7 +1062,8 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[1] == "clients" and parts[3] == "delete":
             name = unquote(parts[2])
             try:
-                r = clients_mod.delete_client(APP.cfg, name)
+                r = clients_mod.delete_client(
+                    APP.cfg, name, dns_pool=APP.saga_pool)
             except clients_mod.ClientError as e:
                 return self._json(400, {"error": str(e)})
             with _DB_LOCK:
@@ -1304,17 +1403,19 @@ class Handler(BaseHTTPRequestHandler):
         # проверка «последнего ключа» и запись — под ОДНИМ локом по данным с диска
         # (ревью 1.3.0): два одновременных удаления разных провайдеров иначе оба
         # проходили проверку и оставляли панель слепой
-        with _SECRETS_LOCK:
-            data, _ = load_secrets()
-            if not data:
-                data = dict(APP.secrets or {})
+        def remove_key(data):
             if not ((data or {}).get(name) or {}).get("api_key"):
-                return self._json(400, {"error": "у %s и так нет ключа" % name})
+                raise ValueError("у %s и так нет ключа" % name)
             if provider_keys(data) <= {name}:
-                return self._json(400, {"error": "это последний ключ: без него панель не увидит пул, "
-                                                 "не купит замену и не продлит боевой прокси. "
-                                                 "Сначала впиши рабочий ключ другого провайдера"})
-            APP.write_secrets(merge_key(data, name, None))
+                raise ValueError("это последний ключ: без него панель не увидит пул, "
+                                 "не купит замену и не продлит боевой прокси. "
+                                 "Сначала впиши рабочий ключ другого провайдера")
+            return merge_key(data, name, None)
+        try:
+            auth.update_secrets_atomic(APP.secrets_path or ETC_SECRETS, remove_key)
+        except ValueError as error:
+            return self._json(400, {"error": str(error)})
+        APP.reload_secrets()
         cur_host = APP.current_host()
         with _DB_LOCK:
             selection = states_mod.selection_state(APP.pool, APP.cfg, cur_host)
@@ -1554,19 +1655,26 @@ class Handler(BaseHTTPRequestHandler):
             ban = APP.store.is_banned(ip)
         if ban:
             return self._send(429, views.login_page(error="Слишком много попыток. Бан ещё %d мин." % (ban // 60 + 1)))
-        body = parse_qs(self._body().decode("utf-8", "replace"))
+        body = parse_qs(self._body(limit=8192).decode("utf-8", "replace"))
         password = (body.get("password") or [""])[0]
         otp = (body.get("otp") or [""])[0]
         admin = APP.admin
         ok = False
-        if admin and auth.verify_password(password, admin.get("pw", "")):
-            if auth.totp_verify(admin.get("totp", ""), otp):
-                ok = True
-            elif otp and APP.secrets_path and auth.consume_recovery_code(None, APP.secrets_path, otp):
-                # recovery-код одноразовый: перечитать секреты (список изменился)
-                APP.secrets, _ = load_secrets()
-                APP.admin = APP.secrets.get("admin")
-                ok = True
+        if not _AUTH_SLOTS.acquire(blocking=False):
+            return self._json(503, {"error": "слишком много одновременных попыток входа"},
+                              extra=[("Retry-After", "2")])
+        try:
+            if admin and auth.verify_password(password, admin.get("pw", "")):
+                if auth.totp_verify(admin.get("totp", ""), otp):
+                    ok = True
+                elif otp and APP.secrets_path and auth.consume_recovery_code(
+                        None, APP.secrets_path, otp):
+                    # recovery-код одноразовый: перечитать секреты (список изменился)
+                    APP.secrets, _ = load_secrets()
+                    APP.admin = APP.secrets.get("admin")
+                    ok = True
+        finally:
+            _AUTH_SLOTS.release()
         if not ok:
             with _DB_LOCK:
                 fails, banned = APP.store.record_fail(ip)
@@ -1585,30 +1693,43 @@ class Handler(BaseHTTPRequestHandler):
     def _do_setup(self, path):
         if APP.provisioned:
             return self._json(403, {"error": "панель уже настроена"})
+        try:
+            body = json.loads(self._body(limit=32768) or b"{}") or {}
+        except (TypeError, ValueError):
+            return self._json(400, {"error": "тело должно быть JSON-объектом"})
+        if not isinstance(body, dict):
+            return self._json(400, {"error": "тело должно быть JSON-объектом"})
+        if path == "/api/setup/claim":
+            token = APP.claim_setup(str(body.get("secret") or ""))
+            if not token:
+                return self._json(403, {"error": "bootstrap-код неверен или просрочен"})
+            return self._json(200, {"ok": True, "setup_token": token,
+                                    "expires_in": SETUP_CLAIM_TTL})
         tok = self.headers.get("X-Setup-Token")
-        if not (tok and auth.hmac.compare_digest(tok, APP.setup_csrf)):
-            return self._json(403, {"error": "setup-токен неверен — перезагрузи /setup"})
-        try:
-            body = json.loads(self._body() or b"{}") or {}
-        except ValueError:
-            body = {}
-        try:
-            if path == "/api/setup/password":
-                return self._setup_password(body)
-            if path == "/api/setup/totp/new":
-                return self._setup_totp_new()
-            if path == "/api/setup/totp/verify":
-                return self._setup_totp_verify(body)
-            if path == "/api/setup/provider":
-                return self._setup_provider(body)
-            if path == "/api/setup/smtp/test":
-                return self._setup_smtp_test(body)
-            if path == "/api/setup/smtp":
-                return self._setup_smtp(body)
-            if path == "/api/setup/finish":
-                return self._setup_finish()
-        except Exception as e:
-            return self._json(500, {"error": "%s: %s" % (type(e).__name__, e)})
+        if not APP.setup_claim_valid(tok):
+            return self._json(403, {"error": "сначала подтверди bootstrap-код из SSH"})
+        with _SETUP_LOCK:
+            if APP.provisioned:
+                return self._json(403, {"error": "панель уже настроена"})
+            if not APP.setup_claim_valid(tok):
+                return self._json(403, {"error": "setup-сессия истекла"})
+            try:
+                if path == "/api/setup/password":
+                    return self._setup_password(body)
+                if path == "/api/setup/totp/new":
+                    return self._setup_totp_new()
+                if path == "/api/setup/totp/verify":
+                    return self._setup_totp_verify(body)
+                if path == "/api/setup/provider":
+                    return self._setup_provider(body)
+                if path == "/api/setup/smtp/test":
+                    return self._setup_smtp_test(body)
+                if path == "/api/setup/smtp":
+                    return self._setup_smtp(body)
+                if path == "/api/setup/finish":
+                    return self._setup_finish()
+            except Exception as e:
+                return self._json(500, {"error": "%s: %s" % (type(e).__name__, e)})
         self._json(404, {"error": "нет такого шага"})
 
     def _setup_password(self, body):
@@ -1791,12 +1912,23 @@ class Handler(BaseHTTPRequestHandler):
         if st.get("smtp"):
             data["smtp"] = st["smtp"]
         APP.write_secrets(data)
+        try:
+            auth.consume_bootstrap_secret(APP.bootstrap_path)
+        except OSError as exc:
+            # Admin уже записан атомарно, поэтому setup закрыт даже при ошибке удаления
+            # bootstrap-файла. Не превращаем успешное создание владельца в ложный 500.
+            with _DB_LOCK:
+                APP.pool.log_event("setup-bootstrap-cleanup", actor="system",
+                                   result="warning", detail=str(exc)[:500],
+                                   src_ip=self._client_ip())
         with _DB_LOCK:
             APP.pool.log_event("setup", actor="user", result="ok",
                                detail="онбординг: провайдеры=%s smtp=%s"
                                % (",".join(st["providers"]), bool(st.get("smtp"))),
                                src_ip=self._client_ip())
         APP.setup = {}
+        APP.setup_claim_token = None
+        APP.setup_claim_expires = 0.0
         # Первый канал — сразу, а не по расписанию. До этого узел (публичная сборка) сидит в
         # EMERGENCY с окном повтора 15 мин, и после мастера человек ждал до четверти часа
         # (приёмка 15.08: ключ введён 15:51, канал появился 15:54 — просто повезло с окном).
@@ -1862,7 +1994,6 @@ class Handler(BaseHTTPRequestHandler):
             out["emergency_since"] = APP.pool.get_setting("emergency_since")
             out["frozen"] = APP.pool.get_setting("automat_frozen") == "1"
             out["heartbeat"] = APP.pool.last_heartbeat()
-            out["dns_rescue"] = dns_rescue_mod.status(APP.cfg, APP.pool)
             out["dns_rescue"] = dns_rescue_mod.status(APP.cfg, APP.pool)
             selection = states_mod.selection_state(APP.pool, APP.cfg, cur_host)
             # последняя проба выхода: сам статус её не делает (curl через tun0 — до 15 с
@@ -1974,6 +2105,7 @@ def requires_tls(cfg):
 # не должны длиться вечно. Без него медленный/молчащий клиент (сканер, slowloris) держит
 # поток и сокет бесконечно.
 _CONN_TIMEOUT = 30
+_MAX_HTTP_WORKERS = 32
 
 
 class PanelHTTPSServer(ThreadingHTTPServer):
@@ -1988,7 +2120,35 @@ class PanelHTTPSServer(ThreadingHTTPServer):
     свой поток и отваливается сам, не трогая остальных."""
 
     daemon_threads = True
+    block_on_close = False
+    request_queue_size = 64
     ssl_ctx = None            # ставится в main(), когда есть cert/key (иначе dev-HTTP)
+
+    def __init__(self, *args, **kwargs):
+        self._worker_slots = threading.BoundedSemaphore(_MAX_HTTP_WORKERS)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        # Do not create an unbounded thread per public connection.  Closing an
+        # excess socket here is deterministic and, unlike writing a TLS 503 in
+        # the accept loop, cannot block the acceptor on a new handshake.
+        if not self._worker_slots.acquire(blocking=False):
+            try:
+                request.close()
+            except OSError:
+                pass
+            return
+        try:
+            return super().process_request(request, client_address)
+        except BaseException:
+            self._worker_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            return super().process_request_thread(request, client_address)
+        finally:
+            self._worker_slots.release()
 
     def get_request(self):
         sock, addr = self.socket.accept()      # обычный TCP-приём — без рукопожатия, быстрый
@@ -2009,8 +2169,8 @@ def main():
     _reconcile_selection_on_startup()
     port = int(APP.cfg.get("panel_port") or 8443)
     if not APP.provisioned:
-        print("⚠️ Панель НЕ настроена — открой https://<host>:%d/setup (мастер первого входа: "
-              "провайдер, 2FA, пароль, почта)" % port, file=sys.stderr)
+        print("⚠️ Панель НЕ настроена — открой https://<host>:%d/setup и введи "
+              "bootstrap-код из SSH-консоли установщика" % port, file=sys.stderr)
     threading.Thread(target=_pulse_monitor, daemon=True).start()   # §6.3 пульс агента
     httpd = PanelHTTPSServer(("0.0.0.0", port), Handler)
     # На РЕАЛЬНОМ узле (в конфиге прописан внешний server_ip) панель обязана работать по HTTPS:

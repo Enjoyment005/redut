@@ -13,18 +13,30 @@
 в мастере), не перетирает настроенные владельцем блоки конфига и не плодит кроны.
 """
 import argparse
+import contextlib
+import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
+
+try:
+    import fcntl
+except ImportError:  # imported by Windows-only installer tests; execution is Linux-only
+    fcntl = None
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 OPT = "/opt/vpn-panel"
 ETC = "/etc/vpn-panel"
 VAR = "/var/lib/vpn-panel"
+NETWORK_LOCK = "/run/vpn-agent.lock"
+BOOTSTRAP_TTL = 24 * 3600
 
 # update.py — ПЕРВЫМ: agent.py его импортирует, и на живом узле между копиями
 # файлов есть окно, где тик крона (pool-refresh/heartbeat) поймал бы ImportError.
@@ -58,6 +70,9 @@ Restart=always
 RestartSec=3
 # Панель работает от root: apply/rollback правят /etc/sing-box и маршруты.
 # Ограничители ущерба — в приложении (лимиты вне веба, тумблеры, TOTP).
+MemoryMax=512M
+TasksMax=64
+LimitNOFILE=4096
 
 [Install]
 WantedBy=multi-user.target
@@ -197,6 +212,46 @@ def write_config(name, net, port, subnet, wg_port, dnsmasq):
     os.replace(tmp, path)
 
 
+@contextlib.contextmanager
+def secret_file_lock(path):
+    lock_path = path + ".lock"
+    lock_file = open(lock_path, "a+", encoding="ascii")
+    try:
+        try:
+            os.chmod(lock_path, 0o600)
+        except OSError:
+            pass
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+
+
+def atomic_json(path, data, mode=0o600):
+    parent = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".%s." % os.path.basename(path), dir=parent)
+    try:
+        os.chmod(tmp, mode)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as target:
+            fd = -1
+            json.dump(data, target, ensure_ascii=False, indent=2)
+            target.write("\n")
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(tmp, path)
+        os.chmod(path, mode)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
 def ensure_secrets():
     """Пустой secrets.json ({} или нет файла) = панель уйдёт в мастер первого входа.
     Настроенный (есть блок admin) не трогаем. Возвращает True, если мастер ещё впереди —
@@ -204,24 +259,46 @@ def ensure_secrets():
     (Раньше «{}» считался настроенной панелью, и повторный запуск до мастера писал
     «панель уже настроена» — найдено на приёмке 15.08.)"""
     path = os.path.join(ETC, "secrets.json")
-    if os.path.isfile(path):
+    with secret_file_lock(path):
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    raw = f.read()
+                data = json.loads(raw) if raw.strip() else {}
+            except (ValueError, OSError):
+                print("  secrets.json: не разобрать как JSON — оставлен как есть")
+                return False
+            if isinstance(data, dict) and data.get("admin"):
+                print("  secrets.json: оставлен как есть (панель уже настроена)")
+                try:
+                    os.unlink(os.path.join(ETC, "bootstrap.json"))
+                except FileNotFoundError:
+                    pass
+                return False
+            if data:
+                print("  secrets.json: оставлен как есть (учётка панели ещё не заведена — мастер впереди)")
+                return True
+        atomic_json(path, {})
+        return True
+
+
+def create_bootstrap_secret(enabled):
+    """Create a fresh SSH-only ownership proof for an unprovisioned panel."""
+    path = os.path.join(ETC, "bootstrap.json")
+    if not enabled:
         try:
-            with open(path, encoding="utf-8") as f:
-                raw = f.read()
-            data = json.loads(raw) if raw.strip() else {}
-        except (ValueError, OSError):
-            print("  secrets.json: не разобрать как JSON — оставлен как есть")
-            return False
-        if isinstance(data, dict) and data.get("admin"):
-            print("  secrets.json: оставлен как есть (панель уже настроена)")
-            return False
-        if data:
-            print("  secrets.json: оставлен как есть (учётка панели ещё не заведена — мастер впереди)")
-            return True
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("{}\n")
-    os.chmod(path, 0o600)
-    return True
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        return ""
+    plain = secrets.token_urlsafe(32)
+    now = time.time()
+    record = {"version": 1, "created": now, "expires": now + BOOTSTRAP_TTL,
+              "used": False,
+              "secret_sha256": hashlib.sha256(plain.encode("utf-8")).hexdigest()}
+    with secret_file_lock(path):
+        atomic_json(path, record)
+    return plain
 
 
 def ensure_cert(host, regen=False):
@@ -238,13 +315,34 @@ def ensure_cert(host, regen=False):
 
 
 def install_units(with_panel):
+    sh("getent group redut-dns >/dev/null 2>&1 || groupadd --system redut-dns", check=True)
+    sh("id -u redut-dns >/dev/null 2>&1 || useradd --system --gid redut-dns "
+       "--home-dir /var/lib/redut-dns-rescue --shell /usr/sbin/nologin redut-dns",
+       check=True)
+    sh("install -d -o root -g redut-dns -m 0750 /etc/redut-dns-rescue", check=True)
+    sh("install -d -o redut-dns -g redut-dns -m 0700 "
+       "/var/lib/redut-dns-rescue /run/redut-dns-rescue", check=True)
+    sh("install -d -o root -g redut-dns -m 0750 "
+       "/run/redut-dns-rescue-controller", check=True)
+    sh("install -d -o root -g redut-dns -m 0770 "
+       "/run/redut-dns-rescue-controller/preflight-state", check=True)
     with open("/usr/local/bin/vpn-agent", "w", encoding="utf-8", newline="\n") as f:
         f.write(WRAPPER)
     os.chmod("/usr/local/bin/vpn-agent", 0o755)
+    template_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+    for name in ("redut-dns-rescue.service",
+                 "redut-dns-rescue-watchdog.service",
+                 "redut-dns-rescue-watchdog.timer"):
+        source = os.path.join(template_dir, name)
+        if not os.path.isfile(source):
+            sys.exit("нет systemd-шаблона %s" % source)
+        shutil.copy2(source, os.path.join("/etc/systemd/system", name))
+        os.chmod(os.path.join("/etc/systemd/system", name), 0o644)
+    sh("systemctl daemon-reload", check=True)
+    sh("systemctl enable --now redut-dns-rescue-watchdog.timer", check=True)
     if with_panel:
         with open("/etc/systemd/system/vpn-panel.service", "w", encoding="utf-8", newline="\n") as f:
             f.write(PANEL_SERVICE)
-        sh("systemctl daemon-reload")
         sh("systemctl enable vpn-panel >/dev/null 2>&1")
         sh("systemctl restart vpn-panel")
 
@@ -285,6 +383,26 @@ def main():
 
     if os.geteuid() != 0:
         sys.exit("нужен root")
+    # Direct setup is a network-affecting deployment just like self-update.
+    # Serialize the complete mixed-file/unit transition with rotation and DNS
+    # Rescue. update.py already owns this non-reentrant lock and declares it.
+    network_lock = None
+    inherited_lock = False
+    if os.name == "posix" and os.environ.get("REDUT_LOCK_HELD") == "1":
+        try:
+            inherited_fd = int(os.environ.get("REDUT_LOCK_FD", ""))
+            inherited_lock = (os.readlink("/proc/self/fd/%d" % inherited_fd)
+                              == NETWORK_LOCK)
+            if inherited_lock:
+                fcntl.flock(inherited_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, TypeError, ValueError):
+            inherited_lock = False
+    if os.name == "posix" and not inherited_lock:
+        network_lock = open(NETWORK_LOCK, "a+")
+        try:
+            fcntl.flock(network_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.exit("vpn-agent занят; установка панели отложена")
     with_panel = not a.no_panel
 
     for d in (OPT, os.path.join(OPT, "providers"), os.path.join(OPT, "webpanel"),
@@ -299,6 +417,7 @@ def main():
     print("  скопировано файлов: %d%s" % (n, ("  (сборка Редут %s)" % ver) if ver else ""))
     write_config(a.name, net, a.port, a.subnet, a.wg_port, a.dnsmasq)
     fresh = ensure_secrets()
+    bootstrap_secret = create_bootstrap_secret(fresh)
 
     # СЕРТИФИКАТ — ДО старта панели (исправлено 15.08, снос №6). Раньше cert выпускался ПОСЛЕ
     # install_units, и на чистой установке панель успевала подняться без panel.crt -> уходила
@@ -320,7 +439,8 @@ def main():
         print("  панель: %s (%s)" % (sh("systemctl is-active vpn-panel"),
                                      "https ok" if _panel_https_ok(a.port) else "TLS НЕ поднялся"))
     print(json.dumps({"panel_port": a.port, "server_ip": net["server_ip"],
-                      "cert_fp": fp, "fresh_setup": fresh}, ensure_ascii=False))
+                      "cert_fp": fp, "fresh_setup": fresh,
+                      "bootstrap_secret": bootstrap_secret}, ensure_ascii=False))
     return 0
 
 

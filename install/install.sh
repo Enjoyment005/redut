@@ -31,6 +31,20 @@ set +a
 log(){ echo "[install] $*"; }
 die(){ echo "[install][FATAL] $*" >&2; exit 1; }
 
+# Fresh/manual installs serialize with rotation, DNS Rescue and allowlist. The
+# self-update parent already owns this lock and marks it explicitly to avoid a
+# non-reentrant child flock deadlock.
+LOCK_FD="${REDUT_LOCK_FD:-}"
+if [ "${REDUT_LOCK_HELD:-0}" != "1" ] \
+        || [[ ! "$LOCK_FD" =~ ^[0-9]+$ ]] \
+        || [ "$(readlink "/proc/$$/fd/$LOCK_FD" 2>/dev/null || true)" != "/run/vpn-agent.lock" ]; then
+    exec 8>/run/vpn-agent.lock
+    flock -n 8 || die "vpn-agent занят; установка отложена"
+    LOCK_FD=8
+fi
+flock -n "$LOCK_FD" || die "общий lock установки не подтверждён"
+export REDUT_LOCK_HELD=1 REDUT_LOCK_FD="$LOCK_FD"
+
 # Копия текстового шаблона со снятием CR (репозиторий на Windows может быть в CRLF).
 put_tpl(){ # src dst mode
     sed 's/\r$//' "$1" > "$2" || die "не скопировать $1 -> $2"
@@ -43,9 +57,17 @@ log "узел '$NAME' ($ROLE): subnet $SUBNET, wan $WAN, gw $GW, ip $SERVER_IP, 
 # ── 1. Пакеты + ip_forward (persist) ─────────────────────────────────────
 log "1/12 apt пакеты"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y            || die "apt-get update"
-apt-get install -y wireguard wireguard-tools ipset iptables curl wget tar \
+APT_NET_OPTS=(-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+              -o Acquire::Retries=2)
+apt-get "${APT_NET_OPTS[@]}" update -y || die "apt-get update"
+apt-get "${APT_NET_OPTS[@]}" install -y wireguard wireguard-tools ipset iptables conntrack curl wget tar \
         python3 dnsmasq microsocks chrony ca-certificates || die "apt-get install"
+getent group redut-dns >/dev/null 2>&1 || groupadd --system redut-dns || die "groupadd redut-dns"
+id -u redut-dns >/dev/null 2>&1 || useradd --system --gid redut-dns \
+    --home-dir /var/lib/redut-dns-rescue --shell /usr/sbin/nologin redut-dns \
+    || die "useradd redut-dns"
+install -d -o redut-dns -g redut-dns -m 0700 /var/lib/redut-dns-rescue
+install -d -o root -g redut-dns -m 0750 /etc/redut-dns-rescue
 echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-vpn.conf
 sysctl -q -p /etc/sysctl.d/99-vpn.conf 2>/dev/null || sysctl -q net.ipv4.ip_forward=1 || true
 
@@ -53,20 +75,31 @@ sysctl -q -p /etc/sysctl.d/99-vpn.conf 2>/dev/null || sysctl -q net.ipv4.ip_forw
 log "2/12 sing-box $SINGBOX_VERSION"
 cur=""
 [ -x /usr/local/bin/sing-box ] && cur="$(/usr/local/bin/sing-box version 2>/dev/null | awk '/version/{print $NF; exit}')"
-if [ "$cur" != "$SINGBOX_VERSION" ]; then
-    tmp="$(mktemp -d)"; arch="linux-amd64"
+arch="linux-amd64"
+case "$SINGBOX_VERSION:$arch" in
+    1.11.7:linux-amd64)
+        expected_sha="30420c7e1a0e4b9c7ee2ff3992c53257be85dec2bdc93074594c8b92d19d4d71"
+        expected_bin_sha="87be1d6db6d28896b13cb868c02d217c817fec1a820baf999a2f76f1564a32a7"
+        ;;
+    *) die "нет доверенного SHA256 для sing-box $SINGBOX_VERSION/$arch" ;;
+esac
+installed_sha=""
+[ -x /usr/local/bin/sing-box ] && installed_sha="$(sha256sum /usr/local/bin/sing-box | awk '{print $1}')"
+if [ "$cur" != "$SINGBOX_VERSION" ] || [ "$installed_sha" != "$expected_bin_sha" ]; then
+    tmp="$(mktemp -d)"
     url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-${arch}.tar.gz"
-    case "$SINGBOX_VERSION:$arch" in
-        1.11.7:linux-amd64) expected_sha="30420c7e1a0e4b9c7ee2ff3992c53257be85dec2bdc93074594c8b92d19d4d71" ;;
-        *) rm -r -- "$tmp"; die "нет доверенного SHA256 для sing-box $SINGBOX_VERSION/$arch" ;;
-    esac
     log "  качаю $url"
-    curl -fsSL "$url" -o "$tmp/sb.tgz" || wget -qO "$tmp/sb.tgz" "$url" || { rm -r -- "$tmp"; die "не скачался sing-box"; }
+    curl -fsSL --connect-timeout 10 --max-time 120 --speed-time 20 --speed-limit 1024 \
+        "$url" -o "$tmp/sb.tgz" \
+        || wget -q --timeout=30 --read-timeout=30 --tries=2 -O "$tmp/sb.tgz" "$url" \
+        || { rm -r -- "$tmp"; die "не скачался sing-box"; }
     actual_sha="$(sha256sum "$tmp/sb.tgz" | awk '{print $1}')"
     [ "$actual_sha" = "$expected_sha" ] || { rm -r -- "$tmp"; die "SHA256 sing-box не совпал"; }
     tar -xzf "$tmp/sb.tgz" -C "$tmp" || { rm -r -- "$tmp"; die "не распаковался sing-box"; }
     candidate="$tmp/sing-box-${SINGBOX_VERSION}-${arch}/sing-box"
     [ -x "$candidate" ] || { rm -r -- "$tmp"; die "в архиве нет sing-box"; }
+    candidate_sha="$(sha256sum "$candidate" | awk '{print $1}')"
+    [ "$candidate_sha" = "$expected_bin_sha" ] || { rm -r -- "$tmp"; die "SHA256 бинарника sing-box не совпал"; }
     cand_ver="$("$candidate" version 2>/dev/null | awk '/version/{print $NF; exit}')"
     [ "$cand_ver" = "$SINGBOX_VERSION" ] || { rm -r -- "$tmp"; die "версия кандидата sing-box неверна"; }
     install -m 0755 "$candidate" /usr/local/bin/sing-box.new || { rm -r -- "$tmp"; die "stage sing-box"; }
@@ -79,6 +112,8 @@ if [ "$cur" != "$SINGBOX_VERSION" ]; then
 fi
 got="$(/usr/local/bin/sing-box version 2>/dev/null | awk '/version/{print $NF; exit}')"
 [ "$got" = "$SINGBOX_VERSION" ] || die "sing-box версия '$got' != '$SINGBOX_VERSION'"
+got_sha="$(sha256sum /usr/local/bin/sing-box | awk '{print $1}')"
+[ "$got_sha" = "$expected_bin_sha" ] || die "sing-box установленный бинарник не прошёл SHA256"
 log "  sing-box $got OK"
 
 # ── 3. таблица middleman (id 200) — /etc/iproute2/rt_tables может отсутствовать ──
@@ -245,8 +280,15 @@ put_tpl "$TPL/singbox-post.sh"      /usr/local/bin/singbox-post.sh            07
 put_tpl "$TPL/singbox-watchdog.sh"  /usr/local/bin/singbox-watchdog.sh        0755
 put_tpl "$TPL/vpn-boot-setup.service" /etc/systemd/system/vpn-boot-setup.service 0644
 put_tpl "$TPL/redut-dns-rescue.service" /etc/systemd/system/redut-dns-rescue.service 0644
+put_tpl "$TPL/redut-dns-rescue-watchdog.service" /etc/systemd/system/redut-dns-rescue-watchdog.service 0644
+put_tpl "$TPL/redut-dns-rescue-watchdog.timer" /etc/systemd/system/redut-dns-rescue-watchdog.timer 0644
 mkdir -p /etc/redut-dns-rescue /var/lib/redut-dns-rescue /run/redut-dns-rescue
-chmod 700 /etc/redut-dns-rescue /var/lib/redut-dns-rescue /run/redut-dns-rescue
+chown root:redut-dns /etc/redut-dns-rescue
+chmod 0750 /etc/redut-dns-rescue
+chown redut-dns:redut-dns /var/lib/redut-dns-rescue /run/redut-dns-rescue
+chmod 0700 /var/lib/redut-dns-rescue /run/redut-dns-rescue
+install -d -o root -g redut-dns -m 0750 /run/redut-dns-rescue-controller
+install -d -o root -g redut-dns -m 0770 /run/redut-dns-rescue-controller/preflight-state
 # Installing/updating never enables interception.  If a prior incident is not
 # active, leave the isolated gateway stopped; recovery is handled by vpn-agent.
 systemctl disable redut-dns-rescue.service >/dev/null 2>&1 || true
@@ -259,11 +301,28 @@ put_tpl "$TPL/server_cleanup.sh"    /usr/local/bin/server_cleanup.sh          07
 log "7/12 vpn-boot-setup.sh (§11 RETURN + wg0 fallback)"
 cat > /usr/local/bin/vpn-boot-setup.sh <<BOOT
 #!/bin/bash
+set -euo pipefail
 # VPN boot setup — subnet $SUBNET, upstream $UP_HOST_EFF (сгенерирован install.sh).
 # Идемпотентно, переживает ребут. §11: RETURN для трафика ВНУТРИ VPN и К самому серверу
 # (панель/SSH из-под VPN не заворачиваются в middleman->tun0). Плюс фолбэк подъёма wg0.
 # UP_HOST правит агент (apply.patch_boot_script) при смене канала; пусто = канал ещё не выбран.
 UP_HOST="$UP_HOST_EFF"
+
+# One writer for routes/firewall. The installer can pass its already-held fd;
+# a standalone/systemd boot waits for the common agent lock.
+LOCK_FD="\${REDUT_LOCK_FD:-}"
+if [ "\${REDUT_LOCK_HELD:-0}" = "1" ] \
+        && [[ "\$LOCK_FD" =~ ^[0-9]+$ ]] \
+        && [ "\$(readlink "/proc/\$\$/fd/\$LOCK_FD" 2>/dev/null || true)" = "/run/vpn-agent.lock" ]; then
+    flock -n "\$LOCK_FD" \
+        || { echo "vpn-boot-setup: inherited lock не подтверждён" >&2; exit 75; }
+else
+    exec 8>/run/vpn-agent.lock
+    flock -w 180 8 \
+        || { echo "vpn-boot-setup: общий lock не получен" >&2; exit 75; }
+    LOCK_FD=8
+fi
+export REDUT_LOCK_HELD=1 REDUT_LOCK_FD="\$LOCK_FD"
 
 # 0) фолбэк — поднять wg0, если systemd не поднял его на буте (случалось на живом узле)
 if ! ip link show wg0 >/dev/null 2>&1; then
@@ -424,13 +483,20 @@ fi
 systemctl restart microsocks || true
 systemctl restart sing-box; sleep 3
 bash /usr/local/bin/vpn-boot-setup.sh || true
-systemctl start vpn-boot-setup 2>/dev/null || true   # RemainAfterExit=yes -> отметится active
+# Do not synchronously start the unit while this installer still owns the
+# common flock: the direct run above already reconciled the host, and systemd
+# would otherwise wait on our own lock. The enabled unit starts on next boot.
 if [ "$DNSMASQ" = "1" ]; then
     ipset create ru_whitelist hash:ip timeout 7200 2>/dev/null || true
     systemctl enable --now dnsmasq 2>/dev/null || true
     # Первое наполнение белого списка из GitHub (сид уже применён — это лишь освежает).
     # Не критично: нет сети к GitHub/нет git -> остаёмся на сиде, крон обновит в воскресенье.
-    /usr/local/bin/update-ru-whitelist.sh >/dev/null 2>&1 || true
+    if REDUT_PARENT_LOCK_FD="$LOCK_FD" /usr/local/bin/update-ru-whitelist.sh >/dev/null 2>&1; then
+        log "  pinned RU allowlist обновлён"
+    else
+        rc=$?
+        log "  pinned RU allowlist не обновлён (rc=$rc); проверенный seed сохранён"
+    fi
 fi
 
 # ── 11. Кроны узла (агентские кроны добавит deploy.py/setup_panel) ────────

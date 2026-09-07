@@ -5,13 +5,36 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=redut-dns
+Group=redut-dns
+UMask=0077
 ExecStart=/usr/local/bin/sing-box run -c /etc/redut-dns-rescue/config.json -D /var/lib/redut-dns-rescue
-Restart=on-failure
-RestartSec=2
+# A crash is handled by the coordinator, which first checks slot freshness and
+# either restarts/fails over under its saga or removes redirect fail-open.
+Restart=no
+TimeoutStartSec=10s
+TimeoutStopSec=10s
+RuntimeDirectory=redut-dns-rescue
+RuntimeDirectoryMode=0700
+StateDirectory=redut-dns-rescue
+StateDirectoryMode=0700
+CapabilityBoundingSet=
+AmbientCapabilities=
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectHome=true
 ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LockPersonality=true
+MemoryMax=128M
+TasksMax=64
+LimitNOFILE=4096
 ReadWritePaths=/var/lib/redut-dns-rescue /run/redut-dns-rescue
 
 [Install]

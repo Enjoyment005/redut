@@ -72,6 +72,10 @@ class Flock:
                 pass
             self.fh.close()
 
+    @property
+    def fd(self):
+        return self.fh.fileno() if self.fh is not None else None
+
 
 @contextlib.contextmanager
 def _maybe_lock(server_cfg, held):

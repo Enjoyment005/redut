@@ -1,6 +1,7 @@
 #!/bin/bash
 # singbox-watchdog.sh v3 — УМНЫЙ сторож sing-box. Запуск по cron */2.
-# Чинит: неактивный sing-box, упавший tun0, потерянный маршрут middleman.
+# Наблюдает: неактивный sing-box, упавший tun0, потерянный маршрут middleman.
+# Сам сеть не меняет: единственный writer — vpn-agent под /run/vpn-agent.lock.
 # УМНО: если выход через tun0 мёртв, СНАЧАЛА проверяет внешний upstream-прокси
 #       (адрес/креды читаются из /etc/sing-box/config.json автоматически):
 #         - upstream ЖИВ, а tun0 нет  -> виноват sing-box -> рестарт
@@ -28,7 +29,7 @@ throttled_log(){ # $1=stamp-файл $2=сообщение
 # Аварийный режим агента: он владеет маршрутами (middleman -> WAN). Сторож ничего
 # не «чинит» (иначе вернул бы default в мёртвый tun0 и убил бы прямой выход) —
 # только даёт агенту повторить попытку восстановиться (агент сам держит backoff, §8/F6).
-if [ -f /run/vpn-agent-emergency ]; then
+if [ -f /run/vpn-agent-emergency ] || [ -f /var/lib/vpn-panel/emergency.intent ]; then
     # маркеры двух-провалов начинают с чистого листа после выхода из аварии (F1):
     # иначе довесок с тиков до аварии превратил бы первый же чих в «2-й подряд»
     rm -f /run/singbox-wd.upfail /run/singbox-wd.sbfail
@@ -40,15 +41,22 @@ REPAIRED=0
 
 # 0) sing-box активен?
 if ! systemctl is-active --quiet sing-box; then
-    log "sing-box inactive -> start"; systemctl start sing-box; sleep 5; REPAIRED=1
+    log "sing-box inactive -> vpn-agent reconcile"
+    [ -x "$AGENT" ] && "$AGENT" rotate --reason watchdog >> "$LOG" 2>&1 || true
+    exit 0
 fi
 # 1) tun0 поднят (carrier=1)?
 if [ "$(cat /sys/class/net/tun0/carrier 2>/dev/null)" != "1" ]; then
-    log "tun0 down/absent -> restart sing-box"; systemctl restart sing-box; sleep 5; REPAIRED=1
+    log "tun0 down/absent -> vpn-agent reconcile"
+    [ -x "$AGENT" ] && "$AGENT" rotate --reason watchdog >> "$LOG" 2>&1 || true
+    exit 0
 fi
-# 2) маршрут middleman default на месте?
+# Route ownership belongs to vpn-agent.  Watchdog observes and asks the agent to
+# reconcile; it never races a panel click by writing middleman directly.
 if ! $IP route show table middleman 2>/dev/null | grep -q '^default dev tun0'; then
-    $IP route replace default dev tun0 table middleman && log "restored middleman default route"; REPAIRED=1
+    log "middleman default drift -> vpn-agent rotate"
+    if [ -x "$AGENT" ]; then "$AGENT" rotate --reason watchdog >> "$LOG" 2>&1; fi
+    exit 0
 fi
 # 3) реальный выход через tun0
 OUT=$(curl -s --max-time 10 --interface tun0 https://api.ipify.org 2>/dev/null)
@@ -81,9 +89,8 @@ PY
             log "tun0 egress dead, upstream $UHOST:$UPORT ALIVE, рестарт не лечит ($N подряд) -> vpn-agent rotate (F2)"
             "$AGENT" rotate --reason watchdog >> "$LOG" 2>&1
         else
-            log "tun0 egress dead, upstream $UHOST:$UPORT ALIVE -> restart sing-box ($N)"
-            systemctl restart sing-box; sleep 5
-            $IP route replace default dev tun0 table middleman
+            log "tun0 egress dead, upstream $UHOST:$UPORT ALIVE -> vpn-agent reconcile ($N)"
+            "$AGENT" rotate --reason watchdog >> "$LOG" 2>&1 || true
         fi
         rm -f /run/singbox-wd.upfail          # виноват был sing-box, не upstream
         REPAIRED=1

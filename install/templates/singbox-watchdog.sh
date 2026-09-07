@@ -1,6 +1,7 @@
 #!/bin/bash
 # singbox-watchdog.sh v3 — УМНЫЙ сторож sing-box. Запуск по cron */2.
-# Чинит: неактивный sing-box, упавший tun0, потерянный маршрут middleman.
+# Наблюдает: неактивный sing-box, упавший tun0, потерянный маршрут middleman.
+# Сам сеть не меняет: единственный writer — vpn-agent под /run/vpn-agent.lock.
 # УМНО: если выход через tun0 мёртв, СНАЧАЛА проверяет внешний upstream-прокси
 #       (адрес/креды читаются из /etc/sing-box/config.json автоматически):
 #         - upstream ЖИВ, а tun0 нет  -> виноват sing-box -> рестарт
@@ -40,11 +41,15 @@ REPAIRED=0
 
 # 0) sing-box активен?
 if ! systemctl is-active --quiet sing-box; then
-    log "sing-box inactive -> start"; systemctl start sing-box; sleep 5; REPAIRED=1
+    log "sing-box inactive -> vpn-agent reconcile"
+    [ -x "$AGENT" ] && "$AGENT" rotate --reason watchdog >> "$LOG" 2>&1 || true
+    exit 0
 fi
 # 1) tun0 поднят (carrier=1)?
 if [ "$(cat /sys/class/net/tun0/carrier 2>/dev/null)" != "1" ]; then
-    log "tun0 down/absent -> restart sing-box"; systemctl restart sing-box; sleep 5; REPAIRED=1
+    log "tun0 down/absent -> vpn-agent reconcile"
+    [ -x "$AGENT" ] && "$AGENT" rotate --reason watchdog >> "$LOG" 2>&1 || true
+    exit 0
 fi
 # Route ownership belongs to vpn-agent.  Watchdog observes and asks the agent to
 # reconcile; it never races a panel click by writing middleman directly.
@@ -84,10 +89,7 @@ PY
             log "tun0 egress dead, upstream $UHOST:$UPORT ALIVE, рестарт не лечит ($N подряд) -> vpn-agent rotate (F2)"
             "$AGENT" rotate --reason watchdog >> "$LOG" 2>&1
         else
-            log "tun0 egress dead, upstream $UHOST:$UPORT ALIVE -> restart sing-box ($N)"
-            systemctl restart sing-box; sleep 5
-            # vpn-agent is the sole route writer; the next guarded rotate
-            # reconciles middleman after the service restart.
+            log "tun0 egress dead, upstream $UHOST:$UPORT ALIVE -> vpn-agent reconcile ($N)"
             "$AGENT" rotate --reason watchdog >> "$LOG" 2>&1 || true
         fi
         rm -f /run/singbox-wd.upfail          # виноват был sing-box, не upstream

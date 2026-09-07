@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Redut DNS Rescue reconciliation every 5 seconds
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=5s
+AccuracySec=1s
+Unit=redut-dns-rescue-watchdog.service
+Persistent=false
+
+[Install]
+WantedBy=timers.target

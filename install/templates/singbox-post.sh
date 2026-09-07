@@ -18,8 +18,13 @@ if [ -f /run/vpn-agent-emergency ] || [ -f /var/lib/vpn-panel/emergency.intent ]
     echo "singbox-post: аварийный режим / прямой выход — маршрут middleman не трогаю (агент вернёт tun0 сам)"
     exit 0
 fi
-# vpn-agent owns middleman.  ExecStartPost only observes and requests a guarded
-# reconciliation, avoiding a second route writer during apply/rollback.
+# vpn-agent owns middleman.  ExecStartPost must not synchronously call rotate:
+# sing-box is still "activating" here and rotate may restart the same unit.
+# Queue a separate job after this hook has returned; the agent then takes the
+# common network lock and re-reads current state.
 AGENT=/usr/local/bin/vpn-agent
-[ -x "$AGENT" ] && "$AGENT" rotate --reason singbox-post >/dev/null 2>&1 || true
+if [ -x "$AGENT" ]; then
+    systemd-run --quiet --collect --on-active=2s --unit=redut-singbox-reconcile \
+        "$AGENT" rotate --reason singbox-post >/dev/null 2>&1 || true
+fi
 exit 0

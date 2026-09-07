@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Регрессии статистики /usr/local/bin/server_cleanup.sh.
+"""Регрессии bounded-статистики /usr/local/bin/server_cleanup.sh.
 
 Выполняем только встроенный Python-блок шаблона с временным stat-файлом:
 системные журналы и остальные файлы тест не трогает.
@@ -27,9 +27,9 @@ def embedded_stats_code():
     return source[start:end]
 
 
-def collect(path, logs, tmpb, before, after, vacuum):
+def collect(path, freed):
     proc = subprocess.run(
-        [sys.executable, "-", path, str(logs), str(tmpb), before, after, vacuum],
+        [sys.executable, "-", path, str(freed)],
         input=embedded_stats_code(), text=True, encoding="utf-8",
         capture_output=True, timeout=10)
     if proc.returncode:
@@ -39,33 +39,34 @@ def collect(path, logs, tmpb, before, after, vacuum):
 
 
 class TestCleanupCollector(unittest.TestCase):
-    def test_vacuum_result_wins_when_total_disk_usage_is_unchanged(self):
-        """Главная регрессия node2: новый active-файл заменил удалённый 8 MiB."""
+    def test_records_only_redut_owned_bytes(self):
         with tempfile.TemporaryDirectory() as d:
-            out = collect(os.path.join(d, "stat.json"), 100, 20,
-                          "Archived journals take up 8M.",
-                          "Archived journals take up 8M.",
-                          "Vacuuming done, freed 8.0M of archived journals from /var/log/journal/x.")
-            self.assertEqual(out["freed_24h"], 8 * 1024 * 1024 + 120)
+            out = collect(os.path.join(d, "stat.json"), 120)
+            self.assertEqual(out["freed_24h"], 120)
             self.assertEqual(out["runs_24h"], 1)
-            self.assertEqual(out["runs"][0]["journal"], 8 * 1024 * 1024)
+            self.assertEqual(out["runs"][0]["scope"], "redut-owned")
+            self.assertEqual(out["scope"], "redut-owned")
 
-    def test_sums_multiple_journal_directories_and_previous_run(self):
+    def test_sums_recent_runs_and_drops_old_history(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "stat.json")
             with open(path, "w", encoding="utf-8") as f:
-                json.dump({"runs": [[time.time() - 60, 7]]}, f)
-            out = collect(path, 0, 0, "8M", "8M",
-                          "Vacuuming done, freed 8M from /run.\n"
-                          "Vacuuming done, freed 512K from /var.")
-            self.assertEqual(out["freed_24h"], 7 + 8 * 1024 * 1024 + 512 * 1024)
+                json.dump({"runs": [
+                    {"at": time.time() - 60, "freed": 7, "scope": "redut-owned"},
+                    {"at": time.time() - 90000, "freed": 999},
+                ]}, f)
+            out = collect(path, 11)
+            self.assertEqual(out["freed_24h"], 18)
             self.assertEqual(out["runs_24h"], 2)
             self.assertTrue(all(isinstance(r, dict) for r in out["runs"]))
 
-    def test_disk_usage_delta_is_fallback_for_old_journalctl(self):
+    def test_invalid_previous_stat_is_replaced_safely(self):
         with tempfile.TemporaryDirectory() as d:
-            out = collect(os.path.join(d, "stat.json"), 0, 0, "16M", "8M", "")
-            self.assertEqual(out["freed_24h"], 8 * 1024 * 1024)
+            path = os.path.join(d, "stat.json")
+            with open(path, "w", encoding="utf-8") as target:
+                target.write("not-json")
+            out = collect(path, 5)
+            self.assertEqual(out["freed_24h"], 5)
 
 
 if __name__ == "__main__":

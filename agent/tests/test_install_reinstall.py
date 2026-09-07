@@ -72,11 +72,16 @@ class TestCleanInstallAndReinstall(unittest.TestCase):
 
         config_path = os.path.join(self.installer.ETC, "config.json")
         secrets_path = os.path.join(self.installer.ETC, "secrets.json")
+        bootstrap_path = os.path.join(self.installer.ETC, "bootstrap.json")
         first = self.read_json(config_path)
         self.assertEqual(first["server"], "node-a")
         self.assertEqual(first["panel_port"], 8443)
         self.assertTrue(first["has_dnsmasq"])
         self.assertEqual(self.read_json(secrets_path), {})
+        bootstrap = self.read_json(bootstrap_path)
+        self.assertEqual(bootstrap["version"], 1)
+        self.assertEqual(len(bootstrap["secret_sha256"]), 64)
+        self.assertGreater(bootstrap["expires"], bootstrap["created"])
 
         owner_blocks = {
             "money": dict(first["money"], max_spend_per_day=77),
@@ -122,6 +127,8 @@ class TestCleanInstallAndReinstall(unittest.TestCase):
         for key, value in owner_blocks.items():
             self.assertEqual(second[key], value, key)
         self.assertEqual(self.read_json(secrets_path), secrets)
+        self.assertFalse(os.path.exists(bootstrap_path),
+                         "provisioned reinstall must remove stale bootstrap proof")
         for path, payload in ((state_path, b"state-db-sentinel"),
                               (ring_path, b"ring-sentinel"),
                               (client_path, b"client-sentinel")):

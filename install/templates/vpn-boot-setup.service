@@ -7,6 +7,7 @@ Wants=wg-quick@wg0.service sing-box.service
 Type=oneshot
 ExecStartPre=/bin/sleep 5
 ExecStart=/usr/local/bin/vpn-boot-setup.sh
+TimeoutStartSec=240s
 RemainAfterExit=yes
 
 [Install]

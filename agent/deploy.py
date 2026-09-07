@@ -28,9 +28,13 @@
 владелец заполнил в мастере /setup (ключ провайдера, 2FA, SMTP).
 """
 import argparse
+import hashlib
 import json
 import os
+import secrets
+import shlex
 import sys
+import time
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 PANEL_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -175,6 +179,9 @@ Restart=always
 RestartSec=3
 # Панель работает от root: apply/rollback правят /etc/sing-box и маршруты.
 # Ограничители ущерба — в приложении (лимиты вне веба, тумблеры, TOTP).
+MemoryMax=512M
+TasksMax=64
+LimitNOFILE=4096
 
 [Install]
 WantedBy=multi-user.target
@@ -198,6 +205,57 @@ def connect(host, pwds):
 def run(c, cmd, t=180):
     _, o, e = c.exec_command(cmd, timeout=t)
     return (o.read().decode("utf-8", "replace") + e.read().decode("utf-8", "replace")).strip()
+
+
+def put_secret_atomic(c, sftp, path, data, preserve_admin=False):
+    """Upload a 0600 secret through the same adjacent writer lock as panel."""
+    tmp = path + ".deploy-" + secrets.token_hex(8)
+    with sftp.open(tmp, "w") as target:
+        target.write(data)
+    sftp.chmod(tmp, 0o600)
+    if preserve_admin:
+        program = (
+            "import json,os,sys; p,s=sys.argv[1:3]; "
+            "new=json.load(open(s,encoding='utf-8')); "
+            "cur=json.load(open(p,encoding='utf-8')) if os.path.isfile(p) else {}; "
+            "new['admin']=cur['admin'] if cur.get('admin') else new.get('admin'); "
+            "new.pop('admin',None) if new.get('admin') is None else None; "
+            "out=s+'.merged'; f=open(out,'w',encoding='utf-8'); "
+            "json.dump(new,f,ensure_ascii=False,indent=2); f.write('\\n'); f.flush(); "
+            "os.fsync(f.fileno()); f.close(); os.chmod(out,0o600); "
+            "os.replace(out,p); os.unlink(s); os.chmod(p,0o600)"
+        )
+        inner = "python3 -c %s %s %s" % (
+            shlex.quote(program), shlex.quote(path), shlex.quote(tmp))
+    else:
+        inner = "mv -f -- %s %s && chmod 600 %s" % (
+            shlex.quote(tmp), shlex.quote(path), shlex.quote(path))
+    command = "flock -w 30 %s.lock sh -c %s" % (shlex.quote(path), shlex.quote(inner))
+    output = run(c, command)
+    exists = run(c, "test -f %s && echo ok" % shlex.quote(path))
+    if exists.strip() != "ok":
+        run(c, "rm -f -- %s" % shlex.quote(tmp))
+        raise SystemExit("не удалось атомарно записать %s: %s" % (path, output))
+
+
+def acquire_remote_network_lock(c):
+    """Hold the node-wide non-reentrant lock on a dedicated SSH channel.
+
+    Keeping stdin open keeps `cat` (and therefore fd 9) alive while SFTP and
+    systemd files are replaced through other channels on the same connection.
+    """
+    command = ("bash -c 'exec 9>/run/vpn-agent.lock; "
+               "flock -n 9 || { echo REDUT_LOCK_BUSY; exit 75; }; "
+               "echo REDUT_LOCKED; cat >/dev/null'")
+    stdin, stdout, stderr = c.exec_command(command, timeout=30)
+    stdout.channel.settimeout(30)
+    marker = stdout.readline().strip()
+    if marker != "REDUT_LOCKED":
+        detail = stderr.read().decode("utf-8", "replace").strip()
+        c.close()
+        raise SystemExit("vpn-agent занят; удалённый деплой отложен%s" %
+                         ((": " + detail) if detail else ""))
+    return stdin
 
 
 def build_config(name):
@@ -244,8 +302,22 @@ def main(argv=None):
     print("\negress ДО:", run(c, "curl -s --max-time 15 --interface tun0 https://api.ipify.org", t=25),
           "| sing-box:", run(c, "systemctl is-active sing-box"))
 
+    deploy_lock = acquire_remote_network_lock(c)
+
     run(c, "mkdir -p %s/providers %s/webpanel /etc/vpn-panel /var/lib/vpn-panel/cfg" % (OPT, OPT))
     run(c, "chmod 700 /var/lib/vpn-panel")
+    identity_state = run(
+        c, "(command -v conntrack >/dev/null 2>&1 || "
+           "(apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y conntrack)) && "
+           "(getent group redut-dns >/dev/null 2>&1 || groupadd --system redut-dns) && "
+           "(id -u redut-dns >/dev/null 2>&1 || useradd --system --gid redut-dns "
+           "--home-dir /var/lib/redut-dns-rescue --shell /usr/sbin/nologin redut-dns) && "
+           "install -d -o root -g redut-dns -m 0750 /etc/redut-dns-rescue && "
+           "install -d -o redut-dns -g redut-dns -m 0700 "
+           "/var/lib/redut-dns-rescue /run/redut-dns-rescue && echo REDUT_DNS_IDENTITY_OK")
+    if "REDUT_DNS_IDENTITY_OK" not in identity_state.splitlines():
+        c.close()
+        sys.exit("не удалось подготовить системную учётку redut-dns")
     sftp = c.open_sftp()
     for rel in files:
         sftp.put(os.path.join(PANEL_DIR, rel.replace("/", os.sep)), OPT + "/" + rel)
@@ -279,15 +351,41 @@ def main(argv=None):
     # secrets.json: в чистой установке НЕ сеем (владелец введёт всё в мастере /setup);
     # иначе ключи провайдеров + SMTP берём из локального файла, а admin-блок (заведён на
     # сервере) сохраняем — иначе каждый деплой выбивал бы вход. Аналогично money/countries.
+    bootstrap_secret = ""
     if a.clean:
         raw_sec = run(c, "cat /etc/vpn-panel/secrets.json 2>/dev/null").strip()
-        if raw_sec and raw_sec not in ("{}", ""):
+        if raw_sec:
+            try:
+                srv_sec = json.loads(raw_sec)
+            except (TypeError, ValueError) as exc:
+                raise SystemExit(
+                    "Серверный /etc/vpn-panel/secrets.json повреждён; "
+                    "автоматическая перезапись запрещена: %s" % exc
+                )
+            if not isinstance(srv_sec, dict):
+                raise SystemExit(
+                    "Серверный /etc/vpn-panel/secrets.json имеет неверный формат; "
+                    "автоматическая перезапись запрещена"
+                )
+        else:
+            srv_sec = {}
+        if srv_sec.get("admin"):
             print("  secrets.json: оставлен как есть (уже настроен через /setup)")
         else:
-            with sftp.open("/etc/vpn-panel/secrets.json", "w") as f:
-                f.write("{}")
-            sftp.chmod("/etc/vpn-panel/secrets.json", 0o600)
-            print("  secrets.json: пустой — мастер /setup заполнит (провайдеры/2FA/пароль/SMTP)")
+            # Сохраняем уже введённые provider/SMTP поля: отсутствие admin означает,
+            # что bootstrap всё ещё нужен, но не разрешает уничтожать остальные secrets.
+            if not raw_sec:
+                put_secret_atomic(c, sftp, "/etc/vpn-panel/secrets.json", "{}\n",
+                                  preserve_admin=True)
+            bootstrap_secret = secrets.token_urlsafe(32)
+            now = time.time()
+            bootstrap = {"version": 1, "created": now, "expires": now + 24 * 3600,
+                         "used": False,
+                         "secret_sha256": hashlib.sha256(
+                             bootstrap_secret.encode("utf-8")).hexdigest()}
+            put_secret_atomic(c, sftp, "/etc/vpn-panel/bootstrap.json",
+                              json.dumps(bootstrap, ensure_ascii=False, indent=2) + "\n")
+            print("  admin не настроен — мастер /setup завершит защищённый первый вход")
     else:
         with open(secrets_path, encoding="utf-8") as fh:
             merged_secrets = json.load(fh)
@@ -300,9 +398,9 @@ def main(argv=None):
             if srv_sec.get("admin"):
                 merged_secrets["admin"] = srv_sec["admin"]
                 print("  secrets.json: сохранён admin-блок с сервера (пароль/TOTP/recovery)")
-        with sftp.open("/etc/vpn-panel/secrets.json", "w") as f:
-            json.dump(merged_secrets, f, ensure_ascii=False, indent=2)
-        sftp.chmod("/etc/vpn-panel/secrets.json", 0o600)
+        put_secret_atomic(c, sftp, "/etc/vpn-panel/secrets.json",
+                          json.dumps(merged_secrets, ensure_ascii=False, indent=2) + "\n",
+                          preserve_admin=True)
         print("  secrets.json: SMTP-алерты %s" % ("настроены" if merged_secrets.get("smtp") else "НЕ заданы"))
     with sftp.open("/usr/local/bin/vpn-agent", "w") as f:
         f.write(WRAPPER)
@@ -310,15 +408,25 @@ def main(argv=None):
     if a.with_panel:
         with sftp.open("/etc/systemd/system/vpn-panel.service", "w") as f:
             f.write(PANEL_SERVICE)
-    # Фаза 3: сторож с перевешенной веткой «upstream мёртв» -> vpn-agent rotate (§1/§8)
-    wd_src = os.path.join(PANEL_DIR, os.pardir, "singbox", "singbox-watchdog.sh")
-    if os.path.isfile(wd_src):
-        with open(wd_src, encoding="utf-8") as fh:
-            wd_data = fh.read().replace("\r\n", "\n")
-        with sftp.open("/usr/local/bin/singbox-watchdog.sh", "w") as f:
-            f.write(wd_data)
-        sftp.chmod("/usr/local/bin/singbox-watchdog.sh", 0o755)
+    template_dir = os.path.join(PANEL_DIR, os.pardir, "install", "templates")
+    for unit_name in ("redut-dns-rescue.service",
+                      "redut-dns-rescue-watchdog.service",
+                      "redut-dns-rescue-watchdog.timer"):
+        unit_src = os.path.join(template_dir, unit_name)
+        if not os.path.isfile(unit_src):
+            c.close()
+            sys.exit("нет systemd-шаблона %s" % unit_src)
+        sftp.put(unit_src, "/etc/systemd/system/" + unit_name)
+        sftp.chmod("/etc/systemd/system/" + unit_name, 0o644)
+    # install/install.sh owns the one canonical watchdog template.  deploy.py
+    # must not replace it with a second developer-tree implementation.
     sftp.close()
+    timer_state = run(c, "systemctl daemon-reload && "
+                         "systemctl enable --now redut-dns-rescue-watchdog.timer && "
+                         "systemctl is-active redut-dns-rescue-watchdog.timer")
+    if timer_state.strip().splitlines()[-1:] != ["active"]:
+        c.close()
+        sys.exit("DNS Rescue watchdog timer не запущен: %s" % timer_state)
 
     # Кроны (идемпотентно, расписание E2 1.3.0): сторож */2; списки провайдеров */30
     # (без проб); ПОЛНЫЙ прогон проб — раз в 2 ч (было */6 МИНУТ: молотилка 240
@@ -372,6 +480,7 @@ def main(argv=None):
         if a.clean and adminfp.strip() != "True":
             print("\nℹ️ Чистая установка — открой мастер первого входа:")
             print("   https://%s:%d/setup  (провайдер PROXY6, 2FA-QR, пароль, почта)" % (host, a.panel_port))
+            print("   Одноразовый bootstrap-код из SSH (24 часа): %s" % bootstrap_secret)
         elif adminfp.strip() != "True":
             print("\n⚠️ Админ ещё не настроен. На сервере выполни:")
             print("   python3 /opt/vpn-panel/webpanel/setup_admin.py")
@@ -382,6 +491,7 @@ def main(argv=None):
 
     print("\negress ПОСЛЕ:", run(c, "curl -s --max-time 15 --interface tun0 https://api.ipify.org", t=25),
           "| sing-box:", run(c, "systemctl is-active sing-box"))
+    deploy_lock.close()
     c.close()
     return 0
 

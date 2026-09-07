@@ -1081,10 +1081,17 @@ function beacon(s,clients){
   const who=n==null?'':(' Устройств с доступом: '+n+'.');
   const when=s.egress_at?(' Проверено '+agoTxt(s.egress_age)+'.'):'';
   const stale=(s.egress_age!=null&&s.egress_age>STALE);
+  const dr=(s.dns_rescue||{}),drs=(dr.state||{}),drc=(dr.coverage||{});
+  const drPhaseActive=/^active_/.test(drs.phase||'');
+  const drProven=drPhaseActive&&drs.effective_active===true&&drs.proof_fresh===true&&
+    drc.wireguard_ipv4_dns53===true;
   if(s.emergency){cls='b-bad';ttl='Аварийный режим включён';
     txt='Клиенты в интернете, но выходят с российского IP самого сервера — блокировки НЕ обходятся. '+
         'Это временно: нажми «Ротация», чтобы вернуться на зарубежный прокси, потом сними аварию.'+
-        ((s.dns_rescue&&/^active_/.test((s.dns_rescue.state||{}).phase||''))?
+        ((s.dns_rescue&&/^active_/.test((s.dns_rescue.state||{}).phase||'')&&
+          (s.dns_rescue.state||{}).effective_active===true&&
+          (s.dns_rescue.state||{}).proof_fresh===true&&
+          (s.dns_rescue.coverage||{}).wireguard_ipv4_dns53===true)?
           ' DNS Rescue временно восстанавливает только обычные DNS-запросы IPv4 через WireGuard.':'')+who}
   else if(s.automat==='ROTATING'){cls='b-warn';ttl='Перебираю пул прокси';
     txt='Боевой прокси умер — панель перебирает запасные из пула (это НЕ авария). На время перебора '+
@@ -1096,6 +1103,15 @@ function beacon(s,clients){
   else if(s.automat==='SUSPECT'){cls='b-warn';ttl='Перепроверяю сбой';
     txt='Первая проверка выхода не прошла — панель подтверждает сбой повторной, прежде чем что-то менять. '+
         'Единичный сетевой чих аварией не считается.'+who}
+  else if(drPhaseActive&&!drProven){cls='b-bad';ttl='Аварийный DNS не подтверждён';
+    txt='DNS Rescue числится активным, но его фактический охват или свежесть доказательств не подтверждены. '+
+        'Обычная работа не считается восстановленной — нужна проверка или безопасное снятие режима.'+who}
+  else if(drProven){cls='b-warn';
+    ttl=drs.phase==='active_isolated'?'DNS canary активен':'Аварийный DNS активен';
+    txt=(drs.phase==='active_isolated'
+      ?'Включён изолированный режим DNS Rescue для одного диагностического WireGuard-клиента. '
+      :'Включён аварийный DNS Rescue для WireGuard-клиентов. ')+
+      'Он охватывает только подтверждённые IPv4 UDP/TCP-запросы на порт 53; IPv6 и встроенный DoH приложений не контролируются.'+who}
   else if(window.__EGBUSY){cls='b-warn';ttl='Проверяю выход…';
     txt='Спрашиваю у внешнего сайта, какой IP видно с сервера. Это занимает несколько секунд.'+who}
   else if(!s.egress_at){cls='b-warn';ttl='Состояние ещё не проверялось';
@@ -1133,10 +1149,12 @@ async function loadStatus(){const s=await api('/api/status');window.__S=s;
   const aut=s.emergency?('<span class="bad">АВАРИЯ'+(s.emergency_since?(' с '+esc(s.emergency_since)):'')+'</span>')
     :(AUTL[s.automat]?('<span class="warn">'+AUTL[s.automat]+'</span>')
     :(s.frozen?'<span class="warn">на паузе</span>':'<span class="ok">'+esc(s.automat||'OK')+'</span>'));
-  const dr=(s.dns_rescue||{}),drs=(dr.state||{}),drc=(dr.coverage||{});
-  const dractive=/^active_/.test(drs.phase||'');
+  const drphase=/^active_/.test(drs.phase||'');
+  const dractive=drphase&&drs.effective_active===true&&drs.proof_fresh===true&&
+    drc.wireguard_ipv4_dns53===true;
   const drtxt=dractive?('<span class="warn">'+esc(drs.phase)+' · '+esc(drs.active_slot||'?')+'</span>'):
-    (drs.configured_mode==='disabled'?'<span class="mut">выключен</span>':esc(drs.phase||'idle'));
+    (drphase||drs.phase==='recovering'?'<span class="bad">не подтверждён · '+esc(drs.phase||'unknown')+'</span>':
+    (drs.configured_mode==='disabled'?'<span class="mut">выключен</span>':esc(drs.phase||'idle')));
   document.getElementById('status').innerHTML=[
     tile('автоматика',aut,'Сторож проверяет связь и, если прокси умер, сам переключает на живой или докупает новый. «На паузе» — не вмешивается.'),
     tile('DNS Rescue',drtxt,'Последний аварийный режим DNS. Охват: только IPv4 UDP/TCP 53, пришедший через wg0; IPv6 и встроенный DoH приложений не контролируются.'),
@@ -1715,18 +1733,26 @@ _SETUP_HTML = """
 <div class="wrap" style="max-width:620px">
   <div class="brand">VPN&nbsp;PANEL<small>первичная настройка · 5 шагов<span class="cursor"></span></small></div>
 
-  <div class="ex danger" style="margin-top:12px">⚠️ <b>Сейчас панель никем не занята и открыта любому,
-    кто знает адрес.</b> Пройди настройку до конца прямо сейчас — на последнем шаге вход закроется паролем
-    и одноразовым кодом.</div>
+  <div class="ex" style="margin-top:12px"><b>Подтверди владение сервером.</b> Код первичной
+    настройки напечатан только в SSH-консоли установщика и хранится на сервере в файле с правами
+    root 0600. Один адрес панели без этого кода не даёт права создать администратора.</div>
 
   <div class="ex">Что вообще происходит: ты только что поднял свой VPN-сервер. Эта настройка задаёт
     <b>пароль</b> для входа сюда, включает <b>второй фактор</b> (чтобы одного пароля было мало),
     подключает <b>кабинет провайдера прокси</b> (чтобы панель могла сама покупать и менять зарубежные
     адреса выхода) и почту для писем об авариях. Каждый шаг объясню на месте.</div>
 
-  <div class="sub" id="stepper" style="margin:14px 0"></div>
+  <div class="card" id="s0">
+    <h2>Код владельца из SSH</h2>
+    <label>одноразовый bootstrap-код</label>
+    <input id="bootstrap" type="password" autocomplete="off" placeholder="вставь код из консоли установки">
+    <button class="btn g" style="margin-top:9px" onclick="claimSetup()">Подтвердить владение</button>
+    <div id="claimbox" class="sub" style="margin-top:9px"></div>
+  </div>
 
-  <div class="card" id="s1">
+  <div class="sub" id="stepper" style="display:none;margin:14px 0"></div>
+
+  <div class="card" id="s1" style="display:none">
     <h2>Шаг 1 · Пароль от панели</h2>
     <div class="ex">Этим паролем ты будешь заходить в эту панель. <b>Лучше нажать «Сгенерировать»</b> —
       получится длинный случайный пароль, его сразу сохрани в менеджер паролей или запиши.
@@ -1829,6 +1855,16 @@ _SETUP_JS = """
 function esc(s){return (s==null?'':''+s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 function toast(t,cls){const d=document.createElement('div');d.className='msg '+(cls||'');d.textContent=t;
   document.getElementById('toast').appendChild(d);setTimeout(()=>d.remove(),9000)}
+let SETUP='';
+async function claimSetup(){const secret=document.getElementById('bootstrap').value.trim();
+  if(!secret)return toast('вставь bootstrap-код из SSH-консоли','bad');
+  try{const r=await fetch('/api/setup/claim',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({secret:secret})});const t=await r.text();let j;try{j=JSON.parse(t)}catch(e){j={error:t}}
+    if(!r.ok)throw new Error(j.error||('HTTP '+r.status));SETUP=j.setup_token;
+    document.getElementById('bootstrap').value='';document.getElementById('s0').style.display='none';
+    document.getElementById('s1').style.display='block';document.getElementById('stepper').style.display='block';
+    document.getElementById('claimbox').textContent='';stepper()}
+  catch(e){document.getElementById('claimbox').innerHTML='<span class="bad">'+esc(e.message)+'</span>';toast(e.message,'bad')}}
 async function sapi(path,obj){const r=await fetch(path,{method:'POST',
   headers:{'X-Setup-Token':SETUP,'Content-Type':'application/json'},body:JSON.stringify(obj||{})});
   const t=await r.text();let j;try{j=JSON.parse(t)}catch(e){j={error:t}}
@@ -1889,12 +1925,11 @@ async function finish(){try{const r=await sapi('/api/setup/finish',{});toast('Г
   setTimeout(()=>location.href=r.next||'/login',1200)}catch(e){toast(e.message,'bad')}}
 SM_FIELDS.forEach(function(id){var el=document.getElementById(id);
   if(el)el.addEventListener('input',smReset)});
-stepper();
 """
 
 
-def setup_page(setup_csrf):
-    body = _SETUP_HTML + "<script>const SETUP=" + _js(setup_csrf) + ";\n" + _SETUP_JS + "</script>"
+def setup_page():
+    body = _SETUP_HTML + "<script>" + _SETUP_JS + "</script>"
     return _doc("Настройка — vpn-panel", body)
 
 

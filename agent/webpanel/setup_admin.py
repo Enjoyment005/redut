@@ -58,31 +58,29 @@ def main(argv=None):
     ap.add_argument("--force", action="store_true", help="перезаписать существующего админа")
     a = ap.parse_args(argv)
 
-    data = {}
-    if os.path.isfile(a.secrets):
-        with open(a.secrets, encoding="utf-8") as f:
-            data = json.load(f)
-    if data.get("admin") and not a.force:
-        sys.exit("Админ уже настроен в %s. Перезаписать: --force" % a.secrets)
-
     import secrets as _s
     password = a.password or _s.token_urlsafe(12)
     seed = auth.totp_new_seed()
     recovery_plain, recovery_hashes = auth.gen_recovery_codes(10)
+    password_hash = auth.hash_password(password)
 
-    data["admin"] = {
-        "pw": auth.hash_password(password),
-        "totp": seed,
-        "recovery": recovery_hashes,
-    }
-    tmp = a.secrets + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    os.replace(tmp, a.secrets)
+    def replace_admin(data):
+        if data.get("admin") and not a.force:
+            raise SystemExit("Админ уже настроен в %s. Перезаписать: --force" % a.secrets)
+        data = dict(data)
+        data["admin"] = {
+            "pw": password_hash,
+            "totp": seed,
+            "recovery": recovery_hashes,
+        }
+        return data
+
+    # Same cross-process writer lock as login recovery-code consumption and
+    # provider-key changes.  Resetting the admin can no longer resurrect a
+    # concurrently consumed recovery-code snapshot.
+    auth.update_secrets_atomic(a.secrets, replace_admin)
+    auth.consume_bootstrap_secret(
+        os.path.join(os.path.dirname(os.path.abspath(a.secrets)), "bootstrap.json"))
 
     print("=" * 60)
     print("АДМИН ПАНЕЛИ НАСТРОЕН — сохрани эти данные, они больше не покажутся")

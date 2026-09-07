@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import datetime
+from urllib.parse import urlparse
 
 import config_store
 
@@ -435,19 +436,34 @@ def normalize(raw, defaults=None, source=""):
     dns_defaults = {
         "mode": "disabled", "owner_approved": False, "automatic_ready": False,
         "active_probes": False, "listen_ip": "", "listen_port": 1053,
+        "preflight_port": 1054,
+        "canary_evidence_id": "", "rollback_drill_passed": False,
+        "firewall_drill_evidence_id": "", "clock_evidence_id": "",
+        "resource_slo_evidence_id": "", "leak_policy_evidence_id": "",
+        "canary_runner_sha256": "",
+        "canary_peer_ipv4": "",
+        "canary_qname_suffix": "", "canary_expected_ipv4": "",
+        "readiness_not_after": "", "profile_classes_ready": [],
         "request_timeout_seconds": 3.0, "activation_deadline_seconds": 30,
         "active_check_seconds": 5, "active_failures": 3,
+        "path_evidence_ttl_seconds": 300,
         "return_checks": 3, "return_interval_seconds": 60,
         "isolated_ttl_seconds": 900, "qps_per_peer": 50,
+        "qps_burst_per_peer": 100,
+        "tcp_connections_per_peer": 8,
         "candidates": [
             {"id": "cloudflare-proxy", "operator": "cloudflare",
-             "endpoint": "https://1.1.1.1/dns-query", "transport": "proxy"},
+             "endpoint": "https://1.1.1.1/dns-query", "transport": "proxy",
+             "sni": "1.1.1.1", "address_generation": "builtin-2026-09-06"},
             {"id": "google-proxy", "operator": "google",
-             "endpoint": "https://8.8.8.8/dns-query", "transport": "proxy"},
+             "endpoint": "https://8.8.8.8/dns-query", "transport": "proxy",
+             "sni": "8.8.8.8", "address_generation": "builtin-2026-09-06"},
             {"id": "cloudflare-direct", "operator": "cloudflare",
-             "endpoint": "https://1.1.1.1/dns-query", "transport": "direct"},
+             "endpoint": "https://1.1.1.1/dns-query", "transport": "direct",
+             "sni": "1.1.1.1", "address_generation": "builtin-2026-09-06"},
             {"id": "google-direct", "operator": "google",
-             "endpoint": "https://8.8.8.8/dns-query", "transport": "direct"},
+             "endpoint": "https://8.8.8.8/dns-query", "transport": "direct",
+             "sni": "8.8.8.8", "address_generation": "builtin-2026-09-06"},
         ],
     }
     if isinstance(defaults.get("dns_rescue"), dict):
@@ -461,37 +477,103 @@ def normalize(raw, defaults=None, source=""):
         _issue(issues, "dns_rescue.mode", "неизвестный режим", "disabled")
         mode = "disabled"
     dns["mode"] = mode
-    for key in ("owner_approved", "automatic_ready", "active_probes"):
+    for key in ("owner_approved", "automatic_ready", "active_probes",
+                "rollback_drill_passed"):
         dns[key] = _bool(dns.get(key, dns_defaults[key]), False, issues,
                          "dns_rescue.%s" % key, dangerous=True)
     listen_ip = dns.get("listen_ip", dns_defaults["listen_ip"])
+    expected_listen = ""
+    try:
+        expected_listen = str(next(ipaddress.ip_network(str(cfg.get("subnet")),
+                                                        strict=False).hosts()))
+    except (ValueError, TypeError, StopIteration):
+        pass
     if listen_ip:
         try:
             parsed = ipaddress.ip_address(str(listen_ip))
-            if parsed.version != 4:
+            if parsed.version != 4 or not expected_listen or str(parsed) != expected_listen:
                 raise ValueError
             listen_ip = str(parsed)
         except ValueError:
-            _issue(issues, "dns_rescue.listen_ip", "ожидался IPv4 адрес wg0", "empty")
+            _issue(issues, "dns_rescue.listen_ip", "разрешён только точный IPv4 адрес wg0", "empty")
             listen_ip = ""
     dns["listen_ip"] = listen_ip
+    canary_peer = str(dns.get("canary_peer_ipv4") or "").strip()
+    if canary_peer:
+        try:
+            parsed_peer = ipaddress.ip_address(canary_peer)
+            subnet = ipaddress.ip_network(str(cfg.get("subnet")), strict=False)
+            if (parsed_peer.version != 4 or parsed_peer not in subnet
+                    or str(parsed_peer) == expected_listen):
+                raise ValueError
+            canary_peer = str(parsed_peer)
+        except (TypeError, ValueError):
+            _issue(issues, "dns_rescue.canary_peer_ipv4",
+                   "нужен точный IPv4 тестового peer внутри wg0", "empty")
+            canary_peer = ""
+    dns["canary_peer_ipv4"] = canary_peer
+    canary_suffix = str(dns.get("canary_qname_suffix") or "").strip().lower().rstrip(".")
+    if canary_suffix and (len(canary_suffix) > 220 or not re.fullmatch(
+            r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+            r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?", canary_suffix)):
+        _issue(issues, "dns_rescue.canary_qname_suffix",
+               "нужен контролируемый DNS suffix", "empty")
+        canary_suffix = ""
+    dns["canary_qname_suffix"] = canary_suffix
+    expected_ipv4 = str(dns.get("canary_expected_ipv4") or "").strip()
+    if expected_ipv4:
+        try:
+            parsed_expected = ipaddress.ip_address(expected_ipv4)
+            if parsed_expected.version != 4:
+                raise ValueError
+            expected_ipv4 = str(parsed_expected)
+        except ValueError:
+            _issue(issues, "dns_rescue.canary_expected_ipv4",
+                   "нужен ожидаемый IPv4 controlled canary RR", "empty")
+            expected_ipv4 = ""
+    dns["canary_expected_ipv4"] = expected_ipv4
+    dns["canary_evidence_id"] = str(dns.get("canary_evidence_id") or "").strip()[:128]
+    for evidence_key in ("firewall_drill_evidence_id", "clock_evidence_id",
+                         "resource_slo_evidence_id", "leak_policy_evidence_id"):
+        dns[evidence_key] = str(dns.get(evidence_key) or "").strip()[:128]
+    runner_sha = str(dns.get("canary_runner_sha256") or "").strip().lower()
+    dns["canary_runner_sha256"] = (runner_sha
+                                    if re.fullmatch(r"[0-9a-f]{64}", runner_sha) else "")
+    dns["readiness_not_after"] = str(dns.get("readiness_not_after") or "").strip()[:40]
+    profiles = dns.get("profile_classes_ready", [])
+    if not isinstance(profiles, list):
+        _issue(issues, "dns_rescue.profile_classes_ready", "ожидался список", "empty")
+        profiles = []
+    dns["profile_classes_ready"] = sorted({str(x).strip().lower() for x in profiles
+                                             if str(x).strip().lower() in
+                                             ("wg-ip", "external-ip")})
     numeric = {
         "listen_port": (1024, 65535, True),
+        "preflight_port": (1024, 65535, True),
         "request_timeout_seconds": (0.2, 10.0, False),
-        "activation_deadline_seconds": (5, 120, True),
+        "activation_deadline_seconds": (5, 30, True),
         "active_check_seconds": (2, 60, True),
         "active_failures": (1, 10, True),
+        "path_evidence_ttl_seconds": (30, 3600, True),
         "return_checks": (2, 10, True),
         "return_interval_seconds": (10, 600, True),
         "isolated_ttl_seconds": (60, 3600, True),
         "qps_per_peer": (1, 500, True),
+        "qps_burst_per_peer": (1, 1000, True),
+        "tcp_connections_per_peer": (1, 64, True),
     }
     for key, (lo, hi, integer) in numeric.items():
         dns[key] = _number(dns.get(key, dns_defaults[key]), dns_defaults[key], issues,
                            "dns_rescue.%s" % key, lo, hi, integer=integer,
                            dangerous=(key == "listen_port"))
+    if dns["preflight_port"] == dns["listen_port"]:
+        _issue(issues, "dns_rescue.preflight_port",
+               "preflight listener должен использовать отдельный порт", "default")
+        dns["preflight_port"] = (1054 if dns["listen_port"] != 1054 else 1055)
     slots = dns.get("candidates", dns_defaults["candidates"])
     normalized_slots, seen_ids, operators = [], set(), set()
+    operator_hosts = {"cloudflare": {"1.1.1.1", "1.0.0.1"},
+                      "google": {"8.8.8.8", "8.8.4.4"}}
     if not isinstance(slots, list) or len(slots) > 4:
         _issue(issues, "dns_rescue.candidates", "ожидался список максимум из 4 слотов", "empty")
         slots = []
@@ -504,28 +586,80 @@ def normalize(raw, defaults=None, source=""):
         operator = str(item.get("operator") or "").strip().lower()
         endpoint = str(item.get("endpoint") or "").strip()
         transport = str(item.get("transport") or "").strip().lower()
+        sni = str(item.get("sni") or "").strip().lower()
+        generation = str(item.get("address_generation") or "").strip()
+        not_after = str(item.get("not_after") or "").strip()
         valid = (bool(re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", sid))
                  and sid not in seen_ids
                  and bool(re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", operator))
-                 and transport in ("proxy", "direct"))
+                 and transport in ("proxy", "direct")
+                 and bool(re.fullmatch(r"[a-z0-9.-]{1,253}", sni))
+                 and bool(re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", generation)))
         match = re.fullmatch(r"https://(\d{1,3}(?:\.\d{1,3}){3})/(dns-query|resolve)", endpoint)
         try:
-            valid = valid and bool(match) and ipaddress.ip_address(match.group(1)).version == 4
+            valid = (valid and bool(match)
+                      and ipaddress.ip_address(match.group(1)).version == 4
+                      and match.group(1) in operator_hosts.get(operator, set())
+                     # sing-box 1.11 legacy DoH verifies the URL host. Requiring
+                     # the declared TLS identity to equal that literal IP makes
+                     # certificate validation explicit without bootstrap DNS.
+                     and sni == match.group(1))
         except (ValueError, AttributeError):
             valid = False
         if not valid:
             _issue(issues, path, "невалидный безопасный слот", "drop")
             continue
         normalized_slots.append({"id": sid, "operator": operator,
-                                 "endpoint": endpoint, "transport": transport})
+                                 "endpoint": endpoint, "transport": transport,
+                                 "sni": sni, "address_generation": generation,
+                                 "not_after": not_after})
         seen_ids.add(sid)
         operators.add(operator)
     dns["candidates"] = sorted(normalized_slots,
                                key=lambda x: (x["transport"] != "proxy", x["id"]))
-    if mode == "automatic_last_resort" and (len(operators) < 2 or len(dns["candidates"]) < 2):
-        _issue(issues, "dns_rescue.candidates", "для auto нужны минимум два оператора", "disabled")
-        mode = dns["mode"] = "disabled"
-    if (dns_invalid or len(issues) > dns_issue_start or safe_mode
+    # Structural/type/safety errors disable activation entirely. A well-formed
+    # automatic profile whose time/evidence readiness is merely incomplete
+    # keeps its requested mode visible but closes only automatic_ready; this
+    # also lets an already-active, physically proven rescue fail over to a
+    # still-fresh slot instead of being torn down by config normalization.
+    dns_structurally_invalid = dns_invalid or len(issues) > dns_issue_start
+    if mode == "automatic_last_resort":
+        endpoints = {item["endpoint"] for item in dns["candidates"]}
+        endpoint_hosts = {urlparse(item["endpoint"]).hostname
+                          for item in dns["candidates"]}
+        transports = {item["transport"] for item in dns["candidates"]}
+        readiness_ok = bool(dns["canary_evidence_id"] and dns["rollback_drill_passed"]
+                            and dns["firewall_drill_evidence_id"]
+                            and dns["clock_evidence_id"]
+                            and dns["resource_slo_evidence_id"]
+                            and dns["leak_policy_evidence_id"]
+                            and dns["canary_runner_sha256"]
+                            and dns["canary_peer_ipv4"]
+                            and dns["canary_qname_suffix"]
+                            and dns["canary_expected_ipv4"]
+                            and {"wg-ip", "external-ip"} <= set(dns["profile_classes_ready"]))
+        try:
+            deadline = datetime.datetime.fromisoformat(dns["readiness_not_after"].replace("Z", "+00:00"))
+            now = datetime.datetime.now(deadline.tzinfo) if deadline.tzinfo else datetime.datetime.now()
+            readiness_ok = readiness_ok and deadline > now
+        except (TypeError, ValueError):
+            readiness_ok = False
+        candidate_dates_ok = True
+        for item in dns["candidates"]:
+            try:
+                deadline = datetime.datetime.fromisoformat(item["not_after"].replace("Z", "+00:00"))
+                now = datetime.datetime.now(deadline.tzinfo) if deadline.tzinfo else datetime.datetime.now()
+                candidate_dates_ok = candidate_dates_ok and deadline > now
+            except (TypeError, ValueError):
+                candidate_dates_ok = False
+        if (len(operators) < 2 or len(endpoints) < 2 or len(endpoint_hosts) < 2
+                or not {"proxy", "direct"} <= transports
+                or not readiness_ok or not candidate_dates_ok):
+            _issue(issues, "dns_rescue.automatic_ready",
+                   "auto требует два независимых оператора, proxy+direct и свежий полный evidence pack",
+                   "disabled")
+            dns["automatic_ready"] = False
+    if (dns_structurally_invalid or safe_mode
             or not dns["owner_approved"]):
         if mode in ("manual_canary", "automatic_last_resort"):
             dns["mode"] = "disabled"

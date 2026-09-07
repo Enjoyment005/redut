@@ -1,0 +1,28 @@
+[Unit]
+Description=Redut DNS Rescue reconciliation tick
+After=network-online.target wg-quick@wg0.service vpn-boot-setup.service
+Wants=network-online.target vpn-boot-setup.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vpn-agent dns-rescue tick
+# Worst-case max-config tick is bounded by reconcile (15s), backend/client/
+# primary proofs and one activation/failover deadline. Keep systemd above that
+# bound so it never SIGKILLs a journalled firewall transition mid-compensation.
+TimeoutStartSec=180s
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LockPersonality=true
+MemoryMax=128M
+TasksMax=64
+LimitNOFILE=4096
+ReadWritePaths=/var/lib/vpn-panel /var/lib/redut-dns-rescue /run /etc/redut-dns-rescue

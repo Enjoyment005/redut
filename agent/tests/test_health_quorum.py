@@ -145,7 +145,7 @@ class TestQuorumRegressions(unittest.TestCase):
             finally:
                 pool.close()
 
-    def test_quorum_hold_leaves_direct_mode_consistently(self):
+    def test_quorum_hold_preserves_direct_mode_without_positive_egress(self):
         with tempfile.TemporaryDirectory() as tmp:
             pool = pool_mod.Pool(os.path.join(tmp, "state.db"), server="test")
             try:
@@ -176,8 +176,8 @@ class TestQuorumRegressions(unittest.TestCase):
                             {}, {}, pool, mock.Mock(), "watchdog", "auto",
                             lambda *_: None, result, previous)
                     self.assertEqual((answer["state"], answer["action"]),
-                                     (states.DEGRADED, "quorum-held"))
-                    leave.assert_called_once()
+                                     (previous, "quorum-held"))
+                    leave.assert_not_called()
                     rotate.assert_not_called()
             finally:
                 pool.close()

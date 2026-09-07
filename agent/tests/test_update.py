@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import _ctx      # noqa: F401  (добавляет panel/ в sys.path)
 import update
@@ -26,6 +27,24 @@ _SETUP_CANDS = (os.path.join(PANEL_DIR, os.pardir, "install", "setup.sh"),
                 os.path.join(PANEL_DIR, os.pardir, "setup.sh"))
 SETUP_SH = next((p for p in _SETUP_CANDS if os.path.isfile(p)), _SETUP_CANDS[0])
 PROFILES_PY = os.path.join(PANEL_DIR, os.pardir, "install", "profiles.py")
+
+
+class TestUpdateLockHandoff(unittest.TestCase):
+    def test_setup_receives_the_actual_inherited_lock_fd(self):
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured.update(kwargs)
+            return 0, "", ""
+
+        with mock.patch.object(update.os, "name", "posix"), \
+             mock.patch.object(update, "_run", side_effect=fake_run):
+            rc, _tail = update._run_setup("/tmp/redut", lambda _line: None,
+                                          lock_fd=17)
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["pass_fds"], (17,))
+        self.assertEqual(captured["env"]["REDUT_LOCK_FD"], "17")
+        self.assertEqual(captured["env"]["REDUT_LOCK_HELD"], "1")
 
 
 class FakePool:
@@ -426,7 +445,7 @@ class TestApplyOrchestration(unittest.TestCase):
         self._mktree(dest, version)
         return dest
 
-    def _fake_setup(self, tree, log):
+    def _fake_setup(self, tree, log, lock_fd=None):
         with open(os.path.join(tree, "VERSION"), encoding="utf-8") as f:
             self.setup_runs.append(f.read().strip())
         return (self.setup_rc.pop(0) if self.setup_rc else 0), ""

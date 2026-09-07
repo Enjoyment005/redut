@@ -32,19 +32,19 @@
     {
       "type": "socks",
       "tag": "socks-out",
-      "server": "203.0.113.10",
-      "server_port": 64713,
-      "username": "UPSTREAM_USER",
-      "password": "UPSTREAM_PASS",
+      "server": "",
+      "server_port": 0,
+      "username": "",
+      "password": "",
       "version": "5"
     },
     {
       "type": "http",
       "tag": "http-tg",
-      "server": "203.0.113.10",
-      "server_port": 64712,
-      "username": "UPSTREAM_USER",
-      "password": "UPSTREAM_PASS"
+      "server": "",
+      "server_port": 0,
+      "username": "",
+      "password": ""
     },
     {
       "type": "dns",

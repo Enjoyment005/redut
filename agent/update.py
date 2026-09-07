@@ -18,6 +18,7 @@
 import json
 import os
 import re
+import signal
 import subprocess
 import time
 
@@ -339,14 +340,27 @@ VERIFY_WAIT_S = 90                     # даём сервисам встать 
 UNITS = ("wg-quick@wg0", "sing-box", "vpn-boot-setup", "microsocks", "vpn-panel")
 
 
-def _run(cmd, timeout=60, env=None):
+def _run(cmd, timeout=60, env=None, pass_fds=()):
     """-> (rc, stdout, stderr); rc=-1 — команда не запустилась, rc=-2 — таймаут."""
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=timeout, env=env)
-        return p.returncode, p.stdout or "", p.stderr or ""
-    except subprocess.TimeoutExpired as e:
-        return -2, (e.stdout or ""), "таймаут %s с" % timeout
+        kwargs = {}
+        if pass_fds and os.name == "posix":
+            kwargs["pass_fds"] = tuple(pass_fds)
+        if os.name == "posix":
+            kwargs["start_new_session"] = True
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace", env=env, **kwargs)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+            return process.returncode, stdout or "", stderr or ""
+        except subprocess.TimeoutExpired:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+            stdout, _stderr = process.communicate()
+            return -2, stdout or "", "таймаут %s с" % timeout
     except (OSError, subprocess.SubprocessError) as e:
         return -1, "", str(e)
 
@@ -454,6 +468,74 @@ def _wg_peers():
     return len([ln for ln in (out or "").splitlines() if ln.strip()])
 
 
+def _wg_peer_map():
+    rc, out, _ = _run(["wg", "show", "wg0", "allowed-ips"], timeout=10)
+    if rc != 0:
+        return None
+    peers = {}
+    for line in (out or "").splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2 or not parts[0]:
+            continue
+        allowed = tuple(sorted(item.strip() for item in parts[1].split(",") if item.strip()))
+        peers[parts[0]] = allowed
+    return peers
+
+
+def _kernel_path_state():
+    """Small functional forwarding snapshot; None means inspection failed."""
+    rc_fwd, fwd, _ = _run(["sysctl", "-n", "net.ipv4.ip_forward"], timeout=10)
+    rc_link, link, _ = _run(["ip", "-o", "link", "show", "dev", "wg0"], timeout=10)
+    rc_rule, rules, _ = _run(["ip", "rule", "show"], timeout=10)
+    rc_route, routes, _ = _run(["ip", "route", "show", "table", "middleman"], timeout=10)
+    if any(rc != 0 for rc in (rc_fwd, rc_link, rc_rule, rc_route)):
+        return None
+    return {
+        "ip_forward": (fwd or "").strip() == "1",
+        "wg0_up": "UP" in (link or "") or "state UNKNOWN" in (link or ""),
+        "middleman_default": next((line.strip() for line in (routes or "").splitlines()
+                                   if line.strip().startswith("default ")), ""),
+        "policy_rules": tuple(sorted(line.strip() for line in (rules or "").splitlines()
+                                     if "middleman" in line or "fwmark" in line)),
+    }
+
+
+def _db_setting(cfg, key):
+    path = (cfg or {}).get("db") or "/var/lib/vpn-panel/state.db"
+    try:
+        import sqlite3
+        conn = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=2.0)
+        try:
+            row = conn.execute("SELECT value FROM setting WHERE key=?", (key,)).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def _dns_update_state(cfg):
+    phase = _db_setting(cfg, "dns_rescue_phase") or "idle"
+    return {"phase": phase,
+            "dnsmasq": (_is_active("dnsmasq") if (cfg or {}).get("has_dnsmasq") else None),
+            "rescue_unit": _is_active("redut-dns-rescue")}
+
+
+def _network_intent_state(cfg):
+    return {"runtime_emergency": os.path.exists("/run/vpn-agent-emergency"),
+            "durable_emergency": os.path.exists("/var/lib/vpn-panel/emergency.intent"),
+            "automat_state": _db_setting(cfg, "automat_state") or "OK"}
+
+
+def dns_update_preflight(cfg):
+    state = _dns_update_state(cfg)
+    if state["phase"] != "idle" or state["rescue_unit"]:
+        return False, ("активно/не очищено поколение DNS Rescue (phase=%s unit=%s); "
+                       "сначала выполни dns-rescue reconcile/deactivate"
+                       % (state["phase"], state["rescue_unit"]))
+    return True, ""
+
+
 def _panel_ok(port):
     rc, out, _ = _run(["curl", "-sk", "--max-time", "5",
                        "https://127.0.0.1:%d/healthz" % int(port)], timeout=15)
@@ -470,6 +552,10 @@ def _singbox_ok(cfg):
 def baseline_health(cfg):
     return {"units": {u: _is_active(u) for u in UNITS},
             "peers": _wg_peers(),
+            "peer_map": _wg_peer_map(),
+            "kernel_path": _kernel_path_state(),
+            "dns": _dns_update_state(cfg),
+            "intent": _network_intent_state(cfg),
             "panel": _panel_ok((cfg or {}).get("panel_port") or 8443)}
 
 
@@ -477,8 +563,18 @@ def hard_ok(baseline):
     """Минимум, без которого АВТОМАТИКЕ обновляться нельзя: обновление больного узла
     может добить, а откат «на больное» ничего не докажет. Руками (manual) — можно:
     иногда обновление и есть лечение."""
+    kernel = baseline.get("kernel_path")
+    kernel_ok = ("kernel_path" not in baseline or
+                 bool(kernel and kernel.get("ip_forward") and kernel.get("wg0_up")
+                      and kernel.get("middleman_default") and kernel.get("policy_rules")))
+    dns = baseline.get("dns")
+    dns_ok = ("dns" not in baseline or bool(
+        dns and dns.get("phase") == "idle" and not dns.get("rescue_unit")
+        and (dns.get("dnsmasq") is not False)))
+    peer_ok = "peer_map" not in baseline or baseline.get("peer_map") is not None
     return bool(baseline["units"].get("sing-box") and baseline["units"].get("vpn-panel")
-                and baseline["panel"])
+                and baseline["panel"] and peer_ok
+                and kernel_ok and dns_ok)
 
 
 def _brief_health(b):
@@ -498,11 +594,40 @@ def _verify_once(cfg, baseline):
     for u in UNITS:
         if baseline["units"].get(u) and not _is_active(u):
             return False, "юнит %s был активен до обновления, а теперь нет" % u
+    for critical in ("wg-quick@wg0", "sing-box", "vpn-panel"):
+        if not _is_active(critical):
+            return False, "критический юнит %s не активен" % critical
     if (baseline.get("peers") or 0) > 0:
         now = _wg_peers()
         if (now or 0) < baseline["peers"]:
             return False, "wg-пиров стало меньше: было %s, стало %s" % (baseline["peers"], now)
-    if baseline.get("panel") and not _panel_ok((cfg or {}).get("panel_port") or 8443):
+    if baseline.get("peer_map") is not None:
+        now_map = _wg_peer_map()
+        if now_map != baseline["peer_map"]:
+            return False, "изменились WireGuard peer identities/AllowedIPs"
+    if baseline.get("kernel_path") is not None:
+        now_path = _kernel_path_state()
+        if now_path is None:
+            return False, "kernel data-plane не читается"
+        if not (now_path.get("ip_forward") and now_path.get("wg0_up")
+                and now_path.get("middleman_default") and now_path.get("policy_rules")):
+            return False, "kernel data-plane функционально неполон"
+        for key in ("ip_forward", "wg0_up", "middleman_default", "policy_rules"):
+            if now_path.get(key) != baseline["kernel_path"].get(key):
+                return False, "kernel data-plane изменился: %s" % key
+    if baseline.get("dns") is not None:
+        now_dns = _dns_update_state(cfg)
+        if now_dns.get("phase") != "idle" or now_dns.get("rescue_unit"):
+            return False, "DNS Rescue generation не очищено после update"
+        if (cfg or {}).get("has_dnsmasq") and not now_dns.get("dnsmasq"):
+            return False, "dnsmasq не активен после update"
+        if now_dns != baseline["dns"]:
+            return False, "DNS data-plane изменился: было %r, стало %r" % (baseline["dns"], now_dns)
+    if baseline.get("intent") is not None:
+        now_intent = _network_intent_state(cfg)
+        if now_intent != baseline["intent"]:
+            return False, "network intent изменился: было %r, стало %r" % (baseline["intent"], now_intent)
+    if not _panel_ok((cfg or {}).get("panel_port") or 8443):
         return False, "панель не отвечает по HTTPS"
     return True, ""
 
@@ -520,10 +645,15 @@ def verify_health(cfg, baseline, wait_s=VERIFY_WAIT_S, sleep=time.sleep):
         sleep(5)
 
 
-def _run_setup(tree, log):
+def _run_setup(tree, log, lock_fd=None):
     """UPDATE=1 bash setup.sh из дерева tree. Хвост вывода — в лог (journal/cron)."""
     env = dict(os.environ, UPDATE="1")
-    rc, out, err = _run(["bash", os.path.join(tree, "setup.sh")], timeout=SETUP_TIMEOUT, env=env)
+    inherited = ()
+    if lock_fd is not None and os.name == "posix":
+        env.update(REDUT_LOCK_HELD="1", REDUT_LOCK_FD=str(int(lock_fd)))
+        inherited = (int(lock_fd),)
+    rc, out, err = _run(["bash", os.path.join(tree, "setup.sh")],
+                        timeout=SETUP_TIMEOUT, env=env, pass_fds=inherited)
     text = (out + (("\n" + err) if err.strip() else "")).strip()
     for ln in text.splitlines()[-80:]:
         log("  | %s" % ln)
@@ -607,6 +737,13 @@ def _apply_locked(cfg, pool, alerter, log, target, manual, res, force=False):
         log(res["why"])
         return res
 
+    dns_ok, dns_why = dns_update_preflight(cfg)
+    if not dns_ok:
+        res["why"] = dns_why
+        status_write("error", why=res["why"])
+        log(res["why"])
+        return res
+
     baseline = baseline_health(cfg)
     if not manual and not hard_ok(baseline):
         res["why"] = ("узел нездоров и до обновления (%s) — автоматика не рискует; "
@@ -636,8 +773,9 @@ def _apply_locked(cfg, pool, alerter, log, target, manual, res, force=False):
     # вешала вход на живом узле (chaos-тест node1). rotate/watchdog этот лок уважают.
     import apply as apply_mod
     try:
-        with apply_mod.Flock((cfg or {}).get("lock") or "/run/vpn-agent.lock"):
-            return _apply_install(cfg, pool, alerter, log, target, manual, res, baseline, force)
+        with apply_mod.Flock((cfg or {}).get("lock") or "/run/vpn-agent.lock") as network_lock:
+            return _apply_install(cfg, pool, alerter, log, target, manual, res,
+                                  baseline, force, lock_fd=network_lock.fd)
     except apply_mod.ApplyError:
         res["why"] = "агент занят (ротация?) — обновление отложено, попробуй через пару минут"
         status_write("failed", why=res["why"], to=target)
@@ -646,7 +784,8 @@ def _apply_locked(cfg, pool, alerter, log, target, manual, res, force=False):
         return res
 
 
-def _apply_install(cfg, pool, alerter, log, target, manual, res, baseline, force=False):
+def _apply_install(cfg, pool, alerter, log, target, manual, res, baseline,
+                   force=False, lock_fd=None):
     """Установка скачанного дерева + проверка + откат. Вызывается под ДВУМЯ локами
     (redut-update и vpn-agent)."""
     local = res["from"]
@@ -685,7 +824,7 @@ def _apply_install(cfg, pool, alerter, log, target, manual, res, baseline, force
             "в случае провала автоотката НЕ будет" % REDUT_PREV)
 
     status_write("install", to=target, frm=local)
-    rc, _tail = _run_setup(REDUT_SRC, log)
+    rc, _tail = _run_setup(REDUT_SRC, log, lock_fd=lock_fd)
     status_write("verify", to=target, frm=local)
     if rc == 0:
         ok_v, why_v = verify_health(cfg, baseline)
@@ -720,7 +859,7 @@ def _apply_install(cfg, pool, alerter, log, target, manual, res, baseline, force
         os.rename(REDUT_SRC, REDUT_SRC + ".failed")   # битое дерево — для разбора
         os.rename(REDUT_PREV, REDUT_SRC)
         log("Откатываюсь: прогоняю setup.sh прежней сборки %s" % (local or ""))
-        rc2, _t2 = _run_setup(REDUT_SRC, log)
+        rc2, _t2 = _run_setup(REDUT_SRC, log, lock_fd=lock_fd)
         ok2, why2 = verify_health(cfg, baseline)
         # Истина — здоровье узла, а не rc: старый setup.sh мог упасть на том же
         # инфраструктурном сбое (недоступен apt), не тронув живой узел (ревью 17.08).

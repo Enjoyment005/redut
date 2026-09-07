@@ -324,6 +324,8 @@ _SCHEMA = [
     " ON spend_operation(phase, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_dns_operation_phase"
     " ON dns_rescue_operation(phase, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_dns_operation_incident_kind"
+    " ON dns_rescue_operation(incident_id, kind, requested_at)",
     "CREATE INDEX IF NOT EXISTS idx_dns_probe_ts ON dns_probe_log(ts)",
 ]
 
@@ -337,7 +339,7 @@ EVENT_KEEP_DAYS = 180
 # дальше уже не воскрешение мигнувшей выдачи, а новая покупка того же id.
 MEMO_KEEP_DAYS = 30
 
-SCHEMA_VERSION = "8"
+SCHEMA_VERSION = "11"
 
 # Поля, которые обновляет refresh (остальные — роль/проба/счётчики — сохраняются)
 _REFRESH_FIELDS = ("ip", "host", "port_http", "port_socks5", "user", "password",
@@ -356,6 +358,22 @@ _ADD_COLUMNS = (
     ("proxy", "asn", "TEXT"),             # learning v2: ASN exit-IP
     ("event", "payload_json", "TEXT"),    # structured decision diagnostics
     ("spend_operation", "result_json", "TEXT"),  # replay after commit-before-return kill
+    ("dns_rescue_state", "active_kind", "TEXT"),
+    ("dns_rescue_state", "expires_at", "TEXT"),
+    ("dns_rescue_state", "active_failures", "INTEGER NOT NULL DEFAULT 0"),
+    ("dns_rescue_state", "active_last_check", "TEXT"),
+    ("dns_rescue_state", "return_last_check", "TEXT"),
+    ("dns_rescue_state", "generation", "TEXT"),
+    ("dns_rescue_state", "backend_last_ok", "TEXT"),
+    ("dns_rescue_state", "client_path_last_ok", "TEXT"),
+    ("dns_rescue_state", "scope_identity", "TEXT"),
+    ("dns_rescue_state", "boot_id", "TEXT"),
+    ("dns_rescue_state", "expires_monotonic", "REAL"),
+    ("dns_rescue_state", "manual_emergency_ref", "TEXT"),
+    ("dns_rescue_operation", "profile_class", "TEXT"),
+    ("dns_rescue_operation", "expires_at", "TEXT"),
+    ("dns_rescue_operation", "generation", "TEXT"),
+    ("dns_rescue_operation", "snapshot_json", "TEXT"),
 )
 
 
@@ -574,6 +592,37 @@ class Pool:
             return value if math.isfinite(value) else None
         return str(value)
 
+    @staticmethod
+    def _decision_payload_valid(value, max_depth=32, max_nodes=4096):
+        """Bound historical event JSON before exposing it to the panel.
+
+        json.loads recursion behaviour differs between Python releases, so a
+        successful decode alone is not a safety or schema check.  Decision
+        payloads are objects; scalars/arrays and excessively deep or wide
+        structures are quarantined rather than projected.
+        """
+        if not isinstance(value, dict):
+            return False
+        nodes = 0
+        stack = [(value, 1)]
+        while stack:
+            item, depth = stack.pop()
+            nodes += 1
+            if nodes > max_nodes or depth > max_depth:
+                return False
+            if isinstance(item, dict):
+                for key, child in item.items():
+                    if not isinstance(key, str):
+                        return False
+                    stack.append((child, depth + 1))
+            elif isinstance(item, list):
+                stack.extend((child, depth + 1) for child in item)
+            elif item is not None and not isinstance(item, (str, bool, int, float)):
+                return False
+            elif isinstance(item, float) and not math.isfinite(item):
+                return False
+        return True
+
     def log_event(self, action, actor="user", from_uid=None, to_uid=None,
                   result="", detail="", src_ip="", payload=None):
         if payload is None and action in DECISION_ACTIONS:
@@ -601,13 +650,20 @@ class Pool:
             item = dict(row)
             raw_payload = item.pop("payload_json", None)
             try:
-                item["decision"] = (json.loads(
+                if raw_payload and len(raw_payload.encode("utf-8")) > 65536:
+                    raise ValueError("decision payload too large")
+                decision = (json.loads(
                     raw_payload,
                     parse_constant=lambda value: (_ for _ in ()).throw(
                         ValueError("невалидная JSON-константа: %s" % value)))
                     if raw_payload else None)
+                if decision is not None and not self._decision_payload_valid(decision):
+                    raise ValueError("decision payload violates bounds/schema")
+                item["decision"] = decision
+                item["decision_invalid"] = False
             except (TypeError, ValueError, RecursionError):
                 item["decision"] = None
+                item["decision_invalid"] = bool(raw_payload)
             out.append(item)
         return out
 
@@ -1155,7 +1211,12 @@ class Pool:
         # security-event retention period.
         e = self.conn.execute(
             "DELETE FROM dns_rescue_operation WHERE finished_at < ?"
-            " AND phase IN ('committed','rolled_back','failed')", (cut_e,)).rowcount
+            " AND phase IN ('committed','rolled_back','failed')"
+            " AND incident_id NOT IN ("
+            "SELECT incident_id FROM dns_rescue_state "
+            "WHERE singleton=1 AND incident_id IS NOT NULL "
+            "UNION SELECT value FROM setting "
+            "WHERE key='dns_incident_id' AND value IS NOT NULL)", (cut_e,)).rowcount
         self.set_setting("prune_last", day)      # заодно коммитит DELETE'ы
         return {"probe_log": a if a and a > 0 else 0, "event": b if b and b > 0 else 0,
                 "proxy_memo": c if c and c > 0 else 0,
@@ -1447,39 +1508,98 @@ class Pool:
             "singleton": 1, "phase": "idle", "configured_mode": "disabled",
             "incident_id": None, "active_scope": None, "active_slot": None,
             "activated_at": None, "attempt_used": 0, "return_successes": 0,
-            "last_error": None, "updated_at": None,
+            "last_error": None, "updated_at": None, "active_kind": None,
+            "expires_at": None, "active_failures": 0, "active_last_check": None,
+            "return_last_check": None, "generation": None,
+            "backend_last_ok": None, "client_path_last_ok": None,
+            "scope_identity": None, "boot_id": None, "expires_monotonic": None,
+            "manual_emergency_ref": None,
         }
 
     def set_dns_state(self, **values):
         allowed = {"phase", "configured_mode", "incident_id", "active_scope",
                    "active_slot", "activated_at", "attempt_used", "return_successes",
-                   "last_error"}
+                   "last_error", "active_kind", "expires_at", "active_failures",
+                   "active_last_check", "return_last_check", "generation",
+                   "backend_last_ok", "client_path_last_ok", "scope_identity",
+                   "boot_id", "expires_monotonic", "manual_emergency_ref"}
         unknown = set(values) - allowed
         if unknown:
             raise ValueError("unknown dns state fields: %s" % ",".join(sorted(unknown)))
         current = self.dns_state()
         current.update(values)
-        if current["phase"] not in ("idle", "probing", "active_proxy", "active_direct",
+        if "active_scope" in values and values["active_scope"] is None:
+            current["manual_emergency_ref"] = values.get(
+                "manual_emergency_ref")
+        if current["phase"] not in ("idle", "probing", "active_isolated",
+                                    "active_proxy", "active_direct",
                                     "failed", "recovering"):
             raise ValueError("invalid dns rescue phase")
         current["attempt_used"] = 1 if current.get("attempt_used") else 0
         current["return_successes"] = max(0, int(current.get("return_successes") or 0))
+        current["active_failures"] = max(0, int(current.get("active_failures") or 0))
         stamp = now_iso()
         def write(conn):
             conn.execute(
                 "INSERT OR REPLACE INTO dns_rescue_state(singleton,phase,configured_mode,"
                 "incident_id,active_scope,active_slot,activated_at,attempt_used,"
-                "return_successes,last_error,updated_at) VALUES(1,?,?,?,?,?,?,?,?,?,?)",
+                "return_successes,last_error,updated_at,active_kind,expires_at,active_failures,"
+                "active_last_check,return_last_check,generation,backend_last_ok,"
+                "client_path_last_ok,scope_identity,boot_id,expires_monotonic,"
+                "manual_emergency_ref) "
+                "VALUES(1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (current["phase"], current["configured_mode"], current.get("incident_id"),
                  current.get("active_scope"), current.get("active_slot"),
                  current.get("activated_at"), current["attempt_used"],
                  current["return_successes"], str(current.get("last_error") or "")[:500] or None,
-                 stamp))
+                 stamp, current.get("active_kind"), current.get("expires_at"),
+                 current["active_failures"], current.get("active_last_check"),
+                 current.get("return_last_check"), current.get("generation"),
+                 current.get("backend_last_ok"), current.get("client_path_last_ok"),
+                  current.get("scope_identity"), current.get("boot_id"),
+                  current.get("expires_monotonic"),
+                  current.get("manual_emergency_ref")))
         self.run_transaction(write)
         return self.dns_state()
 
+    def close_dns_incident(self, configured_mode="disabled", settings=None):
+        """Atomically publish normal settings and forget DNS ownership.
+
+        The route/normal-path proof happens before this call.  Keeping the
+        automaton transition and DNS reset in one SQLite commit prevents a
+        crash from leaving durable EMERGENCY intent without its compensating
+        DNS descriptor (or the inverse).
+        """
+        values = dict(settings or {})
+        values.update({"dns_incident_id": None,
+                       "dns_recovery_exhausted": None,
+                       "dns_exit_resume": None,
+                       "dns_boot_resume": None})
+        stamp = now_iso()
+
+        def write(conn):
+            conn.executemany(
+                "INSERT OR REPLACE INTO setting(key,value) VALUES(?,?)",
+                [(key, None if value is None else str(value))
+                 for key, value in values.items()])
+            conn.execute(
+                "INSERT OR REPLACE INTO dns_rescue_state(singleton,phase,configured_mode,"
+                "incident_id,active_scope,active_slot,activated_at,attempt_used,"
+                "return_successes,last_error,updated_at,active_kind,expires_at,active_failures,"
+                "active_last_check,return_last_check,generation,backend_last_ok,"
+                "client_path_last_ok,scope_identity,boot_id,expires_monotonic,"
+                "manual_emergency_ref) "
+                "VALUES(1,'idle',?,NULL,NULL,NULL,NULL,0,0,NULL,?,NULL,NULL,0,"
+                "NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)",
+                (str(configured_mode or "disabled"), stamp))
+            return dict(conn.execute(
+                "SELECT * FROM dns_rescue_state WHERE singleton=1").fetchone())
+
+        return self.run_transaction(write)
+
     def begin_dns_operation(self, incident_id, kind, slot_id, scope, actor,
-                            idempotency_key):
+                            idempotency_key, profile_class=None, expires_at=None,
+                            generation=None, snapshot=None):
         incident_id, kind = str(incident_id or "").strip(), str(kind or "").strip()
         scope, actor, key = str(scope or "").strip(), str(actor or "").strip(), str(idempotency_key or "").strip()
         if not all((incident_id, kind, scope, actor, key)):
@@ -1490,9 +1610,14 @@ class Pool:
         def write(conn):
             cur = conn.execute(
                 "INSERT OR IGNORE INTO dns_rescue_operation(id,incident_id,kind,phase,"
-                "slot_id,scope,actor,requested_at,updated_at,idempotency_key)"
-                " VALUES(?,?,?,'planned',?,?,?,?,?,?)",
-                (op_id, incident_id, kind, slot_id or None, scope, actor, stamp, stamp, key))
+                "slot_id,scope,actor,requested_at,updated_at,idempotency_key,profile_class,"
+                "expires_at,generation,snapshot_json)"
+                " VALUES(?,?,?,'planned',?,?,?,?,?,?,?,?,?,?)",
+                (op_id, incident_id, kind, slot_id or None, scope, actor, stamp, stamp, key,
+                 str(profile_class or "")[:64] or None, expires_at or None,
+                 generation or None,
+                 json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+                 if isinstance(snapshot, dict) else None))
             row = conn.execute(
                 "SELECT * FROM dns_rescue_operation WHERE idempotency_key=?", (key,)).fetchone()
             if cur.rowcount == 0 and (row["incident_id"], row["kind"], row["slot_id"],
@@ -1522,6 +1647,116 @@ class Pool:
                  str(error or "")[:500] or None, str(op_id)))
             return dict(conn.execute(
                 "SELECT * FROM dns_rescue_operation WHERE id=?", (str(op_id),)).fetchone())
+        return self.run_transaction(write)
+
+    def commit_dns_activation(self, op_id, clear_resume_setting=None,
+                              clear_resume_id=None, **values):
+        """Atomically publish active state, saga, and exact resume completion."""
+        if clear_resume_setting not in (None, "dns_boot_resume", "dns_exit_resume"):
+            raise ValueError("invalid DNS resume setting")
+        if bool(clear_resume_setting) != bool(clear_resume_id):
+            raise ValueError("DNS resume CAS identity is incomplete")
+        allowed = {"phase", "configured_mode", "incident_id", "active_scope",
+                   "active_slot", "activated_at", "attempt_used", "return_successes",
+                   "last_error", "active_kind", "expires_at", "active_failures",
+                   "active_last_check", "return_last_check", "generation",
+                   "backend_last_ok", "client_path_last_ok", "scope_identity",
+                   "boot_id", "expires_monotonic", "manual_emergency_ref"}
+        if set(values) - allowed:
+            raise ValueError("unknown dns state fields")
+        current = self.dns_state()
+        current.update(values)
+        if current.get("phase") not in ("active_isolated", "active_proxy", "active_direct"):
+            raise ValueError("activation commit requires active phase")
+        current["attempt_used"] = 1 if current.get("attempt_used") else 0
+        current["return_successes"] = max(0, int(current.get("return_successes") or 0))
+        current["active_failures"] = max(0, int(current.get("active_failures") or 0))
+        stamp = now_iso()
+
+        def write(conn):
+            if clear_resume_setting:
+                row = conn.execute(
+                    "SELECT value FROM setting WHERE key=?",
+                    (clear_resume_setting,)).fetchone()
+                try:
+                    descriptor = json.loads(row[0]) if row and row[0] else None
+                except (TypeError, ValueError):
+                    descriptor = None
+                if (not isinstance(descriptor, dict)
+                        or descriptor.get("resume_id") != clear_resume_id):
+                    raise ValueError("DNS resume descriptor changed before activation commit")
+            operation = conn.execute(
+                "SELECT * FROM dns_rescue_operation WHERE id=?", (str(op_id),)).fetchone()
+            if not operation or operation["phase"] != "verifying":
+                raise ValueError("activation saga is not verifying")
+            kind = "activate-" + str(current.get("active_kind") or "")
+            if (operation["kind"] != kind
+                    or operation["incident_id"] != current.get("incident_id")
+                    or operation["scope"] != current.get("active_scope")
+                    or operation["slot_id"] != current.get("active_slot")):
+                raise ValueError("activation state/operation identity mismatch")
+            isolated = current.get("phase") == "active_isolated"
+            if isolated:
+                valid_shape = (
+                    current.get("active_kind") == "isolated_manual"
+                    and str(current.get("active_scope") or "").startswith("peer:")
+                    and operation["profile_class"] in ("wg-ip", "external-ip")
+                    and current.get("expires_at")
+                    and current.get("expires_monotonic") is not None
+                    and not current.get("manual_emergency_ref"))
+            else:
+                manual = current.get("active_kind") == "node_wide_manual"
+                valid_shape = (
+                    current.get("active_kind") in (
+                        "node_wide_manual", "node_wide_automatic")
+                    and current.get("active_scope") == "all"
+                    and operation["profile_class"] == "all-present"
+                    and not current.get("expires_at")
+                    and current.get("expires_monotonic") is None
+                    and (bool(current.get("manual_emergency_ref")) if manual
+                         else not current.get("manual_emergency_ref")))
+            if not valid_shape:
+                raise ValueError("invalid activation state matrix")
+            if (not operation["generation"] or not current.get("generation")
+                    or operation["generation"] != current.get("generation")):
+                raise ValueError("activation generation mismatch")
+            if current.get("active_kind") == "node_wide_manual":
+                try:
+                    snapshot = json.loads(operation["snapshot_json"] or "{}")
+                except (TypeError, ValueError):
+                    snapshot = {}
+                if snapshot.get("manual_emergency_ref") != current.get(
+                        "manual_emergency_ref"):
+                    raise ValueError("manual emergency reference mismatch")
+            conn.execute(
+                "INSERT OR REPLACE INTO dns_rescue_state(singleton,phase,configured_mode,"
+                "incident_id,active_scope,active_slot,activated_at,attempt_used,"
+                "return_successes,last_error,updated_at,active_kind,expires_at,active_failures,"
+                "active_last_check,return_last_check,generation,backend_last_ok,"
+                "client_path_last_ok,scope_identity,boot_id,expires_monotonic,"
+                "manual_emergency_ref) "
+                "VALUES(1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (current["phase"], current["configured_mode"], current.get("incident_id"),
+                 current.get("active_scope"), current.get("active_slot"),
+                 current.get("activated_at"), current["attempt_used"],
+                 current["return_successes"], str(current.get("last_error") or "")[:500] or None,
+                 stamp, current.get("active_kind"), current.get("expires_at"),
+                 current["active_failures"], current.get("active_last_check"),
+                 current.get("return_last_check"), current.get("generation"),
+                 current.get("backend_last_ok"), current.get("client_path_last_ok"),
+                  current.get("scope_identity"), current.get("boot_id"),
+                  current.get("expires_monotonic"),
+                  current.get("manual_emergency_ref")))
+            conn.execute(
+                "UPDATE dns_rescue_operation SET phase='committed',updated_at=?,"
+                "finished_at=?,error=NULL WHERE id=?", (stamp, stamp, str(op_id)))
+            if clear_resume_setting:
+                conn.execute(
+                    "INSERT OR REPLACE INTO setting(key,value) VALUES(?,NULL)",
+                    (clear_resume_setting,))
+            return dict(conn.execute(
+                "SELECT * FROM dns_rescue_state WHERE singleton=1").fetchone())
+
         return self.run_transaction(write)
 
     def unfinished_dns_operations(self, limit=100):
@@ -1559,6 +1794,28 @@ class Pool:
             "SELECT * FROM dns_rescue_operation ORDER BY requested_at DESC,id DESC LIMIT ?",
             (max(1, min(1000, int(limit))),)).fetchall()]
 
+    def tried_dns_activation_slots(self, incident_id):
+        """All activation slots for one incident, independent of UI retention limits."""
+        if not incident_id:
+            return set()
+        return {row[0] for row in self.conn.execute(
+            "SELECT DISTINCT slot_id FROM dns_rescue_operation "
+            "WHERE incident_id=? AND kind LIKE 'activate-%' AND slot_id IS NOT NULL",
+            (str(incident_id),)).fetchall()}
+
+    def committed_dns_activation_profile(self, incident_id, slot_id, scope,
+                                         generation):
+        """Resolve the exact committed generation without a global LIMIT."""
+        if not all((incident_id, slot_id, scope, generation)):
+            return None
+        row = self.conn.execute(
+            "SELECT profile_class FROM dns_rescue_operation "
+            "WHERE incident_id=? AND slot_id=? AND scope=? AND generation=? "
+            "AND phase='committed' AND kind LIKE 'activate-%' "
+            "ORDER BY finished_at DESC,id DESC LIMIT 1",
+            (str(incident_id), str(slot_id), str(scope), str(generation))).fetchone()
+        return row[0] if row else None
+
     # ---------- настройки автомата (§8) ----------
     def get_setting(self, key, default=None):
         row = self.conn.execute("SELECT value FROM setting WHERE key=?", (key,)).fetchone()
@@ -1577,6 +1834,53 @@ class Pool:
             self.conn.executemany(
                 "INSERT OR REPLACE INTO setting(key, value) VALUES(?, ?)",
                 [(key, None if value is None else str(value)) for key, value in values.items()])
+
+    def clear_dns_resume(self, setting_key, resume_id):
+        """CAS-clear exactly one durable DNS compensation descriptor."""
+        if setting_key not in ("dns_boot_resume", "dns_exit_resume"):
+            raise ValueError("invalid DNS resume setting")
+        expected = str(resume_id or "").strip()
+        if not expected:
+            raise ValueError("DNS resume id is required")
+
+        def write(conn):
+            row = conn.execute(
+                "SELECT value FROM setting WHERE key=?", (setting_key,)).fetchone()
+            try:
+                descriptor = json.loads(row[0]) if row and row[0] else None
+            except (TypeError, ValueError):
+                descriptor = None
+            if (not isinstance(descriptor, dict)
+                    or descriptor.get("resume_id") != expected):
+                return False
+            conn.execute(
+                "INSERT OR REPLACE INTO setting(key,value) VALUES(?,NULL)",
+                (setting_key,))
+            return True
+        return self.run_transaction(write)
+
+    def publish_manual_emergency(self, values, manual_ref):
+        """Atomically publish sticky manual intent and take over active DNS."""
+        reference = str(manual_ref or "").strip()
+        if not reference:
+            raise ValueError("manual emergency reference is required")
+        settings = dict(values or {})
+        settings.update({"emergency_manual": "1",
+                         "manual_emergency_ref": reference})
+
+        def write(conn):
+            conn.executemany(
+                "INSERT OR REPLACE INTO setting(key,value) VALUES(?,?)",
+                [(key, None if value is None else str(value))
+                 for key, value in settings.items()])
+            conn.execute(
+                "UPDATE dns_rescue_state SET active_kind='node_wide_manual',"
+                "manual_emergency_ref=?,updated_at=? "
+                "WHERE singleton=1 AND phase IN ('active_proxy','active_direct') "
+                "AND active_scope='all' AND active_kind='node_wide_automatic'",
+                (reference, now_iso()))
+
+        self.run_transaction(write)
 
     def request_selection_intent(self, kind, payload, settings, actor="user",
                                  applied=False, detail=""):

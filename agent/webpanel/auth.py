@@ -14,11 +14,15 @@ secrets.json (0600) содержит блок "admin":
 Сессии и бан-счётчики — в state.db (таблицы session, loginfail).
 """
 import base64
+import contextlib
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import struct
+import tempfile
+import threading
 import time
 
 SESSION_TTL = 12 * 3600
@@ -28,6 +32,148 @@ BRUTE_BASE_BAN = 15 * 60      # базовый бан (сек), растёт с 
 TOTP_STEP = 30
 TOTP_DIGITS = 6
 TOTP_WINDOW = 1               # ±1 шаг
+
+# Every in-process and cross-process writer of secrets.json uses this lock
+# contract.  The thread lock is required on Windows/dev where fcntl is absent;
+# the adjacent lock file serialises vpn-panel, setup_admin and other POSIX
+# processes on the node.
+_SECRETS_WRITER_LOCK = threading.RLock()
+
+
+@contextlib.contextmanager
+def secrets_writer(secrets_path):
+    path = os.path.abspath(secrets_path)
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    lock_path = path + ".lock"
+    with _SECRETS_WRITER_LOCK:
+        lock_file = open(lock_path, "a+", encoding="ascii")
+        try:
+            try:
+                os.chmod(lock_path, 0o600)
+            except OSError:
+                pass
+            if os.name == "posix":
+                import fcntl
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            if os.name == "posix":
+                try:
+                    import fcntl
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            lock_file.close()
+
+
+def _read_secrets_unlocked(secrets_path):
+    try:
+        with open(secrets_path, encoding="utf-8") as source:
+            data = json.load(source)
+    except FileNotFoundError:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError("secrets.json root must be an object")
+    return data
+
+
+def _write_secrets_unlocked(secrets_path, data):
+    parent = os.path.dirname(os.path.abspath(secrets_path)) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".secrets.", dir=parent)
+    try:
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as target:
+            fd = -1
+            json.dump(data, target, ensure_ascii=False, indent=2)
+            target.write("\n")
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(tmp, secrets_path)
+        try:
+            os.chmod(secrets_path, 0o600)
+        except OSError:
+            pass
+        try:
+            dir_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            # Directory fsync is unavailable on Windows and some filesystems.
+            pass
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def write_secrets_atomic(secrets_path, data):
+    """Replace secrets.json durably under the common writer lock."""
+    with secrets_writer(secrets_path):
+        _write_secrets_unlocked(secrets_path, data)
+
+
+def update_secrets_atomic(secrets_path, transform):
+    """Read, transform and replace secrets.json as one serialised operation.
+
+    ``transform`` receives the current dictionary and returns the replacement.
+    It may raise to abort without touching the file.
+    """
+    with secrets_writer(secrets_path):
+        data = _read_secrets_unlocked(secrets_path)
+        replacement = transform(data)
+        if not isinstance(replacement, dict):
+            raise ValueError("secrets transform must return an object")
+        _write_secrets_unlocked(secrets_path, replacement)
+        return replacement
+
+
+def bootstrap_secret_valid(bootstrap_path, supplied, now=None):
+    """Validate the SSH-only one-time panel bootstrap secret."""
+    if not supplied:
+        return False
+    now = float(time.time() if now is None else now)
+    try:
+        with secrets_writer(bootstrap_path):
+            with open(bootstrap_path, encoding="utf-8") as source:
+                record = json.load(source)
+    except (OSError, ValueError, TypeError):
+        return False
+    if not isinstance(record, dict) or record.get("used"):
+        return False
+    try:
+        expires = float(record.get("expires") or 0)
+    except (TypeError, ValueError):
+        return False
+    digest = hashlib.sha256(str(supplied).encode("utf-8")).hexdigest()
+    stored = str(record.get("secret_sha256") or "")
+    return expires >= now and len(stored) == 64 and hmac.compare_digest(stored, digest)
+
+
+def consume_bootstrap_secret(bootstrap_path):
+    """Make a bootstrap secret unusable after the admin commit is durable."""
+    with secrets_writer(bootstrap_path):
+        try:
+            os.unlink(bootstrap_path)
+        except FileNotFoundError:
+            return
+        parent = os.path.dirname(os.path.abspath(bootstrap_path)) or "."
+        try:
+            dir_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
 
 
 # ------------------------------------------------------------- пароль (scrypt)
@@ -193,21 +339,23 @@ def consume_recovery_code(conn, secrets_path, code):
 
     Мутирует secrets.json на диске (os.replace) — вычеркнутый код становится "".
     """
-    import json
-    with open(secrets_path, encoding="utf-8") as f:
-        data = json.load(f)
-    hashes = ((data.get("admin") or {}).get("recovery") or [])
-    idx = recovery_match(code, hashes)
-    if idx < 0:
-        return False
-    hashes[idx] = ""  # погасить
-    data["admin"]["recovery"] = hashes
-    tmp = secrets_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    os.replace(tmp, secrets_path)
-    return True
+    matched = [False]
+
+    def consume(data):
+        admin = data.get("admin") or {}
+        hashes = list(admin.get("recovery") or [])
+        idx = recovery_match(code, hashes)
+        if idx < 0:
+            return data
+        hashes[idx] = ""
+        admin = dict(admin)
+        admin["recovery"] = hashes
+        data = dict(data)
+        data["admin"] = admin
+        matched[0] = True
+        return data
+
+    # Re-read only after taking the lock.  Therefore exactly one concurrent
+    # caller can observe and consume a non-empty hash.
+    update_secrets_atomic(secrets_path, consume)
+    return matched[0]

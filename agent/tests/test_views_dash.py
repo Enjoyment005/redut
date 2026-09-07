@@ -63,6 +63,21 @@ class TestCleanupMarkup(unittest.TestCase):
         self.assertIn("c.runs_24h", html)
 
 
+class TestDNSRescueBeacon(unittest.TestCase):
+    def test_active_rescue_can_never_render_as_all_green(self):
+        html = views._DASH_HTML
+        rescue_guard = html.find("else if(drPhaseActive&&!drProven)")
+        rescue_warning = html.find("else if(drProven)")
+        normal_green = html.find("else if(s.egress_ok)", rescue_warning)
+        self.assertGreater(rescue_guard, -1)
+        self.assertGreater(rescue_warning, rescue_guard)
+        self.assertGreater(normal_green, rescue_warning)
+        self.assertIn("Аварийный DNS не подтверждён", html)
+        self.assertIn("DNS canary активен", html)
+        self.assertIn("Аварийный DNS активен", html)
+        self.assertIn("drc.wireguard_ipv4_dns53===true", html)
+
+
 class TestVitalsMarkup(unittest.TestCase):
     """Строка «Сервер» в шапке (1.8.0): блок, рендерер и стили обязаны быть —
     пропадут при рефакторинге, и показатели молча исчезнут. Владелец просил
