@@ -35,8 +35,11 @@ WG = "/usr/bin/wg"
 CONNTRACK = "/usr/sbin/conntrack"
 GLOBAL_CHAIN = "REDUT_DNS_RESCUE_GLOBAL"
 SCOPED_CHAIN = "REDUT_DNS_RESCUE_SCOPED"
-GLOBAL_INPUT_CHAIN = "REDUT_DNS_RESCUE_GLOBAL_INPUT"
-SCOPED_INPUT_CHAIN = "REDUT_DNS_RESCUE_SCOPED_INPUT"
+# xtables uses a kernel-wide 28-character user-chain limit.  The former
+# *_RESCUE_*_INPUT names were 29 bytes and therefore could never be created on
+# Debian's iptables-nft backend.
+GLOBAL_INPUT_CHAIN = "REDUT_DNS_GLOBAL_INPUT"
+SCOPED_INPUT_CHAIN = "REDUT_DNS_SCOPED_INPUT"
 LEGACY_CHAIN = "REDUT_DNS_RESCUE"
 LEGACY_INPUT_CHAIN = "REDUT_DNS_RESCUE_INPUT"
 PRIMARY_TEST_CHAIN = "REDUT_DNS_PRIMARY_TEST"
@@ -947,17 +950,15 @@ def firewall_attached(cfg, deadline_monotonic=None):
                 return True
             if _chain_present_strict("filter", input_chain, deadline_monotonic):
                 return True
-            for protocol in _PROTOCOLS:
-                if _rule_present_strict(
-                        "nat", "PREROUTING",
-                        _jump("nat", "PREROUTING", protocol, chain, cfg),
-                        deadline_monotonic):
-                    return True
-                if _rule_present_strict(
-                        "filter", "INPUT",
-                        _jump("filter", "INPUT", protocol, input_chain, cfg),
-                        deadline_monotonic):
-                    return True
+            # Listing the parent is authoritative even when its jump target is
+            # absent.  `iptables -C ... -j MISSING_CHAIN` returns rc=2 on the
+            # nft backend, which is an invalid-target diagnostic rather than an
+            # inspection failure or evidence that a rule exists.
+            if (_references_to_chain("nat", "PREROUTING", chain,
+                                     deadline_monotonic)
+                    or _references_to_chain("filter", "INPUT", input_chain,
+                                             deadline_monotonic)):
+                return True
         return False
     except (DNSRuntimeError, KeyError, TypeError, ValueError):
         # Unknown is treated as attached by mutation callers.  This prevents a
@@ -983,12 +984,9 @@ def _redirect_detached_strict(cfg, deadline_monotonic=None):
                 "nat", "PREROUTING", PRIMARY_TEST_CHAIN, deadline_monotonic)):
         return False
     for chain, _input_chain in _owned_pairs():
-        for protocol in _PROTOCOLS:
-            if _rule_present_strict(
-                    "nat", "PREROUTING",
-                    _jump("nat", "PREROUTING", protocol, chain, cfg),
-                    deadline_monotonic):
-                return False
+        if _references_to_chain("nat", "PREROUTING", chain,
+                                deadline_monotonic):
+            return False
         if _chain_present_strict("nat", chain, deadline_monotonic):
             return False
     return True
@@ -1025,14 +1023,6 @@ def deactivate_redirect(cfg, scope="all", deadline_monotonic=None):
     except DNSRuntimeError as error:
         errors.append(str(error))
     for chain, _input_chain in _owned_pairs():
-        for protocol in _PROTOCOLS:
-            try:
-                _delete_rule_all(
-                    "nat", "PREROUTING",
-                    _jump("nat", "PREROUTING", protocol, chain, cfg),
-                    deadline_monotonic)
-            except DNSRuntimeError as error:
-                errors.append(str(error))
         try:
             _delete_owned_references(
                 "nat", "PREROUTING", chain, deadline_monotonic)
@@ -1073,14 +1063,6 @@ def remove_listener_acl(cfg, scope="all", deadline_monotonic=None):
     except DNSRuntimeError as error:
         errors.append(str(error))
     for _chain, input_chain in _owned_pairs():
-        for protocol in _PROTOCOLS:
-            try:
-                _delete_rule_all(
-                    "filter", "INPUT",
-                    _jump("filter", "INPUT", protocol, input_chain, cfg),
-                    deadline_monotonic)
-            except DNSRuntimeError as error:
-                errors.append(str(error))
         try:
             _delete_owned_references(
                 "filter", "INPUT", input_chain, deadline_monotonic)
@@ -1110,17 +1092,11 @@ def _firewall_detached_strict(cfg, deadline_monotonic=None):
                 deadline_monotonic)):
         return False
     for chain, input_chain in _owned_pairs():
-        for protocol in _PROTOCOLS:
-            if _rule_present_strict(
-                    "nat", "PREROUTING",
-                    _jump("nat", "PREROUTING", protocol, chain, cfg),
-                    deadline_monotonic):
-                return False
-            if _rule_present_strict(
-                    "filter", "INPUT",
-                    _jump("filter", "INPUT", protocol, input_chain, cfg),
-                    deadline_monotonic):
-                return False
+        if (_references_to_chain("nat", "PREROUTING", chain,
+                                 deadline_monotonic)
+                or _references_to_chain("filter", "INPUT", input_chain,
+                                         deadline_monotonic)):
+            return False
         if (_chain_present_strict("nat", chain, deadline_monotonic)
                 or _chain_present_strict("filter", input_chain, deadline_monotonic)):
             return False
@@ -1156,15 +1132,6 @@ def deactivate_firewall(cfg, scope="all", deadline_monotonic=None):
         errors.append(str(error))
     pairs = _owned_pairs()
     for chain, input_chain in pairs:
-        for protocol in _PROTOCOLS:
-            for table, parent, target in (("nat", "PREROUTING", chain),
-                                          ("filter", "INPUT", input_chain)):
-                try:
-                    _delete_rule_all(table, parent,
-                                     _jump(table, parent, protocol, target, cfg),
-                                     deadline_monotonic)
-                except DNSRuntimeError as error:
-                    errors.append(str(error))
         for table, parent, target in (("nat", "PREROUTING", chain),
                                       ("filter", "INPUT", input_chain)):
             try:

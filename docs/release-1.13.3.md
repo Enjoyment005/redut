@@ -39,10 +39,13 @@
 - Lifecycle: ошибка обязательной панели больше не возвращает ложный успех; deploy
   требует exact HTTPS `/healthz` и закрывает ресурсы. `--keep-config` проверяет live порт
   до upload; `--subnet` и `--clients` корректно работают с non-/24 и отклоняют тесные сети.
+- DNS Rescue/Linux: INPUT-chain имена укладываются в 28-символьный лимит
+  xtables. На `iptables-nft` отсутствующие owned jump-targets проверяются по
+  списку родительской цепочки, а не через ложно-аварийный `iptables -C`.
 
 ## Проверки
 
-- public и canonical: **1181 tests, OK (skipped=3)**; platform-specific Linux-проверки пропущены только на Windows;
+- public и canonical: **1183 tests, OK (skipped=3)**; platform-specific Linux-проверки пропущены только на Windows;
 - каждый логический шаг прошёл независимую проверку;
 - Python compile, shell/JSON syntax, public secret scan, canonical/public mirror и `git diff --check` — PASS;
 - перед публикацией выпуск проходит release-candidate CI и контролируемое обновление узла.

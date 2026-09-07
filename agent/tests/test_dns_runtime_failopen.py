@@ -208,6 +208,54 @@ class TestFirewallFailOpen(unittest.TestCase):
                 name = rule[rule.index("--hashlimit-name") + 1]
                 self.assertLessEqual(len(name.encode("ascii")), 15)
 
+    def test_owned_chain_names_fit_xtables_kernel_limit(self):
+        names = [item for pair in dns_runtime._owned_pairs() for item in pair]
+        names.extend((dns_runtime.PRIMARY_TEST_CHAIN,
+                      dns_runtime.PREFLIGHT_INPUT_CHAIN))
+        self.assertEqual(len(names), len(set(names)))
+        for name in names:
+            self.assertRegex(name, r"^[A-Z0-9_]+$")
+            self.assertLessEqual(len(name.encode("ascii")), 28)
+
+    def test_idle_nft_backend_does_not_probe_missing_jump_target(self):
+        owned = {item for pair in dns_runtime._owned_pairs() for item in pair}
+        owned.add(dns_runtime.PRIMARY_TEST_CHAIN)
+        owned.add(dns_runtime.PREFLIGHT_INPUT_CHAIN)
+        nft_commands = []
+
+        def nft_backend(command, **kwargs):
+            command = list(command)
+            nft_commands.append(command)
+            if command[:2] == ["systemctl", "is-active"]:
+                return ((4, "unknown") if command[-1] == dns_runtime.PREFLIGHT_UNIT
+                        else (3, "inactive"))
+            if command[:2] == ["systemctl", "stop"]:
+                return (0, "")
+            if (len(command) > 5 and command[3] in ("-C", "-D")
+                    and "-j" in command[5:]):
+                rule = command[5:]
+                target = rule[rule.index("-j") + 1]
+                if target in owned and (command[2], target) not in self.firewall.chains:
+                    return (2, "Chain '%s' does not exist" % target)
+            return self.firewall(command, **kwargs)
+
+        with mock.patch.object(dns_runtime.apply_mod, "run_cmd",
+                               side_effect=nft_backend):
+            self.assertFalse(dns_runtime.firewall_attached(self.cfg))
+            self.assertTrue(dns_runtime.firewall_detached(self.cfg))
+            for _unused in range(2):
+                self.assertTrue(dns_runtime.deactivate_redirect(self.cfg))
+                self.assertTrue(dns_runtime.remove_listener_acl(self.cfg))
+                self.assertTrue(dns_runtime.deactivate_firewall(self.cfg))
+        missing_target_checks = [
+            command for command in nft_commands
+            if len(command) > 5 and command[3] in ("-C", "-D")
+            and "-j" in command[5:]
+            and command[5:][command[5:].index("-j") + 1] in owned
+            and (command[2], command[5:][command[5:].index("-j") + 1])
+            not in self.firewall.chains]
+        self.assertEqual(missing_target_checks, [])
+
     def test_redirect_cleanup_drains_full_subnet_after_any_owned_scope(self):
         self._activate(scope="peer:10.77.0.9")
         with mock.patch.object(dns_runtime.apply_mod, "run_cmd",
@@ -263,11 +311,19 @@ class TestFirewallFailOpen(unittest.TestCase):
         self.assertIn(("nat", dns_runtime.SCOPED_CHAIN), self.firewall.chains)
         self.assertNotIn(("nat", dns_runtime.GLOBAL_CHAIN), self.firewall.chains)
         with mock.patch.object(dns_runtime.apply_mod, "run_cmd", side_effect=self.firewall):
+            self.assertTrue(dns_runtime.firewall_effective(
+                self.cfg, scope="peer:10.77.0.9"))
+            self.assertTrue(dns_runtime.deactivate_firewall(self.cfg,
+                                                            scope="peer:10.77.0.9"))
             self.assertTrue(dns_runtime.deactivate_firewall(self.cfg,
                                                             scope="peer:10.77.0.9"))
         self._activate(scope="all")
         self.assertIn(("nat", dns_runtime.GLOBAL_CHAIN), self.firewall.chains)
         self.assertNotIn(("nat", dns_runtime.SCOPED_CHAIN), self.firewall.chains)
+        with mock.patch.object(dns_runtime.apply_mod, "run_cmd", side_effect=self.firewall):
+            self.assertTrue(dns_runtime.firewall_effective(self.cfg, scope="all"))
+            self.assertTrue(dns_runtime.deactivate_firewall(self.cfg, scope="all"))
+            self.assertTrue(dns_runtime.deactivate_firewall(self.cfg, scope="all"))
 
     def test_scoped_effective_rejects_residual_global_pair(self):
         self._activate(scope="peer:10.77.0.9")
