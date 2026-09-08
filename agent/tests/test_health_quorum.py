@@ -83,7 +83,8 @@ class TestRetuneQuorumIntegration(unittest.TestCase):
 
     def run_retune(self, evidence):
         result = {"ok": False, "disqualified": "no-combo", "evidence": evidence}
-        with mock.patch.object(states.apply_mod, "load_json", return_value={}), \
+        with mock.patch.object(health.time, "time", return_value=NOW), \
+             mock.patch.object(states.apply_mod, "load_json", return_value={}), \
              mock.patch.object(states.apply_mod, "current_upstream", return_value="1.1.1.1"), \
              mock.patch.object(states, "_pool_row_by_host", return_value=self.row), \
              mock.patch.object(states, "_probe", return_value=result):
