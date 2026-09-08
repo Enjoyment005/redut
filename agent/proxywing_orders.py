@@ -31,6 +31,12 @@ def budget(cfg):
     return validate_budget((cfg or {}).get('proxywing_money', BUDGET_DEFAULTS))
 
 
+def check_spend_config(cfg):
+    """Keep config safe mode independent of purchase and USD-budget switches."""
+    if ((cfg or {}).get('_config_meta') or {}).get('safe_mode'):
+        raise money.SpendDenied('ProxyWing: конфигурация в безопасном режиме; денежные операции недоступны')
+
+
 def intent(body):
     """Bind the caller's exact family, product/order, term and price ceiling."""
     kind = body.get('kind')
@@ -81,9 +87,12 @@ def quote(provider, cfg, kind, request):
 
 
 def _gates(pool, cfg, kind, request, price, balance, *, reserved=False):
+    check_spend_config(cfg)
     limits = budget(cfg)
-    if not limits['enabled'] or not money.limits(cfg)['buy_enabled']:
-        raise money.SpendDenied('ProxyWing: траты выключены; проверь общий тумблер и отдельный бюджет USD')
+    if not limits['enabled']:
+        raise money.SpendDenied('ProxyWing: ручные траты выключены в отдельном бюджете USD')
+    if kind == 'buy' and not money.limits(cfg)['buy_enabled']:
+        raise money.SpendDenied('ProxyWing: покупка новых прокси запрещена настройкой покупок')
     if price > request['max_total'] or price > limits['max_price_per_buy']:
         raise money.SpendDenied('ProxyWing: цена выше подтверждённой суммы или лимита операции USD')
     if money._safe_spent_today(pool, 'USD') + price > limits['max_spend_per_day']:

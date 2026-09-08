@@ -187,7 +187,8 @@ def refresh_country_strategy(cfg):
 
 def save_proxywing_budget(cfg, value):
     """Save only the explicitly approved USD limits, preserving adjacent config."""
-    from proxywing_orders import validate_budget
+    from proxywing_orders import check_spend_config, validate_budget
+    check_spend_config(cfg)
     approved = validate_budget(value)
     def mutate(data):
         data['proxywing_money'] = dict(approved)

@@ -291,6 +291,63 @@ class TestMonthlyLedger(unittest.TestCase):
                     self.execute()
                 self.assertFalse(self.provider.calls)
 
+    def test_existing_order_renewal_does_not_enable_or_require_new_purchases(self):
+        from providers.proxywing import norm_proxywing
+        fixture = _ctx.fixture('proxywing_proxies.json')['orders'][0]['proxies'][0]
+        uid = self.pool.upsert_proxy(norm_proxywing(fixture, {'id': 'ord_1'}, 'isp'))
+        self.cfg['money']['buy_enabled'] = False
+        result = self.execute(kind='prolong', order_id='ord_1', months=3, max_total=9)
+        replay = self.execute(kind='prolong', order_id='ord_1', months=3, max_total=9)
+        self.assertEqual(result['date_end'], '2026-12-10')
+        self.assertEqual(self.pool.get(uid)['date_end'], '2026-12-10')
+        self.assertEqual(result['spend_operation_id'], replay['spend_operation_id'])
+        self.assertEqual(len(self.provider.calls), 1)
+        self.assertEqual(self.provider.calls[0][0], '/isp/orders/ord_1/extend')
+        self.assertEqual(self.pool.spent_today('USD'), 9)
+        self.assertFalse(self.cfg['money']['buy_enabled'])
+        with self.assertRaises(money.SpendDenied):
+            self.execute(request_id='blocked-new-purchase')
+        self.assertEqual(len(self.provider.calls), 1)
+
+    def test_renewal_keeps_usd_permission_price_daily_and_reserve_limits(self):
+        import copy
+        original = copy.deepcopy(self.cfg)
+        cases = [dict(enabled=False), dict(max_price_per_buy=8),
+                 dict(max_spend_per_day=8), dict(min_balance_reserve=92)]
+        for change in cases:
+            with self.subTest(change=change):
+                self.cfg = copy.deepcopy(original)
+                self.cfg['proxywing_money'].update(change)
+                with self.assertRaises(money.SpendDenied):
+                    self.execute(kind='prolong', order_id='ord_1', months=3, max_total=9)
+                self.assertFalse(self.provider.calls)
+                self.assertEqual(self.pool.spent_today('USD'), 0)
+
+    def test_safe_mode_blocks_new_and_uncertain_renewal_sends(self):
+        self.cfg['_config_meta'] = {'safe_mode': True}
+        with self.assertRaises(money.SpendDenied):
+            self.execute(kind='prolong', order_id='ord_1', months=3, max_total=9)
+        self.assertFalse(self.provider.calls)
+        self.cfg['_config_meta']['safe_mode'] = False
+        self.provider.lose_once = True
+        with self.assertRaises(ProviderError):
+            self.execute(kind='prolong', order_id='ord_1', months=3, max_total=9)
+        self.cfg['_config_meta']['safe_mode'] = True
+        with self.assertRaises(money.SpendDenied):
+            self.execute(kind='prolong', order_id='ord_1', months=3, max_total=9)
+        self.assertEqual(len(self.provider.calls), 1)
+        self.assertEqual(self.pool.pending_spend_operations()[0]['phase'], 'submitted')
+
+    def test_paid_renewal_recovery_in_safe_mode_does_not_send_again(self):
+        with mock.patch.object(orders, 'finish', side_effect=OSError('interrupted commit')):
+            with self.assertRaises(OSError):
+                self.execute(kind='prolong', order_id='ord_1', months=3, max_total=9)
+        self.cfg['_config_meta'] = {'safe_mode': True}
+        result = self.execute(kind='prolong', order_id='ord_1', months=3, max_total=9)
+        self.assertTrue(result['recovered'])
+        self.assertEqual(len(self.provider.calls), 1)
+        self.assertEqual(self.pool.spent_today('USD'), 9)
+
     def test_changed_intent_and_wrong_receipt_cannot_commit(self):
         self.execute()
         with self.assertRaises(money.SpendDenied):
@@ -359,6 +416,53 @@ class TestPanelMonthly(unittest.TestCase):
             status, result = self.server.Handler._api_get(self.handler({}), '/api/proxywing/renewal', {'uid': [uid]})
         self.assertEqual(status, 502)
         self.assertIn('месячные', result['error'])
+
+    def test_renewal_preflight_returns_budget_without_loading_purchase_catalog(self):
+        from providers.proxywing import norm_proxywing
+        fixture = _ctx.fixture('proxywing_proxies.json')['orders'][0]['proxies'][0]
+        uid = self.pool.upsert_proxy(norm_proxywing(fixture, {'id': 'ord_1'}, 'isp'))
+        self.cfg['money']['buy_enabled'] = False
+        self.cfg['proxywing_money']['enabled'] = False
+        with mock.patch.object(self.provider, 'catalog') as catalog:
+            status, result = self.server.Handler._api_get(
+                self.handler({}), '/api/proxywing/renewal', {'uid': [uid]})
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result['budget'], self.cfg['proxywing_money'])
+        self.assertEqual(result['spent_today'], 0)
+        self.assertEqual(result['affected_count'], 1)
+        catalog.assert_not_called()
+        self.assertFalse(self.provider.calls)
+
+    def test_renewal_preflight_denials_return_json(self):
+        from providers.proxywing import norm_proxywing
+        fixture = _ctx.fixture('proxywing_proxies.json')['orders'][0]['proxies'][0]
+        uid = self.pool.upsert_proxy(norm_proxywing(fixture, {'id': 'ord_1'}, 'isp'))
+        with mock.patch.object(self.pool, 'spent_today', side_effect=ValueError('corrupt ledger')):
+            status, result = self.server.Handler._api_get(
+                self.handler({}), '/api/proxywing/renewal', {'uid': [uid]})
+        self.assertEqual(status, 409, result)
+        self.assertIn('error', result)
+        self.cfg['_config_meta'] = {'safe_mode': True}
+        status, result = self.server.Handler._api_get(
+            self.handler({}), '/api/proxywing/renewal', {'uid': [uid]})
+        self.assertEqual(status, 409, result)
+        self.assertIn('error', result)
+        self.assertFalse(self.provider.calls)
+
+    def test_safe_mode_budget_save_does_not_write_or_enable_spending(self):
+        import os
+        import config_store
+        path = os.path.join(os.path.dirname(self.pool.db_path), 'config.json')
+        with open(path, 'w', encoding='utf-8') as file:
+            json.dump({'owner_value': 17}, file)
+        self.cfg['_source'] = path
+        self.cfg['_config_meta'] = {'safe_mode': True}
+        self.cfg['proxywing_money']['enabled'] = False
+        with self.assertRaises(money.SpendDenied):
+            config_store.save_proxywing_budget(self.cfg, dict(self.cfg['proxywing_money'], enabled=True))
+        with open(path, encoding='utf-8') as file:
+            self.assertEqual(json.load(file), {'owner_value': 17})
+        self.assertFalse(self.cfg['proxywing_money']['enabled'])
 
     def test_budget_update_preserves_adjacent_disk_fields(self):
         import os

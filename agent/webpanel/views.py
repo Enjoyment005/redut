@@ -456,8 +456,8 @@ _DASH_HTML = """
     <div class="fold-body">
     <div class="ex">Панель умеет сама покупать прокси, когда старый умирает. Чтобы она не потратила лишнего,
       стоят лимиты (сколько покупок в день, потолок цены, неснижаемый остаток). Лимиты меняются только
-      на сервере в файле <span class="mono">/etc/vpn-panel/config.json</span> — из браузера их не поправить,
-      это защита от случайного клика.<br>
+      для PROXY6 на сервере в файле <span class="mono">/etc/vpn-panel/config.json</span>.
+      Отдельные лимиты ProxyWing в USD настраиваются ниже и требуют подтверждения.<br>
       <b>Где покупать:</b> Россия, Украина и Беларусь — <b>никогда</b> (жёсткий запрет в коде).
       Остальные страны разрешены, но панель ранжирует их по оценке и сама берёт только надёжные;
       рискованную страну можно купить вручную, вписав её код в поле ниже — тогда решение на тебе.<br>
@@ -500,9 +500,11 @@ _DASH_HTML = """
         <select id="pwcountry"></select><button class="btn g" onclick="pwBuy()">Купить на месяц</button></div>
       <p class="sub" id="pwproductinfo"></p>
       <button class="btn s" onclick="pwResume()">Повторить незавершённый запрос</button>
-      <details style="margin-top:12px"><summary>Отдельный бюджет ProxyWing в USD</summary>
+      <details style="margin-top:12px" id="pwbudgetbox"><summary>Отдельный бюджет ProxyWing в USD</summary>
         <p class="sub">Укажи допустимые суммы и сохрани бюджет. Нулевой лимит запрещает траты.
-        Общий запрет покупок также действует. Автоматические дневные покупки и продления не используют этот бюджет.</p>
+        Запрет новых покупок не блокирует продление действующих заказов в рамках этого бюджета.
+        Автоматические дневные покупки и продления не используют этот бюджет.</p>
+        <p class="sub" id="pwbudgethint" role="status"></p>
         <div class="field"><label><input id="pwenabled" type="checkbox"> разрешить ручные траты</label>
           <div><label>за операцию, USD</label><input id="pwmax" type="number" min="0" step="0.01" value="0" style="width:100px"></div>
           <div><label>за сутки, USD</label><input id="pwday" type="number" min="0" step="0.01" value="0" style="width:100px"></div>
@@ -1418,8 +1420,7 @@ function pwDone(body){const original={...body};delete original.request_id;moneyR
 async function pwMarket(){await openFold('money');document.getElementById('pwbox').open=true;
   try{const m=await api('/api/market?provider=proxywing');window.__PW=m;
     document.getElementById('pwinfo').textContent=(m.error||'')+' '+Object.entries(m.errors||{}).map(([k,v])=>k+': '+v).join(' · ')+(m.balance?' · баланс '+m.balance.balance+' '+m.balance.currency:'');
-    const b=m.budget||{};document.getElementById('pwenabled').checked=!!b.enabled;
-    for(const [id,key] of [['pwmax','max_price_per_buy'],['pwday','max_spend_per_day'],['pwreserve','min_balance_reserve']])document.getElementById(id).value=b[key]||0;
+    pwFillBudget(m.budget);
     pwProducts();toast(m.error?'Каталог недоступен':'Каталог ProxyWing обновлён',m.error?'bad':'ok')
   }catch(e){toast(e.message,'bad')}}
 function pwProducts(){const family=document.getElementById('pwfamily').value;
@@ -1430,6 +1431,19 @@ function pwProductChanged(){const p=pwProduct(),select=document.getElementById('
   const bl=new Set((window.__S||{}).cc_blacklist||[]);select.innerHTML='<option value="">Выбери страну тарифа</option>'+Object.keys(CC).filter(c=>!bl.has(c)).map(c=>'<option value="'+esc(c)+'">'+esc(country(c))+'</option>').join('');
   select.value=p&&p.country||'';select.disabled=!!(p&&p.country);
   document.getElementById('pwproductinfo').textContent=p?('Пакет: '+(p.quantity==null?'количество указано в названии тарифа':p.quantity+' IP')+' · всего '+p.price_monthly+' USD за месяц'+(!p.country?' · API не указал код страны: выбери страну по названию тарифа.':'')):'Нет товаров этого типа или каталог недоступен'}
+function pwFillBudget(b){b=b||{};document.getElementById('pwenabled').checked=b.enabled===true;
+  for(const [id,key] of [['pwmax','max_price_per_buy'],['pwday','max_spend_per_day'],['pwreserve','min_balance_reserve']])document.getElementById(id).value=b[key]||0}
+async function pwRenewalBudget(q,price){const b=q.budget||{};let reason='';
+  if(b.enabled!==true)reason='Ручные траты в USD выключены';
+  else if(!Number.isFinite(b.max_price_per_buy)||price>b.max_price_per_buy)reason='Лимит за операцию ниже цены продления';
+  else if(!Number.isFinite(q.spent_today)||!Number.isFinite(b.max_spend_per_day)||q.spent_today+price>b.max_spend_per_day)reason='Недостаточно суточного бюджета';
+  if(!reason)return true;
+  await openFold('money');document.getElementById('pwbox').open=true;pwFillBudget(b);
+  const box=document.getElementById('pwbudgetbox');box.open=true;
+  document.getElementById('pwbudgethint').textContent=reason+'. Продление действующего заказа '+q.order_id+' стоит '+price+' USD. '+
+    'Проверь разрешение и лимиты, сохрани бюджет, затем снова нажми «Продлить» у этого прокси. Сохранение бюджета не списывает деньги.';
+  box.scrollIntoView({block:'center',behavior:'smooth'});document.getElementById('pwenabled').focus();
+  toast(reason+' — открыты настройки бюджета продления','warn');return false}
 async function pwBudget(){const b={enabled:document.getElementById('pwenabled').checked,max_price_per_buy:Number(document.getElementById('pwmax').value),max_spend_per_day:Number(document.getElementById('pwday').value),min_balance_reserve:Number(document.getElementById('pwreserve').value)};
   if(!confirm('Сохранить отдельный бюджет ProxyWing в USD: до '+b.max_price_per_buy+' за операцию, '+b.max_spend_per_day+' за сутки, резерв '+b.min_balance_reserve+'?'))return;
   try{await api('/api/proxywing/budget',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});toast('Бюджет USD сохранён','ok')}catch(e){toast(e.message,'bad')}}
@@ -1439,6 +1453,7 @@ async function pwBuy(){const p=pwProduct();if(!p)return toast('Сначала з
 async function pwRenew(btn,uid){btn.disabled=true;try{const q=await api('/api/proxywing/renewal?uid='+encodeURIComponent(uid));
   const value=prompt('Продлевается весь заказ '+q.order_id+' ('+q.affected_count+' IP в пуле). Сроки: '+q.options.map(o=>o.months+' мес = '+o.total+' USD').join('; ')+'. Введи число месяцев:',String(q.options[0].months));if(value===null)return;
   const chosen=q.options.find(o=>String(o.months)===value.trim());if(!chosen)return toast('Выбери доступный срок','bad');
+  if(!await pwRenewalBudget(q,chosen.total))return;
   if(!confirm('Продлить весь заказ '+q.order_id+' на '+chosen.months+' мес за '+chosen.total+' USD?'))return;
   await pwSpend({kind:'prolong',family:q.family,order_id:q.order_id,months:chosen.months,max_total:chosen.total})
   }catch(e){toast(e.message,'bad')}finally{btn.disabled=false}}

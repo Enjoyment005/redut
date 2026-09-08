@@ -860,6 +860,13 @@ class Handler(BaseHTTPRequestHandler):
                     'API продлевает только месячные заказы; проверь тип заказа и доступность API. ' + str(error)})
             prefix = 'proxywing:%s|%s|' % (family, order_id)
             result.update(family=family, affected_count=sum(r['uid'].startswith(prefix) for r in rows))
+            try:
+                with _CONFIG_LOCK, _DB_LOCK:
+                    proxywing_orders_mod.check_spend_config(APP.cfg)
+                    result.update(budget=proxywing_orders_mod.budget(APP.cfg),
+                                  spent_today=money_mod._safe_spent_today(APP.pool, 'USD'))
+            except money_mod.SpendDenied as error:
+                return self._json(409, {'error': str(error)})
             return self._json(200, result)
         if path == "/api/money":
             day = time.strftime("%Y-%m-%d")
