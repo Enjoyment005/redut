@@ -256,14 +256,14 @@ class TestFirewallFailOpen(unittest.TestCase):
             not in self.firewall.chains]
         self.assertEqual(missing_target_checks, [])
 
-    def test_redirect_cleanup_drains_full_subnet_after_any_owned_scope(self):
+    def test_redirect_cleanup_drains_only_the_owned_scope(self):
         self._activate(scope="peer:10.77.0.9")
         with mock.patch.object(dns_runtime.apply_mod, "run_cmd",
                                side_effect=self.firewall), \
              mock.patch.object(dns_runtime, "_drain_dns_conntrack") as drain:
             self.assertTrue(dns_runtime.deactivate_redirect(
                 self.cfg, scope="peer:10.77.0.9"))
-        drain.assert_called_once_with(self.cfg, "all", None)
+        drain.assert_called_once_with(self.cfg, "peer:10.77.0.9", None)
 
     def test_successful_deactivation_proves_every_owned_artifact_absent(self):
         self._activate()
@@ -436,10 +436,41 @@ class TestRuntimeProofs(unittest.TestCase):
         with mock.patch.object(dns_runtime.apply_mod, "run_cmd",
                                side_effect=[(0, ""), (3, "inactive")]):
             with self.assertRaises(dns_runtime.DNSRuntimeError):
-                dns_runtime.service_start()
+                dns_runtime.service_start(self.cfg)
+        listener = mock.MagicMock()
         with mock.patch.object(dns_runtime.apply_mod, "run_cmd",
-                               side_effect=[(0, ""), (0, "active")]):
-            self.assertTrue(dns_runtime.service_start())
+                               side_effect=[(0, ""), (0, "active"),
+                                            (0, "active")]), \
+             mock.patch.object(dns_runtime.socket, "create_connection",
+                               return_value=listener):
+            self.assertTrue(dns_runtime.service_start(self.cfg))
+
+    def test_service_start_waits_for_listener_after_systemd_is_active(self):
+        listener = mock.MagicMock()
+        with mock.patch.object(
+                dns_runtime.apply_mod, "run_cmd",
+                side_effect=[(0, ""), (0, "active"), (0, "active"),
+                             (0, "active")]), \
+             mock.patch.object(
+                 dns_runtime.socket, "create_connection",
+                 side_effect=[ConnectionRefusedError(), listener]) as connect, \
+             mock.patch.object(dns_runtime.time, "sleep") as sleep:
+            self.assertTrue(dns_runtime.service_start(self.cfg))
+        self.assertEqual(connect.call_count, 2)
+        sleep.assert_called_once()
+
+    def test_service_start_rejects_listener_readiness_timeout(self):
+        with mock.patch.object(
+                dns_runtime.apply_mod, "run_cmd",
+                side_effect=[(0, ""), (0, "active"), (0, "active")]), \
+             mock.patch.object(dns_runtime.socket, "create_connection",
+                               side_effect=ConnectionRefusedError()), \
+             mock.patch.object(dns_runtime.time, "monotonic",
+                               side_effect=[100.0, 100.0, 102.0]):
+            with self.assertRaisesRegex(
+                    dns_runtime.DNSRuntimeError,
+                    "gateway service did not start listening"):
+                dns_runtime.service_start(self.cfg)
 
     def test_service_stop_requires_effective_inactive_state(self):
         with mock.patch.object(dns_runtime.apply_mod, "run_cmd",

@@ -100,6 +100,7 @@ def parse_response(data, txid, name=CANARY_NAME, expected_ipv4=None):
     if answers + ns_count + ar_count > 128:
         raise DNSProbeError("too many DNS records")
     valid_a = 0
+    wrong_rrset = False
     expected_wire = (socket.inet_aton(str(expected_ipv4))
                      if expected_ipv4 is not None else None)
     for record_index in range(answers + ns_count + ar_count):
@@ -110,6 +111,15 @@ def parse_response(data, txid, name=CANARY_NAME, expected_ipv4=None):
         offset += 10
         if offset + rdlength > len(data):
             raise DNSProbeError("truncated DNS answer data")
+        if expected_wire is not None:
+            # Owned wildcard canaries have exactly one A and no alias chain.
+            if record_index < answers:
+                if (owner_name != name or rtype != 1 or rclass != 1
+                        or rdlength != 4 or not 0 <= ttl <= 30
+                        or bytes(data[offset:offset + rdlength]) != expected_wire):
+                    wrong_rrset = True
+            elif owner_name == name and rtype in (1, 5, 28, 39):
+                wrong_rrset = True
         if (record_index < answers and owner_name == name
                 and rtype == 1 and rclass == 1 and rdlength == 4
                 and 0 <= ttl <= 300
@@ -120,7 +130,13 @@ def parse_response(data, txid, name=CANARY_NAME, expected_ipv4=None):
     if offset != len(data):
         raise DNSProbeError("trailing DNS response bytes")
     rcode = flags & 0xF
-    return {"ok": rcode == 0 and valid_a > 0,
+    if expected_wire is not None and valid_a > 1:
+        wrong_rrset = True
+    ok = rcode == 0 and valid_a > 0 and not wrong_rrset
+    reason = ({2: "servfail", 3: "nxdomain", 5: "refused"}.get(rcode)
+              or ("wrong_rrset" if wrong_rrset or rcode else "nodata"))
+    return {"ok": ok, "status": "PASS" if ok else "FAIL",
+            "reason": "ok" if ok else reason,
             "rcode": rcode, "answers": answers, "bytes": len(data)}
 
 
@@ -173,6 +189,12 @@ def probe(host, port, transport="udp", timeout=3.0, name=CANARY_NAME,
         result["transport"] = transport
         return result
     except (OSError, ValueError, DNSProbeError) as error:
+        rejected = isinstance(error, (ConnectionRefusedError, ConnectionResetError))
+        status = "FAIL" if rejected or isinstance(error, (TimeoutError, DNSProbeError)) else "UNKNOWN"
+        reason = ("timeout" if isinstance(error, TimeoutError) else
+                  "refused" if rejected else "wrong_rrset" if isinstance(error, DNSProbeError)
+                  else "runner_error")
         return {"ok": False, "rcode": None, "answers": 0, "bytes": 0,
+                "status": status, "reason": reason,
                 "latency_ms": max(0, int((time.monotonic() - started) * 1000)),
                 "transport": transport, "error_kind": type(error).__name__}

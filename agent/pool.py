@@ -100,6 +100,10 @@ def classify_db_error(error):
 # Схема §13. money в фазе 1 только создаётся (записи — фаза 2).
 # session — таблица панели (фаза 4), здесь не нужна.
 _SCHEMA = [
+    """CREATE TABLE IF NOT EXISTS provider_order_hold(
+        provider TEXT NOT NULL, family TEXT NOT NULL, order_id TEXT NOT NULL,
+        PRIMARY KEY(provider, family, order_id)
+    )""",
     """CREATE TABLE IF NOT EXISTS proxy(
         uid TEXT PRIMARY KEY,
         provider TEXT NOT NULL,
@@ -374,6 +378,8 @@ _ADD_COLUMNS = (
     ("dns_rescue_operation", "expires_at", "TEXT"),
     ("dns_rescue_operation", "generation", "TEXT"),
     ("dns_rescue_operation", "snapshot_json", "TEXT"),
+    ('dns_probe_log', 'status', "TEXT NOT NULL DEFAULT 'UNKNOWN'"),
+    ('dns_probe_log', 'reason', "TEXT NOT NULL DEFAULT 'runner_error'"),
 )
 
 
@@ -1062,7 +1068,7 @@ class Pool:
                                      ",".join("?" * (3 + len(_REFRESH_FIELDS) + 2))),
                     (uid, it["provider"], it["ext_id"])
                     + tuple(it.get(f) for f in _REFRESH_FIELDS)
-                    + ((memo or {}).get("role") or DEFAULT_ROLE.get(name, "auto"), 0))
+                    + ((memo or {}).get("role") or self._initial_proxy_role(it), 0))
                 if memo:
                     self.conn.execute(
                         "UPDATE proxy SET fail_count=?, cooldown_until=?, note=? WHERE uid=?",
@@ -1289,6 +1295,21 @@ class Pool:
         self.conn.execute("UPDATE proxy SET last_used_at=? WHERE uid=?", (now_iso(), uid))
         self.conn.commit()
 
+    def _initial_proxy_role(self, norm):
+        """Keep newly purchased order members off, including imports during a lost reply."""
+        name = norm['provider']
+        if name == 'proxywing':
+            parts = str(norm.get('ext_id') or '').split('|')
+            held = len(parts) == 3 and self.conn.execute(
+                'SELECT 1 FROM provider_order_hold WHERE provider=? AND family=? AND order_id=?',
+                (name, parts[0], parts[1])).fetchone()
+            pending = self.conn.execute(
+                "SELECT 1 FROM spend_operation WHERE provider=? AND kind='buy'"
+                " AND phase IN ('planned','submitted') LIMIT 1", (name,)).fetchone()
+            if held or pending:
+                return 'off'
+        return DEFAULT_ROLE.get(name, 'auto')
+
     def upsert_proxy(self, norm, role=None):
         """Вставить/обновить один нормализованный прокси (после buy, до pool-refresh).
 
@@ -1305,7 +1326,7 @@ class Pool:
         else:
             # тот же uid уже был у нас и ушёл — поднимаем решение владельца (роль off)
             memo = self._take_memo(uid)
-            r = role or (memo or {}).get("role") or DEFAULT_ROLE.get(norm["provider"], "auto")
+            r = role or (memo or {}).get("role") or self._initial_proxy_role(norm)
             self.conn.execute(
                 "INSERT INTO proxy(uid, provider, ext_id, %s, role, gone) VALUES(%s)"
                 % (", ".join(_REFRESH_FIELDS), ",".join("?" * (3 + len(_REFRESH_FIELDS) + 2))),
@@ -1502,7 +1523,18 @@ class Pool:
         row = self.run_transaction(write)
         return self._spend_item(row)
 
-    def complete_spend_operation(self, op_id, money_rows, *, date_updates=None, result=None):
+    def record_spend_response(self, op_id, response):
+        """Persist a sanitized provider receipt before final ledger assembly."""
+        payload = json.dumps(response, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        def write(conn):
+            updated = conn.execute(
+                "UPDATE spend_operation SET result_json=?,updated_at=? WHERE id=? AND phase='submitted'",
+                (payload, now_iso(), str(op_id)))
+            if updated.rowcount != 1:
+                raise ValueError('provider receipt requires submitted operation')
+        self.run_transaction(write)
+
+    def complete_spend_operation(self, op_id, money_rows, *, date_updates=None, result=None, hold_order=None):
         """Атомарно записать ledger и committed; повторный вызов безвреден."""
         validated = [self._validated_money(
             row.get("provider"), row.get("op"), row.get("uid"), row.get("price"),
@@ -1512,6 +1544,11 @@ class Pool:
             raise ValueError("денежная сага не может завершиться без ledger")
         updates = [(str(date_end), str(uid)) for uid, date_end in (date_updates or [])
                    if uid and date_end]
+        if hold_order is not None:
+            from providers.proxywing import family_name, identifier
+            if len(hold_order) != 3 or hold_order[0] != 'proxywing':
+                raise ValueError('unsupported order hold')
+            hold_order = ('proxywing', family_name(hold_order[1]), identifier(hold_order[2]))
         result_json = json.dumps(result or {}, ensure_ascii=False, sort_keys=True,
                                  separators=(",", ":"), allow_nan=False)
         stamp = now_iso()
@@ -1530,6 +1567,8 @@ class Pool:
                 " VALUES(?,?,?,?,?,?,?,?,?)", validated)
             if updates:
                 conn.executemany("UPDATE proxy SET date_end=? WHERE uid=?", updates)
+            if hold_order is not None:
+                conn.execute('INSERT OR IGNORE INTO provider_order_hold(provider,family,order_id) VALUES(?,?,?)', hold_order)
             conn.execute(
                 "UPDATE spend_operation SET phase='committed',updated_at=?,finished_at=?,error='',"
                 " result_json=? WHERE id=?", (stamp, stamp, result_json, str(op_id)))
@@ -1845,16 +1884,50 @@ class Pool:
                 return None
             return max(minimum, min(maximum, int(value)))
         stamp = now_iso()
+        status = (result or {}).get('status', 'PASS' if (result or {}).get('ok') else 'UNKNOWN')
+        if status not in ('PASS', 'FAIL', 'UNKNOWN'):
+            status = 'UNKNOWN'
+        reason = (result or {}).get('reason', 'ok' if status == 'PASS' else 'runner_error')
+        if reason not in ('ok', 'nxdomain', 'nodata', 'servfail', 'refused', 'timeout',
+                          'wrong_rrset', 'control_failed', 'runner_error'):
+            reason = 'runner_error'
         def write(conn):
             cur = conn.execute(
                 "INSERT INTO dns_probe_log(ts,incident_id,slot_id,transport,ok,latency_ms,"
-                "rcode,answers,error_kind) VALUES(?,?,?,?,?,?,?,?,?)",
+                "rcode,answers,error_kind,status,reason) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (stamp, incident_id or None, slot_id or None, transport,
                  1 if (result or {}).get("ok") else 0,
                  bounded_int("latency_ms", 0, 60000), bounded_int("rcode", 0, 15),
                  bounded_int("answers", 0, 65535, 0),
-                 str((result or {}).get("error_kind") or "")[:64] or None))
+                 str((result or {}).get("error_kind") or "")[:64] or None, status, reason))
             return cur.lastrowid
+        return self.run_transaction(write)
+
+    def commit_dns_restoration(self, op_id, generation, scope, phase):
+        """Atomically restore serving state and close superseded detach operations."""
+        if phase not in ('active_isolated', 'active_proxy', 'active_direct'):
+            raise ValueError('invalid restored DNS phase')
+        stamp = now_iso()
+
+        def write(conn):
+            state = conn.execute('SELECT * FROM dns_rescue_state WHERE singleton=1').fetchone()
+            operation = conn.execute('SELECT * FROM dns_rescue_operation WHERE id=?', (op_id,)).fetchone()
+            if (state is None or operation is None or state['generation'] != generation
+                    or state['active_scope'] != scope or operation['generation'] != generation
+                    or not operation['kind'].startswith('deactivate-')
+                    or operation['phase'] != 'rollback'):
+                raise ValueError('DNS restoration identity changed')
+            conn.execute("UPDATE dns_rescue_state SET phase=?,return_successes=0,return_last_check=?,"
+                         "last_error='post-detach-primary-unproven',updated_at=? WHERE singleton=1",
+                         (phase, stamp, stamp))
+            conn.execute("UPDATE dns_rescue_operation SET phase='rolled_back',updated_at=?,"
+                         "finished_at=? WHERE id=?", (stamp, stamp, op_id))
+            conn.execute("UPDATE dns_rescue_operation SET phase='failed',updated_at=?,finished_at=?,"
+                         "error='superseded-by-restoration' WHERE generation=? AND kind LIKE 'deactivate-%' "
+                         "AND id != ? AND phase NOT IN ('committed','rolled_back','failed')",
+                         (stamp, stamp, generation, op_id))
+            return dict(conn.execute('SELECT * FROM dns_rescue_state WHERE singleton=1').fetchone())
+
         return self.run_transaction(write)
 
     def dns_operations(self, limit=100):
@@ -1868,7 +1941,8 @@ class Pool:
             return set()
         return {row[0] for row in self.conn.execute(
             "SELECT DISTINCT slot_id FROM dns_rescue_operation "
-            "WHERE incident_id=? AND kind LIKE 'activate-%' AND slot_id IS NOT NULL",
+            "WHERE incident_id=? AND kind LIKE 'activate-%' AND slot_id IS NOT NULL "
+            "AND COALESCE(error,'') != 'CandidateProofUnknown'",
             (str(incident_id),)).fetchall()}
 
     def committed_dns_activation_profile(self, incident_id, slot_id, scope,

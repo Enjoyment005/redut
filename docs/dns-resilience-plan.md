@@ -1050,3 +1050,26 @@ NORMAL
 Режим сначала доказывает рабочий DNS-путь, затем включает его через rollback-safe saga,
 остаётся явно
 аварийным в UI и не ухудшает `EMERGENCY`, если сам не сработал.
+
+
+## Локальная реализация стабильности DNS Rescue — 8 сентября 2026
+
+Новый контракт runner v4 описан в `DNS-CANARY-RUNNER-CONTRACT.md`. Для automatic вместо
+одного `UDP fail AND TCP fail` применяются три семантических раунда: 3/3 control/candidate,
+согласованный application+primary fault в 2/3, включая последний. UDP NXDOMAIN при рабочем
+TCP больше не блокирует доказанный DNS rescue. Только реально присутствующие profile classes
+входят в проверку; WG, profile inventory и route digest должны оставаться неизменными.
+
+UNKNOWN сохраняет работающий DNS, не увеличивает failures и блокирует новый cutover/return.
+После 15 минут — критическое событие и предупреждение панели. Local health: 5 секунд/3 FAIL;
+client path: 60 секунд/2 FAIL. Возврат — после minimum dwell 300 секунд и трёх PASS через 60 секунд.
+Обычный automatic exit из EMERGENCY не может обойти ожидание DNS idle.
+
+Отключение сначала снимает owned NAT и выполняет scope-aware conntrack drain, затем новым
+QNAME доказывает primary при ещё работающем listener. При ошибке/UNKNOWN возвращается прежняя
+generation. Аварийный fail-open для dead listener, смены boot/scope и истёкшего isolated TTL
+сохраняется. Stale global ownership требует отдельного journaled global drain и degraded-события.
+
+Эти уточнения имеют приоритет над прежними описаниями бинарного probe и быстрого возврата.
+Физические blackout/reboot/Android cache/load gates ещё не измерены. Automatic mode не включён;
+публикация и production deploy требуют отдельного разрешения.

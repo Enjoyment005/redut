@@ -376,20 +376,23 @@ def _urlopen_json(req, host_label, timeout, follow_redirects=True):
 _CURL_UNSENT = {6, 7, 35}
 
 
-def _curl_json(url, headers, form_fields, host_label, timeout):
+def _curl_json(url, headers, form_fields, host_label, timeout, json_body=None):
     """Тот же запрос через СОБСТВЕННЫЙ канал узла: curl --interface tun0 (sing-box -> upstream)."""
     cmd = ["curl", "-sS", "--interface", "tun0", "-m", str(int(timeout)), "-A", USER_AGENT,
            "-D", "-",
            "-o", "-", "-w", "\n__HTTP__%{http_code}"]
     for k, v in (headers or {}).items():
         cmd += ["-H", "%s: %s" % (k, v)]
-    if form_fields is not None:
+    if json_body is not None:
+        cmd += ["-X", "POST", "-H", "Content-Type: application/json", "--data-binary", "@-"]
+    elif form_fields is not None:
         cmd += ["-X", "POST"]
         for k, v in urllib.parse.parse_qsl(urllib.parse.urlencode(form_fields or {}, doseq=True)):
             cmd += ["--data-urlencode", "%s=%s" % (k, v)]
     cmd.append(url)
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 10)
+        extra = {"input": json.dumps(json_body, allow_nan=False)} if json_body is not None else {}
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 10, **extra)
     except OSError as e:
         raise ProviderError("Нет связи с %s через канал узла (%s)" % (host_label or "API", e),
                             network=True, unsent=True) from None
@@ -435,7 +438,7 @@ def _curl_json(url, headers, form_fields, host_label, timeout):
                             kind=ProviderErrorKind.PROTOCOL) from None
 
 
-def _request_json(url, headers, form_fields, timeout, host_label, mutating):
+def _request_json(url, headers, form_fields, timeout, host_label, mutating, json_body=None):
     """Запрос предпочтительным транспортом; при «нет связи» — другим, если это безопасно.
 
     direct -> tun0: если tun0 жив; для mutating — только при unsent (запрос не доставлен).
@@ -449,7 +452,12 @@ def _request_json(url, headers, form_fields, timeout, host_label, mutating):
             continue
         try:
             if tr == "direct":
-                if form_fields is None:
+                if json_body is not None:
+                    req = urllib.request.Request(
+                        url, data=json.dumps(json_body, allow_nan=False).encode('utf-8'), method='POST',
+                        headers={"User-Agent": USER_AGENT, "Content-Type": "application/json",
+                                 **(headers or {})})
+                elif form_fields is None:
                     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
                 else:
                     data = urllib.parse.urlencode(form_fields or {}, doseq=True).encode("utf-8")
@@ -464,7 +472,8 @@ def _request_json(url, headers, form_fields, timeout, host_label, mutating):
                 data = _urlopen_json(
                     req, host_label, timeout, follow_redirects=not mutating)
             else:
-                data = _curl_json(url, headers, form_fields, host_label, timeout)
+                extra = {"json_body": json_body} if json_body is not None else {}
+                data = _curl_json(url, headers, form_fields, host_label, timeout, **extra)
         except ProviderError as e:
             if not e.network:
                 raise                       # ответ API получен (HTTP-ошибка) — транспорт ни при чём
@@ -492,6 +501,13 @@ def http_post_form(url, fields, headers=None, timeout=HTTP_TIMEOUT, host_label="
     — как в расширении (plApi: URLSearchParams.append) для /api/renew/ ProxyLine.
     """
     return _request_json(url, headers, fields or {}, timeout, host_label, mutating)
+
+
+def http_post_json(url, body, headers=None, timeout=HTTP_TIMEOUT, host_label="", mutating=True):
+    """POST JSON with the same no-ambiguous-retry transport policy as other writes."""
+    if not isinstance(body, dict):
+        raise ValueError('JSON request body must be an object')
+    return _request_json(url, headers, None, timeout, host_label, mutating, json_body=body)
 
 
 def build_query(params):

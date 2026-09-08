@@ -1,17 +1,52 @@
 # -*- coding: utf-8 -*-
 """ProxyWing — datacenter и ISP прокси через Developer API v1.
 
-Первый безопасный этап интеграции: список уже оплаченных каналов и баланс.
-Денежные операции намеренно выключены: ProxyWing продаёт месяцы (1/3/6/12),
-а текущая политика Редута оперирует днями и рассчитана на PROXY6. Нельзя молча
-превращать автопродление на 7 дней в покупку месяца.
+Месячные заказы имеют отдельный явный контракт; дневные buy/prolong ядра
+не включаются, чтобы автоматические 7 дней не превратились в месяц.
 """
 import ipaddress
+import math
+import re
 
-from .base import Provider, capabilities, http_get_json
+from .base import Provider, ProviderError, capabilities, http_get_json, http_post_json
 
 API_BASE = "https://api.proxywing.com/v1"
 HOST_LABEL = "api.proxywing.com"
+FAMILIES = ('datacenter', 'isp')
+MONTHS = (1, 3, 6, 12)
+
+
+def identifier(value):
+    """Accept opaque API IDs without allowing path/query injection."""
+    if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', value):
+        raise ProviderError('ProxyWing: некорректный идентификатор')
+    return value
+
+
+def family_name(value):
+    if value not in FAMILIES:
+        raise ProviderError('ProxyWing: выбери Datacenter или ISP')
+    return value
+
+
+def order_identity(ext_id):
+    """Extract one order identity from a persisted normalized proxy ID."""
+    parts = str(ext_id).removeprefix('proxywing:').split('|')
+    if len(parts) != 3:
+        raise ProviderError('ProxyWing: некорректный ID прокси')
+    identifier(parts[2])
+    return family_name(parts[0]), identifier(parts[1])
+
+
+def amount(value):
+    """Validate a positive finite API amount, never reinterpret currency."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        number = 0
+    if isinstance(value, bool) or not math.isfinite(number) or number <= 0:
+        raise ProviderError('ProxyWing: API не вернул корректную цену')
+    return number
 
 
 def _ip_version(value):
@@ -53,6 +88,7 @@ def norm_proxywing(proxy, order, family):
 class ProxyWing(Provider):
     name = "proxywing"
     caps = capabilities()
+    monthly_orders = True
     min_interval = 0.11                 # API: 600 запросов/мин с одного IP
 
     def _api(self, path):
@@ -63,6 +99,73 @@ class ProxyWing(Provider):
                 host_label=HOST_LABEL,
             ) or {}
         return self._guarded(path, request)
+
+    def _post(self, path, body, request_id, on_submit=None):
+        """Submit exactly the caller's durable idempotency key after journaling."""
+        if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9._:-]{8,128}', request_id):
+            raise ProviderError('ProxyWing: нужен стабильный Idempotency-Key')
+        def request():
+            if on_submit is not None:
+                on_submit()
+            return http_post_json(API_BASE + path, body,
+                headers={'Authorization': 'Bearer ' + self.api_key, 'Idempotency-Key': request_id},
+                host_label=HOST_LABEL, mutating=True)
+        return self._guarded(path, request)
+
+    def catalog(self, family=None):
+        """Return family-specific IDs, package sizes and published monthly prices."""
+        out = []
+        for name in (FAMILIES if family is None else (family_name(family),)):
+            data = self._api('/%s/products' % name)
+            if not isinstance(data, dict) or not isinstance(data.get('products'), list):
+                raise ProviderError('ProxyWing: неполный ответ каталога')
+            for row in data['products']:
+                if not isinstance(row, dict) or row.get('category', name) != name:
+                    raise ProviderError('ProxyWing: некорректная категория товара')
+                location = str(row.get('location') or '').lower()
+                country = 'gb' if location == 'uk' else location if re.fullmatch('[a-z]{2}', location) else ''
+                quantity = row.get('quantity')
+                if quantity is not None and (type(quantity) is not int or quantity < 1):
+                    raise ProviderError('ProxyWing: некорректный размер пакета')
+                out.append({'product_id': identifier(row.get('product_id')), 'family': name,
+                    'name': str(row.get('name') or row.get('location') or row.get('product_id')),
+                    'group': str(row.get('group') or ''), 'country': country,
+                    'quantity': quantity, 'price_monthly': amount(row.get('price_monthly')),
+                    'currency': 'USD'})
+        return out
+
+    def renewal_options(self, family, order_id):
+        """Read the real quote for extending the whole order, in calendar months."""
+        path = '/%s/orders/%s/renewal-options' % (family_name(family), identifier(order_id))
+        data = self._api(path)
+        if (not isinstance(data, dict) or data.get('order_id') != order_id
+                or not isinstance(data.get('options'), list)):
+            raise ProviderError('ProxyWing: неполный ответ условий продления')
+        options = []
+        for item in data['options']:
+            if not isinstance(item, dict) or type(item.get('months')) is not int or item['months'] not in MONTHS:
+                raise ProviderError('ProxyWing: некорректный срок продления')
+            if item['months'] in [x['months'] for x in options]:
+                raise ProviderError('ProxyWing: неоднозначные цены продления')
+            options.append({'months': item['months'], 'total': amount(item.get('total'))})
+        if not options:
+            raise ProviderError('ProxyWing: продление заказа через API недоступно')
+        return {'order_id': order_id, 'next_due_date': data.get('next_due_date'),
+                'options': options, 'currency': 'USD'}
+
+    def order_product(self, family, product_id, billing_cycle, request_id, on_submit=None):
+        """Buy a product on the explicit monthly cycle whose price is published."""
+        if billing_cycle != 'monthly':
+            raise ProviderError('ProxyWing: новая покупка поддерживает месячный тариф')
+        return self._post('/%s/orders' % family_name(family),
+            {'product_id': identifier(product_id), 'billing_cycle': billing_cycle}, request_id, on_submit)
+
+    def extend_order(self, family, order_id, months, request_id, on_submit=None):
+        """Extend the entire order, never multiply a charge by the number of IPs."""
+        if type(months) is not int or months not in MONTHS:
+            raise ProviderError('ProxyWing: срок продления — 1, 3, 6 или 12 месяцев')
+        return self._post('/%s/orders/%s/extend' % (family_name(family), identifier(order_id)),
+            {'cycle': months, 'cycle_type': 'monthly'}, request_id, on_submit)
 
     def list(self):
         out = []
@@ -79,4 +182,4 @@ class ProxyWing(Provider):
 
     def balance(self):
         data = self._api("/account/balance")
-        return {"balance": data.get("balance"), "currency": data.get("currency") or "USD"}
+        return {"balance": data.get("balance"), "currency": data.get("currency")}

@@ -148,8 +148,8 @@ OPT = "/opt/vpn-panel"
 # файлов есть окно, где тик крона (pool-refresh/heartbeat) поймал бы ImportError.
 AGENT_FILES = ["update.py", "config_store.py", "config_schema.py", "health.py", "learning.py",
                "metrics.py", "replay.py",
-               "dns_probe.py", "dns_runtime.py", "dns_rescue.py",
-               "agent.py", "pool.py", "probe.py", "apply.py", "money.py",
+               "dns_probe.py", "dns_evidence.py", "dns_runtime.py", "dns_rescue.py",
+               "agent.py", "pool.py", "probe.py", "apply.py", "money.py", "proxywing_orders.py",
                "states.py", "alerts.py", "country.py",
                "providers/__init__.py", "providers/base.py",
                "providers/proxyline.py", "providers/proxy6.py", "providers/proxywing.py"]

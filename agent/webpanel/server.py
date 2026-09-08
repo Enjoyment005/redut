@@ -74,6 +74,7 @@ import country as country_mod      # noqa: E402
 import health as health_mod        # noqa: E402
 import metrics as metrics_mod      # noqa: E402
 import money as money_mod          # noqa: E402
+import proxywing_orders as proxywing_orders_mod  # noqa: E402
 import pool as pool_mod            # noqa: E402
 import probe as probe_mod          # noqa: E402
 import states as states_mod        # noqa: E402
@@ -840,6 +841,26 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, report)
         if path == "/api/market":
             return self._json(200, self._market(qs))
+        if path == '/api/proxywing/renewal':
+            from providers.proxywing import order_identity
+            uid = (qs.get('uid') or [''])[0]
+            with _DB_LOCK:
+                row = APP.pool.get(uid)
+                rows = APP.pool.list(include_gone=True)
+            if not row or row.get('provider') != 'proxywing':
+                return self._json(404, {'error': 'Прокси ProxyWing не найден'})
+            prov = APP.providers.get('proxywing')
+            if prov is None:
+                return self._json(400, {'error': 'Нет ключа ProxyWing'})
+            try:
+                family, order_id = order_identity(row['ext_id'])
+                result = prov.renewal_options(family, order_id)
+            except ProviderError as error:
+                return self._json(502, {'error': 'ProxyWing: не удалось получить сроки продления. '
+                    'API продлевает только месячные заказы; проверь тип заказа и доступность API. ' + str(error)})
+            prefix = 'proxywing:%s|%s|' % (family, order_id)
+            result.update(family=family, affected_count=sum(r['uid'].startswith(prefix) for r in rows))
+            return self._json(200, result)
         if path == "/api/money":
             day = time.strftime("%Y-%m-%d")
             with _DB_LOCK:
@@ -904,6 +925,28 @@ class Handler(BaseHTTPRequestHandler):
         рейтингом (money.rank_countries), к каждой стране — её оценка для пометки
         в списке. Per-country getcount не гоняем (много стран × троттлинг — долго):
         наличие берём из getcountry, точный count считает уже поток покупки."""
+        selected = (qs.get('provider') or ['proxy6'])[0]
+        if selected == 'proxyline':
+            return Handler._proxyline_market(self, qs)
+        if selected == 'proxywing':
+            prov = APP.providers.get('proxywing')
+            result = {'provider': 'proxywing', 'products': [], 'errors': {},
+                      'budget': proxywing_orders_mod.budget(APP.cfg)}
+            if prov is None:
+                result['error'] = 'Нет ключа ProxyWing'
+                return result
+            for family in ('datacenter', 'isp'):
+                try:
+                    result['products'].extend(prov.catalog(family))
+                except ProviderError as error:
+                    result['errors'][family] = str(error)
+            try:
+                result['balance'] = prov.balance()
+            except ProviderError as error:
+                result['errors']['balance'] = str(error)
+            return result
+        if selected != 'proxy6':
+            return {'error': 'Каталог этого провайдера не поддерживается'}
         prov = APP.providers.get("proxy6")
         lim = money_mod.limits(APP.cfg)
         out = {"limits": lim, "available": [], "price": None}
@@ -911,7 +954,12 @@ class Handler(BaseHTTPRequestHandler):
             out["error"] = "нет ключа PROXY6"
             return out
         version = int(lim["buy_version"])
-        period = int((qs.get("period") or [str(lim["buy_period_days"])])[0])
+        try:
+            period = int((qs.get('period') or [str(lim['buy_period_days'])])[0])
+        except (ValueError, TypeError):
+            return {'error': 'Срок должен быть целым числом дней'}
+        if not 1 <= period <= 365:
+            return {'error': 'Срок должен быть от 1 до 365 дней'}
         out["version"], out["period"] = version, period
         try:
             avail = prov.getcountry(version)
@@ -927,6 +975,34 @@ class Handler(BaseHTTPRequestHandler):
         except ProviderError as e:
             out["price_error"] = str(e)
         return out
+
+    def _proxyline_market(self, qs):
+        """Read stock and a new-order quote; never turn a price request into a charge."""
+        from providers.proxyline import PERIODS
+        result = {'provider': 'proxyline', 'countries': [], 'periods': list(PERIODS),
+                  'currency': 'USD', 'money_supported': False,
+                  'notice': 'Покупка и продление — в кабинете ProxyLine. Здесь только наличие и цена нового заказа.'}
+        provider = APP.providers.get('proxyline')
+        if provider is None:
+            return dict(result, error='Нет ключа ProxyLine')
+        try:
+            if (qs.get('country') or [''])[0]:
+                cc = (qs.get('country') or [''])[0]
+                if country_mod.is_blocked(cc, APP.cfg):
+                    raise ProviderError('Эта страна запрещена настройками узла')
+                kind = (qs.get('type') or ['dedicated'])[0]
+                version = int((qs.get('version') or ['4'])[0])
+                quantity = int((qs.get('quantity') or ['1'])[0])
+                period = int((qs.get('period') or ['30'])[0])
+                result['stock'] = provider.stock(cc, kind, version)
+                result['quote'] = provider.quote(cc, kind, version, quantity, period)
+            else:
+                result['countries'] = [c for c in provider.countries()
+                                       if not country_mod.is_blocked(c['code'], APP.cfg)]
+                result['balance'] = provider.balance()
+        except (ProviderError, ValueError, TypeError) as error:
+            result['error'] = str(error) if isinstance(error, ProviderError) else 'Некорректные параметры каталога'
+        return result
 
     # ------------------------------------------------ POST
     def do_POST(self):
@@ -980,6 +1056,45 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": "%s: %s" % (type(e).__name__, e)})
 
     def _api_post(self, path):
+        if path.startswith('/api/proxywing/'):
+            body = Handler._json_object_body(self)
+            try:
+                if path == '/api/proxywing/budget':
+                    with _CONFIG_LOCK, _DB_LOCK:
+                        config_store.save_proxywing_budget(APP.cfg, body)
+                        APP.pool.log_event('proxywing-budget', actor='user', result='ok',
+                                           src_ip=self._client_ip(), detail='USD limits updated')
+                    return self._json(200, {'ok': True, 'budget': proxywing_orders_mod.budget(APP.cfg)})
+                if path != '/api/proxywing/spend':
+                    return self._json(404, {'error': 'Нет такого метода ProxyWing'})
+                prov = APP.providers.get('proxywing')
+                if prov is None:
+                    return self._json(400, {'error': 'Нет ключа ProxyWing'})
+                with _DB_LOCK:
+                    result = proxywing_orders_mod.execute(APP.pool, prov, APP.cfg, body)
+                warning = result.get('warning') or ''
+                try:
+                    # Import only the paid order; new channels await owner selection.
+                    imported = []
+                    family = result['family']
+                    prefix = '%s|%s|' % (family, result['order_id'])
+                    for proxy in prov.list():
+                        if proxy['ext_id'].startswith(prefix):
+                            with _DB_LOCK:
+                                uid = 'proxywing:' + proxy['ext_id']
+                                APP.pool.upsert_proxy(proxy, role=None if APP.pool.get(uid) else 'off')
+                            imported.append(uid)
+                    result['uids'] = imported
+                except (ProviderError, OSError):
+                    warning = (warning + '; ' if warning else '') + 'Оплата подтверждена; обнови пул для загрузки прокси'
+                return self._json(200, dict(result, warning=warning))
+            except money_mod.SpendDenied as error:
+                with _DB_LOCK:
+                    try:
+                        bound = money_mod.bound_spend_request(APP.pool, body.get('request_id'))
+                    except money_mod.SpendDenied:
+                        bound = None
+                return self._json(409, {'error': str(error), 'replace_request': bool(error.replace_request or not bound)})
         if path == "/api/pool/refresh":
             cur = APP.current_host()
             with _DB_LOCK:
@@ -1590,10 +1705,10 @@ class Handler(BaseHTTPRequestHandler):
         if bound_request and not country:
             country = str(bound_request.get("country") or "").lower()
         try:
-            period = int(body.get("period") if body.get("period") is not None
-                         else bound_request.get("period") or lim["buy_period_days"])
-        except (TypeError, ValueError):
-            return self._json(400, {"error": "period должен быть числом"})
+            period = money_mod.whole_number(body.get("period") if body.get("period") is not None
+                         else bound_request.get("period") or lim["buy_period_days"], 'period')
+        except money_mod.SpendDenied:
+            return self._json(400, {"error": "period должен быть положительным целым числом"})
         version = int(bound_request.get("version") or lim["buy_version"])
 
         # A stored result is immutable: replay it before current provider,
@@ -1712,8 +1827,8 @@ class Handler(BaseHTTPRequestHandler):
         if not request_id:
             return self._json(400, {"error": "нужно поле request_id для безопасного повтора"})
         try:
-            days = int(body.get("days"))
-        except (TypeError, ValueError):
+            days = money_mod.whole_number(body.get("days"), 'days')
+        except money_mod.SpendDenied:
             return self._json(400, {"error": "нужно поле days (целое)"})
         try:
             with _DB_LOCK:

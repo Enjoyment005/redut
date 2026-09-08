@@ -365,6 +365,18 @@ def normalize(raw, defaults=None, source=""):
         money["delete_enabled"] = False
     cfg["money"] = money
 
+    from proxywing_orders import BUDGET_DEFAULTS
+    pw = _mapping(cfg.get('proxywing_money', BUDGET_DEFAULTS), issues, 'proxywing_money')
+    pw_start = len(issues)
+    pw['enabled'] = _bool(pw.get('enabled', False), False, issues,
+                          'proxywing_money.enabled', dangerous=True)
+    for key in ('max_price_per_buy', 'max_spend_per_day', 'min_balance_reserve'):
+        pw[key] = _number(pw.get(key, 0), 0, issues, 'proxywing_money.' + key,
+                          0, 1e9, dangerous=True)
+    if len(issues) > pw_start or safe_mode:
+        pw['enabled'] = False
+    cfg['proxywing_money'] = pw
+
     cfg["has_dnsmasq"] = _bool(cfg.get("has_dnsmasq", defaults.get("has_dnsmasq", False)),
                                 bool(defaults.get("has_dnsmasq", False)), issues,
                                 "has_dnsmasq")
@@ -444,7 +456,10 @@ def normalize(raw, defaults=None, source=""):
         "canary_peer_ipv4": "",
         "canary_qname_suffix": "", "canary_expected_ipv4": "",
         "readiness_not_after": "", "profile_classes_ready": [],
-        "request_timeout_seconds": 3.0, "activation_deadline_seconds": 30,
+        "runner_contract_version": 3, "semantic_sentinels": [],
+        "minimum_dwell_seconds": 300, "client_check_seconds": 60,
+        "client_failures": 2, "unknown_alert_seconds": 900,
+        "request_timeout_seconds": 2.0, "activation_deadline_seconds": 30,
         "active_check_seconds": 5, "active_failures": 3,
         "path_evidence_ttl_seconds": 300,
         "return_checks": 3, "return_interval_seconds": 60,
@@ -540,6 +555,16 @@ def normalize(raw, defaults=None, source=""):
     dns["canary_runner_sha256"] = (runner_sha
                                     if re.fullmatch(r"[0-9a-f]{64}", runner_sha) else "")
     dns["readiness_not_after"] = str(dns.get("readiness_not_after") or "").strip()[:40]
+    version = dns.get('runner_contract_version', 3)
+    dns['runner_contract_version'] = version if type(version) is int and version in (3, 4) else 3
+    sentinels = dns.get('semantic_sentinels', [])
+    if (not isinstance(sentinels, list) or len(sentinels) > 2 or any(
+            not isinstance(name, str) or len(name) > 253 or not re.fullmatch(
+                r'(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}', name)
+            for name in sentinels)):
+        _issue(issues, 'dns_rescue.semantic_sentinels', 'нужны утвержденные стабильные DNS имена', 'empty')
+        sentinels = []
+    dns['semantic_sentinels'] = sorted(set(sentinels))
     profiles = dns.get("profile_classes_ready", [])
     if not isinstance(profiles, list):
         _issue(issues, "dns_rescue.profile_classes_ready", "ожидался список", "empty")
@@ -548,15 +573,19 @@ def normalize(raw, defaults=None, source=""):
                                              if str(x).strip().lower() in
                                              ("wg-ip", "external-ip")})
     numeric = {
+        'minimum_dwell_seconds': (300, 3600, True),
+        'client_check_seconds': (60, 60, True),
+        'client_failures': (2, 2, True),
+        'unknown_alert_seconds': (900, 900, True),
         "listen_port": (1024, 65535, True),
         "preflight_port": (1024, 65535, True),
-        "request_timeout_seconds": (0.2, 10.0, False),
+        "request_timeout_seconds": (0.2, 2.0, False),
         "activation_deadline_seconds": (5, 30, True),
-        "active_check_seconds": (2, 60, True),
-        "active_failures": (1, 10, True),
+        "active_check_seconds": (5, 5, True),
+        "active_failures": (3, 3, True),
         "path_evidence_ttl_seconds": (30, 3600, True),
-        "return_checks": (2, 10, True),
-        "return_interval_seconds": (10, 600, True),
+        "return_checks": (3, 3, True),
+        "return_interval_seconds": (60, 60, True),
         "isolated_ttl_seconds": (60, 3600, True),
         "qps_per_peer": (1, 500, True),
         "qps_burst_per_peer": (1, 1000, True),
@@ -638,7 +667,9 @@ def normalize(raw, defaults=None, source=""):
                             and dns["canary_peer_ipv4"]
                             and dns["canary_qname_suffix"]
                             and dns["canary_expected_ipv4"]
-                            and {"wg-ip", "external-ip"} <= set(dns["profile_classes_ready"]))
+                            and dns['runner_contract_version'] == 4
+                            and dns['semantic_sentinels']
+                            and dns["profile_classes_ready"])
         try:
             deadline = datetime.datetime.fromisoformat(dns["readiness_not_after"].replace("Z", "+00:00"))
             now = datetime.datetime.now(deadline.tzinfo) if deadline.tzinfo else datetime.datetime.now()

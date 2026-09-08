@@ -433,6 +433,9 @@ def _finalize_buy(pool, op, proxies, response, *, actor, src_ip, recovered):
 
 
 def _recover_buy(pool, op, provider, *, actor="auto", src_ip=""):
+    if op.get('provider') == 'proxywing':
+        from proxywing_orders import recover
+        return recover(pool, op)
     if not op.get("descr") or op.get("request_invalid"):
         raise SpendDenied("незавершённая покупка повреждена — новая трата заблокирована")
     try:
@@ -491,6 +494,9 @@ def _finalize_prolong(pool, op, response, new_end, *, actor, src_ip, recovered):
 
 
 def _recover_prolong(pool, op, provider, *, actor="auto", src_ip=""):
+    if op.get('provider') == 'proxywing':
+        from proxywing_orders import recover
+        return recover(pool, op)
     request = op.get("request") or {}
     # Neither supported provider accepts our durable request id. A later
     # date_end increase therefore cannot be attributed to this exact request:
@@ -686,6 +692,19 @@ def resume_spend_operation(pool, operation_id, *, acknowledge=False):
 
 
 # --------------------------------------------------------------------- покупка
+def whole_number(value, label):
+    """Validate caller numbers before conversion, so true and 30.5 cannot become days."""
+    if type(value) is int:
+        number = value
+    elif isinstance(value, str) and re.fullmatch(r'[0-9]{1,8}', value.strip()):
+        number = int(value)
+    else:
+        raise SpendDenied('%s должно быть положительным целым числом' % label)
+    if number < 1:
+        raise SpendDenied('%s должно быть положительным целым числом' % label)
+    return number
+
+
 def preflight_buy(pool, provider, cfg, *, country, period=None, count=1, version=None,
                   auto=True):
     """Все гейты §6.2 ДО траты. -> dict(price, currency, balance_before, period,
@@ -696,9 +715,9 @@ def preflight_buy(pool, provider, cfg, *, country, period=None, count=1, version
     пропускаем всё, кроме чёрного списка, но причину пишем в журнал вызывающего.
     """
     lim = limits(cfg)
-    period = int(period or lim["buy_period_days"])
-    version = int(version if version is not None else lim["buy_version"])
-    count = int(count)
+    period = whole_number(period if period is not None else lim['buy_period_days'], 'period')
+    version = whole_number(version if version is not None else lim['buy_version'], 'version')
+    count = whole_number(count, 'count')
     currency = _currency(lim["currency"])
     country = (country or "").strip().lower()
 
@@ -780,10 +799,10 @@ def _plan_and_buy_locked(pool, provider, cfg, *, country, period=None, count=1,
     pname = str(getattr(provider, "name", "") or "")
     lim = limits(cfg)
     try:
-        expected = {"count": int(count),
-                    "period": int(period or lim["buy_period_days"]),
+        expected = {"count": whole_number(count, 'count'),
+                    "period": whole_number(period if period is not None else lim['buy_period_days'], 'period'),
                     "country": str(country or "").strip().lower(),
-                    "version": int(version or lim["buy_version"])}
+                    "version": whole_number(version if version is not None else lim['buy_version'], 'version')}
     except (TypeError, ValueError, OverflowError) as error:
         raise SpendDenied("параметры покупки некорректны") from error
     rid, request_key = _request_identity(request_id)
@@ -886,7 +905,7 @@ def prolong_with_limits(pool, provider, cfg, *, row, days, actor="auto", src_ip=
 def _prolong_with_limits_locked(pool, provider, cfg, *, row, days,
                                 actor="auto", src_ip="", request_id=None):
     lim = limits(cfg)
-    days = int(days)
+    days = whole_number(days, 'days')
     if not (1 <= days <= 365):
         raise SpendDenied("period=%d вне 1..365 дней" % days)
 
@@ -929,8 +948,22 @@ def _prolong_with_limits_locked(pool, provider, cfg, *, row, days,
     if currency is None:
         raise pre_submit_denial(
             "валюта денежного лимита некорректна — продление отменено")
+    # A cached expiry may predate another node's/manual extension. Comparing a
+    # failed request against it would incorrectly attribute that older extension
+    # to this attempt and commit a fictitious charge. Take a live baseline.
+    remote_before = _find_remote_proxy(provider, ext_id)
+    date_before = (remote_before or {}).get("date_end")
+    if _date_value(date_before) is None:
+        raise pre_submit_denial(
+            "не удалось зафиксировать date_end до продления — трата отменена")
+
     if pname == "proxy6":
-        pr = provider.getprice(1, days, int(lim["buy_version"]))
+        ip_version = (remote_before or {}).get("ip_version")
+        kind = (remote_before or {}).get("kind")
+        if ip_version not in (4, 6) or kind not in ("dedicated", "shared") or (ip_version == 6 and kind == "shared"):
+            raise pre_submit_denial("не удалось подтвердить тип прокси для цены продления")
+        version = 6 if ip_version == 6 else 3 if kind == "shared" else 4
+        pr = provider.getprice(1, days, version)
         price = _num(pr.get("price"))
         bal = _num(pr.get("balance"))
         quoted_currency = _currency(pr.get("currency"))
@@ -954,14 +987,6 @@ def _prolong_with_limits_locked(pool, provider, cfg, *, row, days,
         if (bal - price) < lim["min_balance_reserve"]:
             raise pre_submit_denial(
                 "продление опустит баланс ниже неснижаемого остатка (§6.2)")
-    # A cached expiry may predate another node's/manual extension. Comparing a
-    # failed request against it would incorrectly attribute that older extension
-    # to this attempt and commit a fictitious charge. Take a live baseline.
-    remote_before = _find_remote_proxy(provider, ext_id)
-    date_before = (remote_before or {}).get("date_end")
-    if _date_value(date_before) is None:
-        raise pre_submit_denial(
-            "не удалось зафиксировать date_end до продления — трата отменена")
 
     request = dict(expected, date_before=str(date_before).replace(" ", "T"))
     if existing is not None:

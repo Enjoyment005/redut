@@ -50,6 +50,8 @@ def normalized(mode="disabled", owner=False, automatic=False):
         })
     if automatic:
         rescue.update({
+            "runner_contract_version": 4,
+            "semantic_sentinels": ['sentinel.example'],
             "canary_evidence_id": "test-canary-2026-09",
             "rollback_drill_passed": True,
             "firewall_drill_evidence_id": "test-firewall-2026-09",
@@ -411,6 +413,27 @@ class TestCoordinator(unittest.TestCase):
             json.dump({"outbounds": [{"tag": "socks-out", "type": "socks",
                                       "server": "192.0.2.50", "server_port": 1080}]}, handle)
         self.pool = pool_mod.Pool(self.cfg["db"], server="test")
+        # Physical inventory and runner are external boundaries in coordinator unit tests.
+        context = {'identity': 'scope-test', 'digest': 'profiles-test',
+                   'profiles': ['external-ip', 'wg-ip'], 'canary_identity': 'scope-test'}
+        patches = [
+            mock.patch.object(dns_rescue, '_proof_context', return_value=context),
+            mock.patch.object(dns_runtime, 'profile_inventory', return_value=context),
+            mock.patch.object(dns_runtime, 'service_state', return_value='active'),
+            mock.patch.object(dns_runtime, 'deactivate_redirect', return_value=True),
+            mock.patch.object(dns_runtime, '_drain_dns_conntrack'),
+            mock.patch.object(dns_runtime, 'client_primary_detached_result',
+                              return_value={'status': 'PASS', 'ok': True}),
+            mock.patch.object(dns_runtime, 'causal_round', return_value={
+                'status': 'PASS', 'profiles': {p: {'controls': True, 'candidate': True,
+                    'failures': {'transport': 'INTERFERENCE_SUSPECTED'}}
+                    for p in context['profiles']}}),
+            mock.patch.object(dns_rescue.time, 'sleep'),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
 
     def tearDown(self):
         self.pool.close()
@@ -643,7 +666,9 @@ class TestCoordinator(unittest.TestCase):
                                          profile_class="wg-ip", _locked=True)
         self.assertFalse(result["ok"])
         self.assertEqual(result["state"]["phase"], "idle")
-        self.assertEqual(self.pool.dns_operations()[0]["phase"], "rolled_back")
+        activation = next(op for op in self.pool.dns_operations()
+                          if op['kind'].startswith('activate-'))
+        self.assertEqual(activation['phase'], 'rolled_back')
 
     def test_automatic_gate_requires_real_external_canary_runner(self):
         self.cfg = normalized("automatic_last_resort", True, True)
@@ -711,9 +736,9 @@ class TestCoordinator(unittest.TestCase):
              mock.patch.object(dns_rescue, "_boot_id", return_value="boot-test"), \
              mock.patch.multiple(dns_rescue.dns_runtime, **runtime_mocks), \
              mock.patch.object(dns_rescue, "probe_backend", return_value=good):
-            result = dns_rescue.activate(
+            result = dns_rescue._activate_locked(
                 self.cfg, self.pool, automatic=True, incident_id="dns-order",
-                _locked=True)
+                proof_context=dns_rescue._proof_context(self.cfg))
         self.assertTrue(result["ok"], result)
         self.assertLess(order.index("acl:peer:10.77.0.9"), order.index("preflight"))
         self.assertLess(order.index("redirect:peer:10.77.0.9"), order.index("preflight"))
@@ -740,15 +765,15 @@ class TestCoordinator(unittest.TestCase):
              mock.patch.object(dns_rescue.dns_runtime, "peer_canary_runner_ready",
                                return_value=True), \
              mock.patch.object(dns_rescue.dns_runtime,
-                               "client_primary_failure_proven",
-                               return_value=False) as client:
+                               "causal_round",
+                               return_value={"status": "UNKNOWN"}) as client:
             first = dns_rescue.automatic_tick(
                 self.cfg, self.pool, "EMERGENCY", _locked=True)
             second = dns_rescue.automatic_tick(
                 self.cfg, self.pool, "EMERGENCY", _locked=True)
-        self.assertEqual(first["action"], "client-primary-unproven")
+        self.assertEqual(first["action"], "causal-unproven")
         self.assertEqual(second["action"], "ineligible")
-        self.assertEqual(client.call_count, 1)
+        self.assertEqual(client.call_count, 3)
         self.assertTrue(self.pool.dns_state()["attempt_used"])
 
     def test_primary_dns_working_probe_is_reserved_once_per_incident(self):
@@ -765,15 +790,16 @@ class TestCoordinator(unittest.TestCase):
              mock.patch.object(dns_rescue.dns_runtime,
                                "client_primary_failure_proven",
                                return_value=True), \
-             mock.patch.object(dns_rescue, "_primary_dns_failure",
-                               return_value=(False, [])) as primary:
+             mock.patch.object(dns_runtime, "causal_round", return_value={
+                 'status': 'PASS', 'profiles': {p: {'controls': True, 'candidate': True,
+                     'failures': {}} for p in ('wg-ip', 'external-ip')}}) as primary:
             first = dns_rescue.automatic_tick(
                 self.cfg, self.pool, "EMERGENCY", _locked=True)
             second = dns_rescue.automatic_tick(
                 self.cfg, self.pool, "EMERGENCY", _locked=True)
-        self.assertEqual(first["action"], "primary-dns-working")
+        self.assertEqual(first["action"], "causal-unproven")
         self.assertEqual(second["action"], "ineligible")
-        self.assertEqual(primary.call_count, 1)
+        self.assertEqual(primary.call_count, 3)
 
     def test_recovering_state_never_starts_health_or_failover(self):
         self.pool.set_dns_state(
@@ -891,7 +917,8 @@ class TestCoordinator(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 dns_rescue._deactivate_locked(
                     self.cfg, self.pool, "auto", "crash-with-unknown-scope")
-        operation = self.pool.unfinished_dns_operations()[0]
+        operation = next(op for op in self.pool.unfinished_dns_operations()
+                         if op['kind'].startswith('deactivate-'))
         self.assertEqual(operation["scope"], "all")
         self.assertIsNone(json.loads(operation["snapshot_json"])[
             "authorized_guard_scope"])
@@ -958,7 +985,7 @@ class TestCoordinator(unittest.TestCase):
         activate.assert_called_once()
         self.assertFalse(self.pool.unfinished_dns_operations())
 
-    def test_unknown_service_state_counts_failure_without_immediate_failover(self):
+    def test_unknown_service_state_preserves_failure_counter(self):
         self.pool.set_dns_state(
             phase="active_isolated", incident_id="manual-test",
             active_scope="peer:10.77.0.9", active_slot="cloudflare-proxy",
@@ -977,8 +1004,8 @@ class TestCoordinator(unittest.TestCase):
              mock.patch.object(dns_rescue, "_failover_locked") as failover:
             result = dns_rescue.automatic_tick(
                 self.cfg, self.pool, "OK", _locked=True)
-        self.assertEqual(result["action"], "active")
-        self.assertEqual(result["state"]["active_failures"], 1)
+        self.assertEqual(result["action"], "service-inspection-unknown")
+        self.assertEqual(result["state"]["active_failures"], 0)
         probe.assert_not_called()
         failover.assert_not_called()
 
@@ -1350,7 +1377,7 @@ class TestCoordinator(unittest.TestCase):
              mock.patch.object(dns_rescue, "_deactivate_locked") as deactivate:
             result = dns_rescue.automatic_tick(
                 self.cfg, self.pool, "OK", _locked=True)
-        self.assertEqual(result["action"], "active-evidence-expired")
+        self.assertEqual(result["action"], "candidate-evidence-inspection-unknown")
         deactivate.assert_not_called()
 
     def test_expired_candidate_with_stale_runtime_proof_is_detached(self):
@@ -1428,7 +1455,9 @@ class TestCoordinator(unittest.TestCase):
             expires_monotonic=999999999.0, boot_id="boot-test",
             scope_identity="scope-test", client_path_last_ok=dns_rescue._now(),
             active_last_check="2000-01-01 00:00:00")
-        with mock.patch.object(dns_rescue.dns_runtime, "service_active", return_value=True), \
+        with mock.patch.object(dns_runtime, 'client_roundtrip_result',
+                               return_value={'status': 'PASS', 'ok': True}), \
+             mock.patch.object(dns_rescue.dns_runtime, "service_active", return_value=True), \
              mock.patch.object(dns_rescue, "_boot_id", return_value="boot-test"), \
              mock.patch.object(dns_rescue.dns_runtime,
                                "wireguard_scope_identity_state",
@@ -1452,7 +1481,9 @@ class TestCoordinator(unittest.TestCase):
             active_last_check="2000-01-01 00:00:00", scope_identity="scope-test",
             client_path_last_ok=dns_rescue._now(), boot_id="boot-test",
             return_last_check=dns_rescue._now())
-        with mock.patch.object(dns_rescue.dns_runtime, "service_active", return_value=True), \
+        with mock.patch.object(dns_runtime, 'client_roundtrip_result',
+                               return_value={'status': 'PASS', 'ok': True}), \
+             mock.patch.object(dns_rescue.dns_runtime, "service_active", return_value=True), \
              mock.patch.object(dns_rescue, "_boot_id", return_value="boot-test"), \
              mock.patch.object(dns_rescue.dns_runtime,
                                "wireguard_scope_identity_state",
@@ -1477,7 +1508,9 @@ class TestCoordinator(unittest.TestCase):
             active_slot="cloudflare-proxy", active_kind="node_wide_automatic",
             active_last_check="2000-01-01 00:00:00", scope_identity="scope-test",
             client_path_last_ok=dns_rescue._now(), boot_id="boot-test")
-        with mock.patch.object(dns_rescue.dns_runtime, "service_active", return_value=True), \
+        with mock.patch.object(dns_runtime, 'client_roundtrip_result',
+                               return_value={'status': 'PASS', 'ok': True}), \
+             mock.patch.object(dns_rescue.dns_runtime, "service_active", return_value=True), \
              mock.patch.object(dns_rescue, "_boot_id", return_value="boot-test"), \
              mock.patch.object(dns_rescue.dns_runtime,
                                "wireguard_scope_identity_state",
@@ -1534,7 +1567,7 @@ class TestCoordinator(unittest.TestCase):
              mock.patch.object(dns_rescue.dns_runtime, "firewall_attached", return_value=False), \
              mock.patch.object(dns_rescue, "_deactivate_locked", side_effect=fake_deactivate):
             prepared = dns_rescue.prepare_for_emergency_exit(
-                self.cfg, self.pool, _locked=True)
+                self.cfg, self.pool, actor="user", _locked=True)
         self.assertTrue(prepared["resume_pending"])
         self.assertTrue(self.pool.get_setting("dns_exit_resume"))
 
@@ -1551,7 +1584,7 @@ class TestCoordinator(unittest.TestCase):
                                side_effect=self._resume_success(
                                    "dns_exit_resume", resumed_state)) as activate:
             result = dns_rescue.resume_after_emergency_exit_failure(
-                self.cfg, self.pool, _locked=True)
+                self.cfg, self.pool, actor="user", _locked=True)
         self.assertTrue(result["ok"])
         self.assertIsNone(self.pool.get_setting("dns_exit_resume"))
         self.assertTrue(activate.call_args.kwargs["idempotency_key"].startswith(
@@ -1642,7 +1675,7 @@ class TestCoordinator(unittest.TestCase):
              mock.patch.object(dns_rescue, "_deactivate_locked",
                                return_value=failed):
             result = dns_rescue.prepare_for_emergency_exit(
-                self.cfg, self.pool, _locked=True)
+                self.cfg, self.pool, actor="user", _locked=True)
         self.assertFalse(result["ok"])
         self.assertTrue(result["resume_pending"])
         resume = json.loads(self.pool.get_setting("dns_exit_resume"))
@@ -1876,7 +1909,7 @@ class TestCoordinator(unittest.TestCase):
                                return_value="unknown"), \
              mock.patch.object(dns_rescue, "_deactivate_locked") as deactivate:
             result = dns_rescue.prepare_for_emergency_exit(
-                self.cfg, self.pool, _locked=True)
+                self.cfg, self.pool, actor="user", _locked=True)
         self.assertEqual(result["action"], "dns-exit-proof-unknown")
         self.assertIsNone(self.pool.get_setting("dns_exit_resume"))
         deactivate.assert_not_called()
@@ -1951,10 +1984,10 @@ class TestCoordinator(unittest.TestCase):
                 self.cfg, self.pool, state, chosen, "all-present",
                 time.monotonic() + 30, print)
         self.assertEqual(
-            result["action"], "successor-rejected-current-preserved")
+            result["action"], "candidate-path-inspection-unknown")
         old_probe.assert_not_called()
 
-    def test_expired_service_unknown_threshold_detaches_before_successor(self):
+    def test_expired_service_unknown_keeps_listener(self):
         self.cfg = normalized("automatic_last_resort", True, True)
         self.cfg["dns_rescue"]["candidates"][0]["not_after"] = \
             "2000-01-01T00:00:00Z"
@@ -1980,8 +2013,7 @@ class TestCoordinator(unittest.TestCase):
                                return_value=expected) as failover:
             result = dns_rescue.automatic_tick(
                 self.cfg, self.pool, "EMERGENCY", _locked=True)
-        self.assertEqual(result["action"], "backend-failover")
-        self.assertFalse(failover.call_args.kwargs["current_runtime_proven"])
+        self.assertEqual(result["action"], "candidate-evidence-inspection-unknown")
 
     def test_nodewide_route_drift_is_repaired_before_destructive_tick(self):
         self.cfg = normalized("automatic_last_resort", True, True)
@@ -2303,25 +2335,16 @@ class TestCoordinator(unittest.TestCase):
         self.assertEqual(state["incident_id"], "dns-boot")
         self.assertIsNone(self.pool.get_setting("dns_exit_resume"))
 
-    def test_nodewide_unknown_threshold_publishes_exact_resume_before_teardown(self):
-        self.cfg = normalized("automatic_last_resort", True, True)
-        state = self._seed_nodewide_committed(boot_id="boot-test")
-        state = self.pool.set_dns_state(
-            active_failures=self.cfg["dns_rescue"]["active_failures"] - 1)
-
-        def stop(*_args):
-            descriptor = json.loads(self.pool.get_setting("dns_exit_resume"))
-            self.assertEqual(descriptor["scope_identity"], "scope-test")
-            self.assertEqual(descriptor["boot_id"], "boot-test")
-            return {"ok": True, "action": "deactivated",
-                    "state": self.pool.dns_state()}
-
-        with mock.patch.object(dns_rescue, "_deactivate_locked",
-                               side_effect=stop):
+    def test_nodewide_unknown_preserves_generation_without_resume_or_teardown(self):
+        state = self._seed_nodewide_committed(boot_id='boot-test')
+        state = self.pool.set_dns_state(active_failures=2)
+        with mock.patch.object(dns_rescue, '_deactivate_locked') as detach:
             result = dns_rescue._hold_active_inspection_unknown(
-                self.cfg, self.pool, state, "wireguard-scope")
-        self.assertTrue(result["resume_pending"])
-        self.assertIsNotNone(self.pool.get_setting("dns_exit_resume"))
+                self.cfg, self.pool, state, 'wireguard-scope')
+        self.assertEqual(result['state']['active_failures'], 2)
+        self.assertEqual(result['state']['generation'], state['generation'])
+        self.assertIsNone(self.pool.get_setting('dns_exit_resume'))
+        detach.assert_not_called()
 
     def test_corrupt_active_state_matrix_is_never_effective(self):
         corrupt = dict(

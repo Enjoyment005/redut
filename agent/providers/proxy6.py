@@ -27,6 +27,7 @@ P6_HOSTS = ("proxy6.net", "px6.link")
 # Границы валидации ДО вызова API (§15) — санитарные, не политика трат (та в money.py).
 MAX_BUY_COUNT = 100     # покупаем поштучно; всё крупнее — почти наверняка баг
 MAX_PERIOD_DAYS = 365
+MAX_LIST_PAGES = 50
 DESCR_MAX = 50          # ограничение API PROXY6 на длину descr
 _RE_DESCR = re.compile(r"^[A-Za-z0-9._:-]{1,%d}$" % DESCR_MAX)
 _RE_ISO2 = re.compile(r"^[a-z]{2}$")
@@ -71,6 +72,8 @@ def norm_proxy6(it):
     version = str(it.get("version", ""))
     if version == "5":
         return None
+    if version not in ('3', '4', '6'):
+        raise ProviderError('PROXY6: API не подтвердил версию прокси')
     try:
         port = int(it.get("port") or 0) or None
     except (TypeError, ValueError):
@@ -109,9 +112,12 @@ def norm_bought(it, version, country):
 
 def _as_int(value, what):
     """int в разумных границах или ProviderError (валидация ДО API, §15)."""
+    if isinstance(value, bool) or not (isinstance(value, int) or
+            isinstance(value, str) and re.fullmatch(r'[0-9]+', value.strip())):
+        raise ProviderError('PROXY6: %s должно быть целым числом' % what)
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ProviderError("PROXY6: %s=%r не целое число" % (what, value)) from None
 
 
@@ -212,6 +218,8 @@ class Proxy6(Provider):
                         else ProviderErrorKind.UNKNOWN)
                 raise ProviderError(self._mask(p6_error_text(data)), code=code,
                                     kind=kind, definitive=True)
+            if not isinstance(data, dict) or data.get('status') != 'yes':
+                raise ProviderError('PROXY6: API не подтвердил успешный ответ')
             self._good_host = host
             return data or {}
         raise ProviderError(
@@ -224,29 +232,44 @@ class Proxy6(Provider):
             definitive=getattr(last, "definitive", False))
 
     def list(self):
+        return self._proxy_pages({'state': 'active'})
+
+    def _proxy_pages(self, params):
+        """Accept only a complete listing; a partial page must not replace the pool."""
         out = []
-        page = 1
-        while True:
-            r = self._api("getproxy", {"state": "active", "page": page, "limit": 1000})
-            # ВАЖНО: list — ОБЪЕКТ с ключами-id, не массив
-            items = list((r.get("list") or {}).values())
+        seen = set()
+        for page in range(1, MAX_LIST_PAGES + 1):
+            r = self._api('getproxy', dict(params, page=page, limit=1000))
+            raw = r.get('list')
+            if not isinstance(raw, dict) and raw != []:
+                raise ProviderError('PROXY6: неполный список прокси')
+            items = list(raw.values()) if isinstance(raw, dict) else []
+            if type(r.get('list_count')) is not int or r['list_count'] != len(items):
+                raise ProviderError('PROXY6: число прокси не совпадает с ответом')
             for it in items:
+                if not isinstance(it, dict) or not _RE_IDS.fullmatch(str(it.get('id', ''))):
+                    raise ProviderError('PROXY6: некорректный ID в списке прокси')
+                ident = str(it['id'])
+                if ident in seen:
+                    raise ProviderError('PROXY6: API повторил страницу списка')
+                seen.add(ident)
                 n = norm_proxy6(it)
                 if n:
                     out.append(n)
-            if len(items) < 1000 or page > 50:
-                break
-            page += 1
-        return out
+            if len(items) < 1000:
+                return out
+        raise ProviderError('PROXY6: превышен предел страниц; старый пул сохранён')
 
     def balance(self):
         r = self._api("getproxy", {"limit": 1})  # баланс приходит в любом ответе
-        return {"balance": r.get("balance"), "currency": r.get("currency") or "RUB"}
+        return {"balance": r.get("balance"), "currency": r.get("currency")}
 
     def check(self, ext_id):
         """Дешёвая проверка на стороне провайдера: check?ids= -> proxy_status."""
-        r = self._api("check", {"ids": str(ext_id)})
-        return bool(r.get("proxy_status"))
+        r = self._api("check", {"ids": _ids_csv(ext_id)})
+        if type(r.get('proxy_status')) is not bool:
+            raise ProviderError('PROXY6: ответ проверки прокси не подтверждён')
+        return r['proxy_status']
 
     # ------------------------------------------------------------- рынок (без трат)
     def getcountry(self, version=4):
@@ -275,7 +298,7 @@ class Proxy6(Provider):
         r = self._api("getprice", {"count": count, "period": period, "version": version})
         return {"price": r.get("price"), "price_single": r.get("price_single"),
                 "period": r.get("period"), "count": r.get("count"),
-                "balance": r.get("balance"), "currency": r.get("currency") or "RUB"}
+                "balance": r.get("balance"), "currency": r.get("currency")}
 
     # ------------------------------------------------------------- деньги (§6, фаза 2)
     def _check_buy_country(self, country, allow_cc):
@@ -335,7 +358,7 @@ class Proxy6(Provider):
                 "price": r.get("price"), "price_single": r.get("price_single"),
                 "count": r.get("count"), "period": r.get("period"),
                 "country": r.get("country") or country,
-                "balance": r.get("balance"), "currency": r.get("currency") or "RUB"}
+                "balance": r.get("balance"), "currency": r.get("currency")}
 
     def find_by_descr(self, descr, state="all"):
         """getproxy?descr= — восстановление после оборванного buy (§6.2).
@@ -347,8 +370,7 @@ class Proxy6(Provider):
         descr = _validate_descr(descr)
         if not descr:
             raise ProviderError("find_by_descr: пустой descr")
-        r = self._api("getproxy", {"descr": descr, "state": state, "limit": 1000})
-        return [n for n in (norm_proxy6(it) for it in (r.get("list") or {}).values()) if n]
+        return self._proxy_pages({'descr': descr, 'state': state})
 
     def prolong(self, ids, period, on_submit=None):
         """Продление списка прокси на period дней (prolong?ids=&period=).
@@ -365,7 +387,7 @@ class Proxy6(Provider):
         return {"order_id": r.get("order_id"), "price": r.get("price"),
                 "price_single": r.get("price_single"), "count": r.get("count"),
                 "period": r.get("period"), "balance": r.get("balance"),
-                "currency": r.get("currency") or "RUB",
+                "currency": r.get("currency"),
                 "proxies": {str(k): {"date_end": (v or {}).get("date_end")} for k, v in got.items()}}
 
     def delete(self, ids):

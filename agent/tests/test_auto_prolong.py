@@ -34,6 +34,7 @@ class FakeProv:
     def list(self):
         extensions = {str(ext_id): days for ext_id, days in self.calls}
         return [{"provider": self.name, "ext_id": ext_id,
+                 "ip_version": 4, "kind": "dedicated",
                  "date_end": _in(extensions.get(ext_id, 2))}
                 for ext_id in ("1", "2", "7")]
 
@@ -224,7 +225,8 @@ class TestIdempotency(Base):
                 raise AssertionError("provider prolong must not be repeated")
 
             def list(inner_self):
-                return [{"ext_id": "1", "date_end": inner_self.remote_end}]
+                return [{"ext_id": "1", "date_end": inner_self.remote_end,
+                         "ip_version": 4, "kind": "dedicated"}]
 
         self.prov = KillOnce()
         with self.assertRaises(SystemExit):

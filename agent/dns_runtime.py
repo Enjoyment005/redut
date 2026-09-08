@@ -6,6 +6,7 @@ config, state directory and systemd unit.  All kernel changes use owned chains
 and are verified after mutation.
 """
 import copy
+import configparser
 import hashlib
 import ipaddress
 import json
@@ -22,6 +23,7 @@ import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 
 import apply as apply_mod
+import dns_evidence
 
 try:
     import grp
@@ -51,6 +53,7 @@ CONFIG_PATH = "/etc/redut-dns-rescue/config.json"
 UNIT = "redut-dns-rescue.service"
 PREFLIGHT_UNIT = "redut-dns-rescue-preflight.service"
 CANARY_RUNNER = "/usr/local/libexec/redut-dns-canary"
+CLIENTS_DIR = "/etc/wireguard/clients"
 DEFAULT_SINGBOX = "/usr/local/bin/sing-box"
 PREFLIGHT_ROOT = "/run/redut-dns-rescue-controller"
 PREFLIGHT_CONFIG_PATH = PREFLIGHT_ROOT + "/preflight.json"
@@ -1010,7 +1013,8 @@ def listener_guard_effective(cfg, scope="all", deadline_monotonic=None):
         return False
 
 
-def deactivate_redirect(cfg, scope="all", deadline_monotonic=None):
+def deactivate_redirect(cfg, scope="all", deadline_monotonic=None, on_global_drain=None,
+                        on_detach_plan=None):
     """Neutralize NAT and drain old mappings while the listener stays guarded.
 
     Removing a REDIRECT rule does not invalidate conntrack's translation for an
@@ -1018,6 +1022,43 @@ def deactivate_redirect(cfg, scope="all", deadline_monotonic=None):
     after detachment is proven, but before the coordinator stops the listener.
     """
     errors = []
+    removed = set()
+    # Inventory precedes mutation, so inspection UNKNOWN never silently widens drain.
+    for chain, _input_chain in _owned_pairs():
+        references = _references_to_chain('nat', 'PREROUTING', chain, deadline_monotonic)
+        present = _chain_present_strict('nat', chain, deadline_monotonic)
+        if present or references:
+            if chain != SCOPED_CHAIN:
+                removed.add('all')
+            elif present:
+                rc, rules = _cmd([IPTABLES, '-t', 'nat', '-S', chain], deadline_monotonic)
+                if rc != 0:
+                    raise DNSRuntimeError('scoped generation inspection unknown')
+                found = False
+                for line in rules.splitlines():
+                    tokens = shlex.split(line)
+                    if 'REDIRECT' not in tokens:
+                        continue
+                    try:
+                        network = ipaddress.ip_network(tokens[tokens.index('-s') + 1], strict=False)
+                    except (ValueError, IndexError):
+                        removed.add('all')
+                        continue
+                    removed.add('peer:' + str(network.network_address)
+                                if network.version == 4 and network.prefixlen == 32 else 'all')
+                    found = True
+                if not found:
+                    removed.add(scope)
+            else:
+                removed.add(scope)
+    stale_global = scope != 'all' and 'all' in removed
+    drain_scopes = ['all'] if 'all' in removed or scope == 'all' else sorted(removed | {scope})
+    if on_detach_plan is not None:
+        on_detach_plan(drain_scopes)
+    if stale_global:
+        if on_global_drain is None:
+            raise DNSRuntimeError('stale global ownership requires journaled global drain')
+        on_global_drain()
     try:
         _scrub_primary_test_bypass(cfg, deadline_monotonic)
     except DNSRuntimeError as error:
@@ -1035,11 +1076,10 @@ def deactivate_redirect(cfg, scope="all", deadline_monotonic=None):
     if not _redirect_detached_strict(cfg, deadline_monotonic):
         raise DNSRuntimeError("DNS redirect detachment not proven: "
                               + ("; ".join(errors)[:500] or "NAT artifacts remain"))
-    # Cleanup removes every owned NAT generation, including stale broader
-    # chains. Drain the full WG subnet so no pre-existing translation can keep
-    # sending a different peer to the listener after it is stopped.
-    _drain_dns_conntrack(cfg, "all", deadline_monotonic)
-    return True
+    for drain_scope in drain_scopes:
+        _drain_dns_conntrack(cfg, drain_scope, deadline_monotonic)
+    return {'detached': True, 'removed_scopes': sorted(removed),
+            'drained_scopes': drain_scopes, 'stale_global': stale_global}
 
 
 def remove_listener_acl(cfg, scope="all", deadline_monotonic=None):
@@ -1400,6 +1440,152 @@ def peer_canary_runner_ready(cfg):
         return False
 
 
+def profile_inventory(cfg, deadline_monotonic=None):
+    """Bind present profile classes to every live /32 peer's saved configuration.
+
+    Missing, duplicate or unmanaged DNS profiles are UNKNOWN. Private keys are
+    never included in the digest or returned to the coordinator.
+    """
+    try:
+        identity = wireguard_scope_identity(cfg, 'all', deadline_monotonic)
+        rc, output = _cmd([WG, 'show', 'wg0', 'allowed-ips'], deadline_monotonic)
+        if not identity or rc != 0 or os.path.lexists(CLIENT_OPERATION_MARK):
+            return None
+        live = set()
+        for line in output.splitlines():
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                return None
+            for address in parts[1].split(','):
+                network = ipaddress.ip_network(address.strip(), strict=False)
+                if network.version != 4 or network.prefixlen != 32:
+                    return None
+                live.add(str(network.network_address))
+        saved = {}
+        for entry in os.scandir(CLIENTS_DIR):
+            if not entry.name.endswith('.conf'):
+                continue
+            info = entry.stat(follow_symlinks=False)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
+                    or info.st_mode & 0o022 or info.st_size > 65536):
+                return None
+            parser = configparser.ConfigParser(interpolation=None, strict=True)
+            with open(entry.path, encoding='utf-8') as handle:
+                parser.read_file(handle)
+            address = str(ipaddress.ip_interface(parser['Interface']['Address']).ip)
+            if address not in live:
+                continue
+            dns = tuple(str(ipaddress.IPv4Address(x.strip()))
+                        for x in parser['Interface']['DNS'].split(','))
+            if not dns or address in saved:
+                return None
+            profile = ('wg-ip' if dns == (wireguard_ip(cfg),) else
+                       'external-ip' if all(x != wireguard_ip(cfg) for x in dns) else None)
+            if profile is None:
+                return None
+            saved[address] = (profile, dns)
+        if not live or set(saved) != live:
+            return None
+        payload = json.dumps([identity, sorted(saved.items())], sort_keys=True)
+        return {'identity': identity, 'digest': hashlib.sha256(payload.encode()).hexdigest(),
+                'profiles': sorted({p[0] for p in saved.values()})}
+    except (DNSRuntimeError, OSError, ValueError, KeyError, configparser.Error):
+        return None
+
+
+def route_generation(cfg, deadline_monotonic=None):
+    """Fingerprint routing policy separately from WG membership and owned NAT."""
+    try:
+        outputs = []
+        for command in ([IP, '-4', 'route', 'show', 'table', 'middleman'],
+                        [IP, '-4', 'rule', 'show']):
+            rc, output = _cmd(command, deadline_monotonic)
+            if rc != 0 or not output.strip():
+                return None
+            outputs.append('\n'.join(sorted(output.splitlines())))
+        return hashlib.sha256('\n'.join(outputs).encode()).hexdigest()
+    except DNSRuntimeError:
+        return None
+
+
+def _v4_probe(cfg, mode, scope, profiles, timeout, deadline_monotonic=None,
+              candidate=None, challenge=None):
+    """Run a single bounded round; all paths use the same one-shot QNAME."""
+    if not profiles or not peer_canary_runner_ready(cfg):
+        return dns_evidence.outcome()
+    try:
+        challenge = challenge or uuid.uuid4().hex
+        command, generation, qname, expected = _runner_command(
+            cfg, mode, profiles, challenge, scope, deadline_monotonic)
+        block = cfg.get('dns_rescue') or {}
+        require_v4 = mode == 'causal-round' or block.get('runner_contract_version', 3) >= 4
+        if require_v4 and '--contract-version' not in command:
+            command += ['--contract-version', '4', '--operation-timeout-ms', '2000']
+        if mode in ('rescue-roundtrip', 'candidate-preflight'):
+            command += ['--listen', block.get('listen_ip') or wireguard_ip(cfg),
+                        '--port', str(block['listen_port'])]
+        else:
+            target = str(ipaddress.IPv4Address(cfg.get('dns') or '1.1.1.1'))
+            command += ['--dns', target, '--port', '53']
+        if candidate is not None:
+            command += ['--candidate-id', candidate['id'],
+                        '--candidate-operator', candidate['operator'],
+                        '--candidate-transport', candidate['transport'],
+                        '--sentinels', ','.join(block.get('semantic_sentinels', []))]
+        duration = min(float(timeout), _remaining_timeout(deadline_monotonic, float(timeout)))
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=duration,
+                              env={'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+                                   'LANG': 'C', 'LC_ALL': 'C'})
+        result = dns_evidence.parse_report(
+            proc, challenge=challenge, generation=generation, qname=qname,
+            expected_ipv4=expected, profiles=profiles, mode=mode, candidate=candidate,
+            sentinels=block.get('semantic_sentinels', []) if candidate else ())
+        if not require_v4 and result['status'] == 'UNKNOWN':
+            proven = _parse_runner_report(proc, challenge, generation, qname, expected,
+                                          profiles, True, True)
+            result = dns_evidence.outcome('PASS', 'ok') if proven else dns_evidence.outcome()
+        if wireguard_scope_identity(cfg, scope, deadline_monotonic) != generation:
+            return dns_evidence.outcome()
+        return result
+    except (DNSRuntimeError, OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
+        return dns_evidence.outcome()
+
+
+def causal_round(cfg, profiles, candidate, timeout, deadline_monotonic=None):
+    """Runner executes client DNS, authenticated candidate and independent controls concurrently."""
+    return _v4_probe(cfg, 'causal-round', 'all', profiles, timeout,
+                     deadline_monotonic, candidate=candidate)
+
+
+def client_roundtrip_result(cfg, scope, profiles, timeout, deadline_monotonic=None):
+    """Tri-state client proof with owned NAT counter correlation."""
+    if (cfg.get('dns_rescue') or {}).get('runner_contract_version', 3) < 4:
+        return dns_evidence.outcome('PASS', 'ok') if client_roundtrip_proven(
+            cfg, scope, profiles, timeout, deadline_monotonic) else dns_evidence.outcome()
+    try:
+        if not _firewall_attached_strict(cfg, scope, deadline_monotonic):
+            return dns_evidence.outcome()
+        before = _redirect_counters(cfg, scope, deadline_monotonic)
+        result = _v4_probe(cfg, 'rescue-roundtrip', scope, profiles, timeout, deadline_monotonic)
+        after = _redirect_counters(cfg, scope, deadline_monotonic)
+        if not all(after[p] > before[p] for p in _PROTOCOLS):
+            return dns_evidence.outcome()
+        return result
+    except DNSRuntimeError:
+        return dns_evidence.outcome()
+
+
+def client_primary_detached_result(cfg, scope, profiles, timeout, deadline_monotonic=None):
+    """Prove primary after actual NAT detachment while the listener remains alive."""
+    if not redirect_detached(cfg, deadline_monotonic):
+        return dns_evidence.outcome()
+    peer_scope = ('peer:' + str((cfg.get('dns_rescue') or {}).get('canary_peer_ipv4') or '')
+                  if scope == 'all' else scope)
+    if not wireguard_scope_ready(cfg, peer_scope, deadline_monotonic):
+        return dns_evidence.outcome()
+    return _v4_probe(cfg, 'primary-recovery', peer_scope, profiles, timeout, deadline_monotonic)
+
+
 def _runner_command(cfg, mode, profiles, challenge, scope="all",
                     deadline_monotonic=None):
     """Build the fixed runner command and bind evidence to the WG inventory."""
@@ -1421,6 +1607,8 @@ def _runner_command(cfg, mode, profiles, challenge, scope="all",
                "--route-generation", generation, "--challenge", challenge,
                "--qname", qname, "--expected-ipv4", expected_ipv4,
                "--profiles", ",".join(profiles), "--transports", "udp,tcp"]
+    if block.get('runner_contract_version', 3) >= 4:
+        command += ['--contract-version', '4', '--operation-timeout-ms', '2000']
     return command, generation, qname, expected_ipv4
 
 
@@ -1501,7 +1689,12 @@ def _runner_report_evidence(proc, challenge, generation, qname, expected_ipv4,
 
 
 def _parse_runner_report(proc, challenge, generation, qname, expected_ipv4,
-                         profiles, dns_value, application_value):
+                         profiles, dns_value, application_value, minimum_version=3):
+    if minimum_version >= 4 or '"version":4' in (proc.stdout or '').replace(' ', ''):
+        return dns_evidence.parse_report(
+            proc, challenge=challenge, generation=generation, qname=qname,
+            expected_ipv4=expected_ipv4, profiles=profiles,
+            mode='rescue-roundtrip')['status'] == 'PASS'
     evidence = _runner_report_evidence(
         proc, challenge, generation, qname, expected_ipv4, profiles)
     return (evidence is not None
@@ -1512,8 +1705,12 @@ def _parse_runner_report(proc, challenge, generation, qname, expected_ipv4,
 
 
 def _runner_report_outcomes(proc, challenge, generation, qname,
-                            expected_ipv4, profiles):
+                            expected_ipv4, profiles, minimum_version=3):
     """Return only challenge-bound booleans safe for observe/UI output."""
+    if minimum_version >= 4:
+        proven = _parse_runner_report(proc, challenge, generation, qname,
+                                      expected_ipv4, profiles, True, True, minimum_version)
+        return dict.fromkeys(('udp', 'tcp', 'application_dns', 'controls'), proven)
     evidence = _runner_report_evidence(
         proc, challenge, generation, qname, expected_ipv4, profiles)
     outcomes = {"udp": False, "tcp": False,
@@ -1607,6 +1804,7 @@ def candidate_sidecar_preflight_proven(cfg, slot, main_config, scope, profiles,
             or not peer_canary_runner_ready(cfg)):
         return False
     proven = False
+    semantic_status = 'UNKNOWN'
     outcomes = {"udp": False, "tcp": False,
                 "application_dns": False, "controls": False}
     try:
@@ -1651,8 +1849,16 @@ def candidate_sidecar_preflight_proven(cfg, slot, main_config, scope, profiles,
             env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                  "LANG": "C", "LC_ALL": "C"})
         outcomes = _runner_report_outcomes(
-            proc, challenge, generation, qname, expected_ipv4, required)
+            proc, challenge, generation, qname, expected_ipv4, required,
+            (cfg.get('dns_rescue') or {}).get('runner_contract_version', 3))
         proven = all(outcomes.values())
+        if block.get('runner_contract_version', 3) >= 4:
+            semantic_status = dns_evidence.parse_report(
+                proc, challenge=challenge, generation=generation, qname=qname,
+                expected_ipv4=expected_ipv4, profiles=required,
+                mode='candidate-preflight')['status']
+        elif proven:
+            semantic_status = 'PASS'
     except (DNSRuntimeError, KeyError, TypeError, ValueError, OSError,
             subprocess.SubprocessError):
         proven = False
@@ -1662,6 +1868,7 @@ def candidate_sidecar_preflight_proven(cfg, slot, main_config, scope, profiles,
         scrub_candidate_sidecar(cfg, time.monotonic() + 10.0)
     if isinstance(evidence_out, dict):
         evidence_out.update(outcomes)
+        evidence_out['status'] = semantic_status
     return proven
 
 
@@ -1691,7 +1898,8 @@ def client_candidate_preflight_proven(cfg, scope, profiles, timeout,
                  "LANG": "C", "LC_ALL": "C"})
         if not _parse_runner_report(
                 proc, challenge, generation, qname, expected_ipv4,
-                required, True, True):
+                required, True, True,
+                (cfg.get('dns_rescue') or {}).get('runner_contract_version', 3)):
             return False
         current = _redirect_counters(cfg, scope, deadline_monotonic)
         return all(current[transport] > baseline[transport]
@@ -1731,7 +1939,8 @@ def client_roundtrip_proven(cfg, scope, profiles, timeout, deadline_monotonic=No
                  "LANG": "C", "LC_ALL": "C"})
         if not _parse_runner_report(
                 proc, challenge, generation, qname, expected_ipv4,
-                required, True, True):
+                required, True, True,
+                (cfg.get('dns_rescue') or {}).get('runner_contract_version', 3)):
             return False
         current = _redirect_counters(cfg, scope, deadline_monotonic)
         return all(current[transport] > baseline[transport]
@@ -1769,7 +1978,7 @@ def client_primary_failure_proven(cfg, profiles, timeout, deadline_monotonic=Non
 
 
 def client_primary_recovery_proven(cfg, profiles, timeout,
-                                   deadline_monotonic=None):
+                                   deadline_monotonic=None, evidence_out=None):
     """Prove the original path through an exact temporary bypass.
 
     A plain query while the global REDIRECT is active would only prove rescue
@@ -1780,6 +1989,7 @@ def client_primary_recovery_proven(cfg, profiles, timeout,
     required = tuple(sorted(set(profiles or ())))
     if not required or not peer_canary_runner_ready(cfg):
         return False
+    result = dns_evidence.outcome()
     cleanup_ok = True
     scope = ""
     try:
@@ -1821,9 +2031,17 @@ def client_primary_recovery_proven(cfg, profiles, timeout,
             command, capture_output=True, text=True, timeout=duration,
             env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                  "LANG": "C", "LC_ALL": "C"})
-        proven = _parse_runner_report(
-            proc, challenge, generation, qname, expected_ipv4,
-            required, True, True)
+        if (cfg.get('dns_rescue') or {}).get('runner_contract_version', 3) >= 4:
+            result = dns_evidence.parse_report(
+                proc, challenge=challenge, generation=generation, qname=qname,
+                expected_ipv4=expected_ipv4, profiles=required, mode='primary-recovery')
+            proven = result['status'] == 'PASS'
+        else:
+            proven = _parse_runner_report(proc, challenge, generation, qname,
+                                           expected_ipv4, required, True, True)
+            result = dns_evidence.outcome('PASS', 'ok') if proven else dns_evidence.outcome()
+        if wireguard_scope_identity(cfg, scope, deadline_monotonic) != generation:
+            proven, result = False, dns_evidence.outcome()
     except (DNSRuntimeError, TypeError, ValueError, OSError,
             subprocess.SubprocessError):
         proven = False
@@ -1838,15 +2056,49 @@ def client_primary_recovery_proven(cfg, profiles, timeout,
                 _drain_dns_conntrack(cfg, scope, cleanup_deadline)
             except DNSRuntimeError:
                 cleanup_ok = False
+    if isinstance(evidence_out, dict):
+        evidence_out.update(result if cleanup_ok else dns_evidence.outcome())
     return bool(proven and cleanup_ok)
 
 
-def service_start(deadline_monotonic=None):
+def _wait_gateway_listener(cfg, deadline_monotonic=None):
+    """Wait until the live gateway accepts TCP before backend probes run.
+
+    A ``Type=simple`` systemd unit becomes active as soon as sing-box starts,
+    which can happen shortly before it binds the DNS listener.  The following
+    backend proof checks both UDP and TCP; this gate only closes that startup
+    race without weakening those protocol checks.
+    """
+    block = cfg.get("dns_rescue") or {}
+    listen = block.get("listen_ip") or wireguard_ip(cfg)
+    port = int(block.get("listen_port"))
+    ready_deadline = time.monotonic() + 2.0
+    if deadline_monotonic is not None:
+        ready_deadline = min(ready_deadline, float(deadline_monotonic))
+    while True:
+        if not _service_active_strict(deadline_monotonic):
+            raise DNSRuntimeError("gateway service exited before listener became ready")
+        remaining = ready_deadline - time.monotonic()
+        if remaining <= 0:
+            raise DNSRuntimeError("gateway service did not start listening")
+        try:
+            with socket.create_connection(
+                    (listen, port), timeout=max(0.05, min(0.1, remaining))):
+                return True
+        except OSError:
+            remaining = ready_deadline - time.monotonic()
+            if remaining <= 0:
+                raise DNSRuntimeError("gateway service did not start listening")
+            time.sleep(min(0.05, remaining))
+
+
+def service_start(cfg, deadline_monotonic=None):
     rc, out = _cmd(["systemctl", "restart", UNIT], deadline_monotonic, cap=10.0)
     if rc != 0:
         raise DNSRuntimeError("gateway service failed: %s" % str(out)[:200])
     if not _service_active_strict(deadline_monotonic):
         raise DNSRuntimeError("gateway service did not become active")
+    _wait_gateway_listener(cfg, deadline_monotonic)
     return True
 
 
