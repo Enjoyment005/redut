@@ -117,6 +117,14 @@ def choose_outbounds(host, user, password, socks_port, http_port):
     return socks_out, http_tg, reject_quic
 
 
+def outbound_fingerprint(outbounds):
+    """Digest complete managed connections without persisting credentials."""
+    managed = sorted((o for o in outbounds if o.get("tag") in ("socks-out", "http-tg")),
+                     key=lambda o: o["tag"])
+    raw = json.dumps(managed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _lst(v):
     return v if isinstance(v, list) else ([] if v is None else [v])
 
@@ -512,6 +520,9 @@ def apply_candidate(server_cfg, proxy_row, probe_res, log=print, _locked=False,
                     "http_port": probe_res.get("http_port"),
                     "selection_source": selection_source,
                     "promote_role": proxy_row.get("role") == "off",
+                    "outbound_fingerprint": outbound_fingerprint(choose_outbounds(
+                        new_ip, proxy_row.get("user") or "", proxy_row.get("password") or "",
+                        probe_res.get("socks_port"), probe_res.get("http_port"))[:2]),
                 }
                 before_checksum = file_checksum(cfg_path)
                 key = (str(idempotency_key).strip() if idempotency_key else
@@ -523,10 +534,22 @@ def apply_candidate(server_cfg, proxy_row, probe_res, log=print, _locked=False,
                 operation_id = op["id"]
                 owns_operation = existing is None and bool(op.get("created"))
                 if existing is not None or not op.get("created"):
+                    prior_fingerprint = (op.get("desired_state") or {}).get("outbound_fingerprint")
+                    if (prior_fingerprint is not None
+                            and prior_fingerprint != desired["outbound_fingerprint"]):
+                        raise ApplyError("повтор operation %s: параметры подключения изменились" % operation_id)
+                    if (op.get("phase") == "committed"
+                            and op.get("after_checksum") != before_checksum):
+                        raise ApplyError("повтор operation %s: live config изменился" % operation_id)
                     recovered = recover_operation(server_cfg, pool, op, log=log, _locked=True)
                     current = pool.get_operation(operation_id=operation_id)
                     if current.get("phase") in ("verifying", "committed") and recovered.get("ok"):
+                        if (outbound_fingerprint(load_json(cfg_path).get("outbounds", []))
+                                != desired["outbound_fingerprint"]):
+                            raise ApplyError("повтор operation %s: целевое подключение не применено" % operation_id)
                         verify = recovered.get("verify") or verify_egress()
+                        if not verify.get("ok"):
+                            raise ApplyError("повтор operation %s: свежая verify не прошла" % operation_id)
                         return {"ok": True, "old_ip": old_ip, "new_ip": new_ip,
                                 "backup": backup_by_checksum(ring_dir, current.get("before_checksum")),
                                 "verify": verify, "operation_id": operation_id,
@@ -630,10 +653,12 @@ def rollback_from_ring(server_cfg, backup_path=None, log=print, _locked=False,
         try:
             bad_ip = current_upstream(load_json(cfg_path))
             good_ip = current_upstream(load_json(backup))
+            target_checksum = file_checksum(backup)
             if pool is not None:
                 before_checksum = file_checksum(cfg_path)
                 desired = {"kind": "rollback", "from_host": bad_ip,
                            "to_host": good_ip, "backup": os.path.abspath(backup),
+                           "backup_checksum": target_checksum,
                            "selection_source": selection_source}
                 key = (str(idempotency_key).strip() if idempotency_key else
                        _default_apply_key(pool, "rollback", desired, before_checksum))
@@ -643,17 +668,28 @@ def rollback_from_ring(server_cfg, backup_path=None, log=print, _locked=False,
                 operation_id = op["id"]
                 owns_operation = existing is None and bool(op.get("created"))
                 if existing is not None or not op.get("created"):
+                    bound_checksum = ((op.get("desired_state") or {}).get("backup_checksum")
+                                      or op.get("after_checksum"))
+                    if bound_checksum is not None and bound_checksum != target_checksum:
+                        raise ApplyError("повтор operation %s: целевой backup изменился" % operation_id)
+                    if (op.get("phase") == "committed"
+                            and op.get("after_checksum") != before_checksum):
+                        raise ApplyError("повтор operation %s: live config изменился" % operation_id)
                     recovered = recover_operation(server_cfg, pool, op, log=log, _locked=True)
                     current = pool.get_operation(operation_id=operation_id)
                     if current.get("phase") in ("verifying", "committed") and recovered.get("ok"):
+                        if file_checksum(cfg_path) != target_checksum:
+                            raise ApplyError("повтор operation %s: целевой backup не применён" % operation_id)
                         verify = recovered.get("verify") or verify_egress()
+                        if not verify.get("ok"):
+                            raise ApplyError("повтор operation %s: свежая verify не прошла" % operation_id)
                         return {"ok": True, "backup": backup, "bad_ip": bad_ip,
                                 "good_ip": good_ip, "verify": verify,
                                 "operation_id": operation_id, "recovered": True}
                     raise ApplyError("повтор operation %s завершён как %s"
                                      % (operation_id, current.get("phase")))
                 pool.transition_operation(operation_id, "staged",
-                                          after_checksum=file_checksum(backup))
+                                          after_checksum=target_checksum)
             rc, out = singbox_check(singbox_bin, backup)
             if rc != 0:
                 raise ApplyError("Бэкап %s не проходит sing-box check:\n%s" % (backup, out))

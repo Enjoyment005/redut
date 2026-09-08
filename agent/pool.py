@@ -386,58 +386,65 @@ _ADD_COLUMNS = (
 
 
 def migrate(conn, db_path=None):
-    """Идемпотентная миграция: повторный вызов ничего не ломает и не теряет."""
-    existing_user_tables = {row[0] for row in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
-    dns_state_preexisting = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dns_rescue_state'"
-    ).fetchone() is not None
-    dns_operation_preexisting = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dns_rescue_operation'"
-    ).fetchone() is not None
-    setting_preexisting = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='setting'"
-    ).fetchone() is not None
-    dns_descriptor_residue = False
-    pre_dns_schema = not existing_user_tables
-    if setting_preexisting:
-        dns_descriptor_residue = conn.execute(
-            "SELECT 1 FROM setting WHERE key IN "
-            "('dns_boot_resume','dns_exit_resume','dns_incident_id','manual_emergency_ref') "
-            "AND COALESCE(value,'')<>'' LIMIT 1").fetchone() is not None
-        schema_row = conn.execute(
-            "SELECT value FROM setting WHERE key='schema_version'").fetchone()
-        schema_value = str(schema_row[0] if schema_row else "")
-        pre_dns_schema = (bool(schema_value) and schema_value.isascii()
-                          and schema_value.isdigit() and int(schema_value) <= 7)
-    initialize_dns_singleton = (not dns_state_preexisting
-                                and not dns_operation_preexisting
-                                and not dns_descriptor_residue
-                                and pre_dns_schema)
-    for stmt in _SCHEMA:
-        conn.execute(stmt)
-    for table, col, typ in _ADD_COLUMNS:
-        have = {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)}
-        if col not in have:
-            conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, col, typ))
-    conn.execute("INSERT OR IGNORE INTO setting(key, value) VALUES('schema_version', ?)",
-                 (SCHEMA_VERSION,))
-    # Версия монотонна: старый бинарник не должен маскировать будущую схему,
-    # понижая 999 до своей 2. Некорректный маркер тоже не переписываем молча.
-    conn.execute(
-        "UPDATE setting SET value=? WHERE key='schema_version'"
-        " AND value<>'' AND value NOT GLOB '*[^0-9]*'"
-        " AND CAST(value AS INTEGER) < ?",
-        (SCHEMA_VERSION, int(SCHEMA_VERSION)))
-    # Materialize only a genuinely new/pre-DNS schema. An existing DNS table
-    # without its singleton is ambiguous and remains fail-closed; setup.sh owns
-    # the one exact v1.13.0 compatibility repair under the node-wide lock.
-    if initialize_dns_singleton:
+    """Migrate atomically under a writer lock; never commit a caller transaction."""
+    if conn.in_transaction:
+        raise sqlite3.OperationalError("migrate requires a connection without an open transaction")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        existing_user_tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+        dns_state_preexisting = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dns_rescue_state'"
+        ).fetchone() is not None
+        dns_operation_preexisting = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dns_rescue_operation'"
+        ).fetchone() is not None
+        setting_preexisting = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='setting'"
+        ).fetchone() is not None
+        dns_descriptor_residue = False
+        pre_dns_schema = not existing_user_tables
+        if setting_preexisting:
+            dns_descriptor_residue = conn.execute(
+                "SELECT 1 FROM setting WHERE key IN "
+                "('dns_boot_resume','dns_exit_resume','dns_incident_id','manual_emergency_ref') "
+                "AND COALESCE(value,'')<>'' LIMIT 1").fetchone() is not None
+            schema_row = conn.execute(
+                "SELECT value FROM setting WHERE key='schema_version'").fetchone()
+            schema_value = str(schema_row[0] if schema_row else "")
+            pre_dns_schema = (bool(schema_value) and schema_value.isascii()
+                              and schema_value.isdigit() and int(schema_value) <= 7)
+        initialize_dns_singleton = (not dns_state_preexisting
+                                    and not dns_operation_preexisting
+                                    and not dns_descriptor_residue
+                                    and pre_dns_schema)
+        for stmt in _SCHEMA:
+            conn.execute(stmt)
+        for table, col, typ in _ADD_COLUMNS:
+            have = {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+            if col not in have:
+                conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, col, typ))
+        conn.execute("INSERT OR IGNORE INTO setting(key, value) VALUES('schema_version', ?)",
+                     (SCHEMA_VERSION,))
+        # Версия монотонна: старый бинарник не должен маскировать будущую схему,
+        # понижая 999 до своей 2. Некорректный маркер тоже не переписываем молча.
         conn.execute(
-            "INSERT OR IGNORE INTO dns_rescue_state"
-            "(singleton,phase,configured_mode,updated_at) "
-            "VALUES(1,'idle','disabled',?)", (now_iso(),))
-    conn.commit()
+            "UPDATE setting SET value=? WHERE key='schema_version'"
+            " AND value<>'' AND value NOT GLOB '*[^0-9]*'"
+            " AND CAST(value AS INTEGER) < ?",
+            (SCHEMA_VERSION, int(SCHEMA_VERSION)))
+        # Materialize only a genuinely new/pre-DNS schema. An existing DNS table
+        # without its singleton is ambiguous and remains fail-closed; setup.sh owns
+        # the one exact v1.13.0 compatibility repair under the node-wide lock.
+        if initialize_dns_singleton:
+            conn.execute(
+                "INSERT OR IGNORE INTO dns_rescue_state"
+                "(singleton,phase,configured_mode,updated_at) "
+                "VALUES(1,'idle','disabled',?)", (now_iso(),))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
     _migrate_roles_v2(conn, db_path)
 
 

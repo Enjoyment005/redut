@@ -521,13 +521,20 @@ def cmd_apply(cfg, args):
             rc, out = apply_mod.singbox_check(cfg.get("singbox_bin") or "sing-box", stage)
             if rc != 0:
                 os.unlink(stage)
+                credentials = {str(o[key]) for o in new_cfg.get("outbounds", [])
+                               for key in ("username", "password") if o.get(key)}
+                for credential in sorted(credentials, key=len, reverse=True):
+                    out = out.replace(credential, "****")
                 print("❌ sing-box check забраковал кандидата:\n%s" % out)
                 p.close()
                 return 1
             print("  sing-box check (кандидат): OK")
         else:
             print("  ⚠️ sing-box бинарь недоступен — check пропущен (dev)")
-        shown = {"outbounds": [o for o in new_cfg["outbounds"] if o.get("tag") in ("socks-out", "http-tg")],
+        public_fields = ("type", "tag", "server", "server_port", "version")
+        shown = {"outbounds": [{key: o[key] for key in public_fields if key in o}
+                               for o in new_cfg["outbounds"]
+                               if o.get("tag") in ("socks-out", "http-tg")],
                  "route": new_cfg.get("route")}
         print("\n[dry-run] итоговые outbound'ы и route:\n" + json.dumps(shown, indent=2, ensure_ascii=False))
         os.unlink(stage)

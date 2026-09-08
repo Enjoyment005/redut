@@ -248,7 +248,10 @@ class TestApplySaga(unittest.TestCase):
         probe = dict(self.probe, socks_port=1199, http_port=8199)
         desired = {"kind": "apply", "uid": row["uid"], "from_host": self.OLD,
                    "to_host": self.OLD, "socks_port": 1199, "http_port": 8199,
-                   "selection_source": "retune", "promote_role": False}
+                   "selection_source": "retune", "promote_role": False,
+                   "outbound_fingerprint": apply_mod.outbound_fingerprint(
+                       apply_mod.choose_outbounds(self.OLD, row["user"], row["password"],
+                                                  1199, 8199)[:2])}
         key = apply_mod._default_apply_key(self.pool, "apply", desired)
         op = self.pool.begin_operation(
             "apply", "auto", desired, key, to_uid=row["uid"],

@@ -3,11 +3,12 @@ const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('nod
 const source=fs.readFileSync(process.argv[2],'utf8');
 const script=source.slice(source.indexOf('const __moneyRequestFallback='),source.indexOf('async function del('));
 function fixture(customApi,storage=new Map()){
-  const elements=new Map(),calls=[],messages=[];let prompted='30',prompts=0;
+  const elements=new Map(),calls=[],messages=[],poolRows=[];let prompted='30',prompts=0;
   const element=id=>{if(!elements.has(id))elements.set(id,{value:'',disabled:false,hidden:false,textContent:'',innerHTML:'',setAttribute(){}});return elements.get(id)};
   const market={countries:[{code:'us'}],periods:[5,10,30],balance:{balance:100,currency:'USD'}};
-  const context=vm.createContext({window:{},document:{getElementById:element},URLSearchParams,
-    esc:String,country:String,reloadAll:async()=>{},toast:m=>messages.push(m),
+  const context=vm.createContext({window:{},document:{getElementById:element,
+    querySelector:()=>({innerHTML:'',appendChild:row=>poolRows.push(row)}),createElement:()=>({innerHTML:''})},URLSearchParams,
+    esc:String,country:String,proxyLabel:p=>p.uid,ccBadge:()=>'',fl:()=>'',reloadAll:async()=>{},toast:m=>messages.push(m),
     confirm:()=>{throw Error('extra confirmation')},prompt:()=>{prompts++;return prompted},
     crypto:{randomUUID:()=> 'pl-test-request-'+calls.length},
     sessionStorage:{getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v),removeItem:k=>storage.delete(k)},
@@ -21,8 +22,13 @@ function fixture(customApi,storage=new Map()){
       if(url==='/api/market?provider=proxy6')return {available:[],period:7};
       throw Error('unexpected '+url)}});
   vm.runInContext(script,context);
+  vm.runInContext(source.slice(source.indexOf('async function loadPool(){'),source.indexOf('async function loadEvents(){')),context);
   for(const [id,value] of Object.entries({marketprovider:'proxyline',plkind:'dedicated',plquantity:'1'}))element(id).value=value;
-  return {run:s=>vm.runInContext(s,context),element,calls,messages,storage,market,prompt:value=>{prompted=value},prompts:()=>prompts};
+  return {run:s=>vm.runInContext(s,context),element,calls,messages,storage,market,poolRows,
+    renderedRenew:()=>{const tag=poolRows[0].innerHTML.match(/<button[^>]*onclick="prolong[^>]*>/)[0];
+      const button={disabled:/\bdisabled\b/.test(tag)};const handler=tag.match(/onclick="([^"]+)"/)[1];
+      return {button,click:()=>button.disabled?undefined:vm.runInContext('(async function(){'+handler.replace('prolong(', 'return prolong(')+'})',context).call(button)}},
+    prompt:value=>{prompted=value},prompts:()=>prompts};
 }
 const payments=f=>f.calls.filter(c=>c.url==='/api/proxyline/spend');
 (async()=>{
@@ -44,9 +50,16 @@ const payments=f=>f.calls.filter(c=>c.url==='/api/proxyline/spend');
   busy.element('marketprovider').value='proxyline';await busy.run('shopSelect()');
   assert.equal(busy.element('shopbalance').textContent,'98.8 USD');
 
-  const renew=fixture();await renew.run('shopSelect()');await renew.run("prolong({},'proxyline:15')");
+  const proxyline=active=>({uid:'proxyline:15',provider:'proxyline',provider_active:active,role:'auto',
+    host:'198.51.100.15',port_socks5:1080,country:'us',blocked:false,is_current:false});
+  const renew=fixture(url=>url==='/api/pool'?{proxies:[proxyline(true)]}:undefined);
+  await renew.run('loadPool()');const renewal=renew.renderedRenew();assert.equal(renewal.button.disabled,false);
+  await renewal.click();
   assert.equal(renew.prompts(),1);assert.equal(payments(renew).length,1);
   assert.equal(payments(renew)[0].body.uid,'proxyline:15');assert.equal(payments(renew)[0].body.period,30);
+  const inactive=fixture(url=>url==='/api/pool'?{proxies:[proxyline(false)]}:undefined);
+  await inactive.run('loadPool()');const disabled=inactive.renderedRenew();assert.equal(disabled.button.disabled,true);
+  await disabled.click();assert.equal(inactive.prompts(),0);assert.equal(payments(inactive).length,0);
   for(const value of ['7','30.5','true','0']){
     const invalid=fixture();invalid.prompt(value);await invalid.run("prolong({},'proxyline:15')");
     assert.equal(payments(invalid).length,0);

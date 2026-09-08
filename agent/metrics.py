@@ -140,7 +140,8 @@ def _switches(events, window_days):
             detail = json.loads(
                 event.get("detail") or "",
                 parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
-            bad, good = detail.get("bad_ip"), detail.get("good_ip")
+            bad = detail.get("bad_ip", detail.get("bad"))
+            good = detail.get("good_ip", detail.get("good"))
             if not bad or not good:
                 rollback_unknown += 1
             elif str(bad) != str(good):

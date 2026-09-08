@@ -1197,7 +1197,7 @@ class Handler(BaseHTTPRequestHandler):
                 APP.pool.log_event("rollback", actor="user",
                                    result=("post-state-pending" if post_error else
                                            ("ok" if r["ok"] else "verify-fail")),
-                                   detail=json.dumps({"bad": r["bad_ip"], "good": r["good_ip"]}, ensure_ascii=False),
+                                   detail=json.dumps({"bad_ip": r["bad_ip"], "good_ip": r["good_ip"]}, ensure_ascii=False),
                                    src_ip=self._client_ip())
                 APP.pool.set_egress(r.get("verify"))
                 if not post_error:

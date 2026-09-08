@@ -325,7 +325,7 @@ def _physical(cfg, state):
         path_window = int(block.get("path_evidence_ttl_seconds", 300))
         node_wide = state.get("active_kind") in (
             "node_wide_manual", "node_wide_automatic")
-        return (dns_runtime.firewall_effective(cfg, scope=state.get("active_scope"))
+        return (dns_runtime.firewall_effective(cfg, scope=state.get("active_scope")) is True
                 and dns_runtime.service_active()
                 and (not node_wide or dns_runtime.emergency_route_ready(cfg))
                 and bool(state.get("boot_id")) and state.get("boot_id") == _boot_id()
@@ -1650,7 +1650,7 @@ def _reconcile_locked(cfg, pool, actor):
             route_state = (dns_runtime.emergency_route_state(cfg, deadline)
                            if node_wide else "ready")
             firewall_ok = dns_runtime.firewall_effective(
-                cfg, scope=state.get("active_scope"))
+                cfg, scope=state.get("active_scope"), deadline_monotonic=deadline)
             boot_matches = bool(current_boot) and state.get("boot_id") == current_boot
             base_consistent = (
                 firewall_ok and boot_matches
@@ -1658,22 +1658,28 @@ def _reconcile_locked(cfg, pool, actor):
                 and identity_state.get("identity") == state.get("scope_identity")
                 and route_state == "ready")
             ownership_inspection_unknown = (
-                firewall_ok
+                firewall_ok is not False
                 and (boot_matches or current_boot is None)
                 and identity_state.get("status") != "invalid"
+                and (identity_state.get("status") == "unknown"
+                     or identity_state.get("identity") == state.get("scope_identity"))
                 and route_state != "mismatch"
-                and (current_boot is None
+                and (firewall_ok is None or current_boot is None
                      or identity_state.get("status") == "unknown"
                      or route_state == "unknown"))
             physically_consistent = base_consistent and service_state == "active"
         except Exception:
             physically_consistent = False
-    if physically_consistent and not unfinished and not auxiliary_errors:
+    if physically_consistent and not unfinished:
+        if auxiliary_errors:
+            # A later complete firewall proof supersedes earlier inspection
+            # errors. Retry sidecar cleanup without stopping the serving path.
+            return pool.set_dns_state(last_error=";".join(auxiliary_errors))
         _clear_physical_resume(pool, "dns_exit_resume", state)
         _clear_physical_resume(pool, "dns_boot_resume", state)
         return state
     if (not isolated_expired and service_state == "unknown" and base_consistent
-            and not unfinished and not auxiliary_errors
+            and not unfinished
             and state.get("phase") in ACTIVE_PHASES
             and _state_shape_valid(cfg, state)):
         # An inspection timeout is not proof that a live resolver disappeared.
@@ -1682,11 +1688,11 @@ def _reconcile_locked(cfg, pool, actor):
         return pool.set_dns_state(last_error="service-inspection-unknown")
     if (not isolated_expired
             and ownership_inspection_unknown and service_state != "inactive"
-            and not unfinished and not auxiliary_errors
+            and not unfinished
             and state.get("phase") in ACTIVE_PHASES
             and _state_shape_valid(cfg, state)):
         # The health tick applies the durable failure threshold. Reconcile must
-        # not tear down a guarded live path on one ip/wg inspection timeout.
+        # not tear down a guarded live path on one firewall/ip/wg timeout.
         return pool.set_dns_state(last_error="ownership-inspection-unknown")
     # A positively owned generation with either a dead listener or exact route
     # drift needs fail-open teardown, but it must not lose the incident/scope/

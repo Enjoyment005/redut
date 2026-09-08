@@ -189,16 +189,31 @@ class ProxyWing(Provider):
             {'cycle': months, 'cycle_type': 'monthly'}, request_id, on_submit)
 
     def list(self):
+        """Require complete family snapshots before allowing the pool to remove rows."""
         out = []
-        for family in ("datacenter", "isp"):
+        for family in FAMILIES:
             data = self._api("/%s/proxies" % family)
-            for order in data.get("orders") or []:
-                if str(order.get("status") or "").lower() not in ("", "active"):
+            if not isinstance(data, dict) or not isinstance(data.get("orders"), list):
+                raise ProviderError('ProxyWing: неполный список заказов')
+            for order in data["orders"]:
+                if not isinstance(order, dict):
+                    raise ProviderError('ProxyWing: некорректная запись заказа')
+                identifier(order.get("id"))
+                status = order.get("status")
+                if status is not None and not isinstance(status, str):
+                    raise ProviderError('ProxyWing: некорректный статус заказа')
+                if (status or "").lower() not in ("", "active"):
                     continue
-                for proxy in order.get("proxies") or []:
+                if not isinstance(order.get("proxies"), list):
+                    raise ProviderError('ProxyWing: неполный список прокси заказа')
+                for proxy in order["proxies"]:
+                    if not isinstance(proxy, dict):
+                        raise ProviderError('ProxyWing: некорректная запись прокси')
+                    identifier(proxy.get("id"))
                     item = norm_proxywing(proxy, order, family)
-                    if item["host"] and (item["port_http"] or item["port_socks5"]):
-                        out.append(item)
+                    if not item["host"] or not (item["port_http"] or item["port_socks5"]):
+                        raise ProviderError('ProxyWing: неполные параметры подключения прокси')
+                    out.append(item)
         return out
 
     def balance(self):

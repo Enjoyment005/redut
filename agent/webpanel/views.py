@@ -1285,8 +1285,8 @@ async function loadPool(){const rows=(await api('/api/pool')).proxies;const tb=d
       '<td><button class="btn s tiny" onclick="probe(this,\\''+esc(p.uid)+'\\')" title="Проверить прокси — безопасно, ничего не меняет">Тест</button> '+
         '<button class="btn g tiny" onclick="apply(this,\\''+esc(p.uid)+'\\')"'+(inact?' disabled':'')+
         ' title="'+(inact?'У провайдера нет ключа — панель не управляет этим прокси':'Сделать боевым и закрепить вручную: проверка → переключение → проверка → автооткат. При отказе вернётся AUTO(speed)')+'">В бой</button> '+
-        '<button class="btn a tiny" onclick="prolong(this,\\''+esc(p.uid)+'\\')"'+((inact||p.provider==='proxyline')?' disabled':'')+
-        ' title="'+(p.provider==='proxyline'?'Продление доступно в кабинете ProxyLine':inact?'У провайдера нет ключа — продлить нечем':'Продлить аренду — тратит деньги')+'">Продлить</button> '+
+        '<button class="btn a tiny" onclick="prolong(this,\\''+esc(p.uid)+'\\')"'+(inact?' disabled':'')+
+        ' title="'+(inact?'У провайдера нет ключа — продлить нечем':'Продлить аренду — тратит деньги')+'">Продлить</button> '+
         '<button class="btn r tiny" onclick="del(this,\\''+esc(p.uid)+'\\')"'+((p.provider!='proxy6'||inact)?' disabled':'')+
         ' title="Удалить навсегда">Удалить</button></td>';
     tb.appendChild(tr)}
@@ -1550,7 +1550,7 @@ const PROV={
   proxy6:{t:'PROXY6',h:'Основной провайдер: панель умеет у него всё — купить, продлить, удалить; цены в рублях. '+
     'Ключ: кабинет proxy6.net → раздел «API». Если в кабинете включено ограничение API по IP, впиши туда адрес '+
     'этого сервера, иначе провайдер ответит «доступ с неверного IP».'},
-  proxyline:{t:'ProxyLine',h:'Запасной провайдер: в панели доступны импорт, баланс, наличие и цена нового заказа; покупка и продление — в кабинете ProxyLine, '+
+  proxyline:{t:'ProxyLine',h:'Запасной провайдер: в панели доступны импорт, баланс, наличие, покупка и продление; '+
     'цены в долларах. Ключ: кабинет panel.proxyline.net → раздел «API».'},
   proxywing:{t:'ProxyWing',h:'Datacenter и ISP: Редут импортирует уже купленные HTTP/SOCKS-каналы и проверяет их как остальные. '+
     'Каталог и покупка доступны в разделе «Деньги», с бюджетом USD для новых покупок. Продление действует без настройки бюджета. Сроки — в месяцах; продлевается весь заказ. Ключ: dashboard.proxywing.com → Account → Security.'}};
@@ -1730,8 +1730,8 @@ async function loadClients(){const r=await api('/api/clients');const tb=document
         '<span class="mut" title="профиль заведён мимо панели — файла с ключом нет">файла нет</span> ')+
       '<button class="btn r tiny client-revoke">Отозвать</button></td>';
     const download=tr.querySelector('.client-download'),qr=tr.querySelector('.client-qr');
-    if(download)download.addEventListener('click',()=>dlClient(c.name));
-    if(qr)qr.addEventListener('click',()=>qrClient(c.name));
+    if(download)download.addEventListener('click',()=>dlClient(c.conf_name));
+    if(qr)qr.addEventListener('click',()=>qrClient(c.conf_name));
     tr.querySelector('.client-revoke').addEventListener('click',()=>delClient(c.name,c.pubkey));
     tb.appendChild(tr)}
   window.__CN=r.clients.length;

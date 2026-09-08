@@ -169,6 +169,7 @@ def list_clients(cfg):
                     "ip": ip, "pubkey": peer["pubkey"],
                     "handshake": d.get("handshake", 0), "rx": d.get("rx", 0),
                     "tx": d.get("tx", 0), "has_conf": bool(conf_name),
+                    "conf_name": conf_name,
                     "unsupported": bool(unsupported_reason),
                     "unsupported_reason": unsupported_reason})
     return out

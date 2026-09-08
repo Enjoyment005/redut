@@ -18,6 +18,7 @@
 Дефолты — профиль node1 (profiles.py). Новый сервер по той же схеме = только --host/--pw.
 """
 import argparse
+import ipaddress
 import os
 import re
 import secrets
@@ -351,18 +352,27 @@ def verify(c, p, net, with_panel):
     (ok if peers.isdigit() and int(peers) >= 1 else bad)("wg0 пиров: %s" % peers)
 
     # §11 RETURN выше MARK, без дублей MASQUERADE
+    subnet = str(ipaddress.IPv4Network(p["subnet"], strict=False))
     pr = run(c, "iptables -t mangle -S PREROUTING")
-    lines = pr.splitlines()
+    jump = "-A PREROUTING -s %s -j REDUT_PREROUTING" % subnet
+    (ok if jump in pr.splitlines() else bad)(
+        "§11 PREROUTING -> REDUT_PREROUTING для %s" % subnet)
+    lines = run(c, "iptables -t mangle -S REDUT_PREROUTING").splitlines()
+    prefix = "-A REDUT_PREROUTING -s %s " % subnet
     idx_mark = next((i for i, l in enumerate(lines) if "MARK --set" in l), -1)
-    ret_self = next((i for i, l in enumerate(lines) if ("-d %s/32" % net["server_ip"]) in l and "RETURN" in l), -1)
+    mark_ok = idx_mark >= 0 and lines[idx_mark] in (
+        prefix + "-j MARK --set-mark 0x64",
+        prefix + "-j MARK --set-xmark 0x64/0xffffffff")
+    ret_self = next((i for i, l in enumerate(lines)
+                     if l == prefix + "-d %s/32 -j RETURN" % net["server_ip"]), -1)
     ret_sub = next((i for i, l in enumerate(lines)
-                    if ("-d %s" % p["subnet"]) in l and "RETURN" in l), -1)
-    if ret_self >= 0 and ret_sub >= 0 and idx_mark >= 0 and ret_self < idx_mark and ret_sub < idx_mark:
+                    if l == prefix + "-d %s -j RETURN" % subnet), -1)
+    if ret_self >= 0 and ret_sub >= 0 and mark_ok and ret_self < idx_mark and ret_sub < idx_mark:
         ok("§11 RETURN (сам сервер + подсеть) ВЫШЕ MARK 0x64")
     else:
         bad("§11 RETURN не на месте/не выше MARK (self=%d sub=%d mark=%d)" % (ret_self, ret_sub, idx_mark))
 
-    masq = run(c, "iptables -t nat -S POSTROUTING | grep -c -- '-s %s .*MASQUERADE'" % p["subnet"])
+    masq = run(c, "iptables -t nat -S POSTROUTING | grep -c -- '-s %s .*MASQUERADE'" % subnet)
     if masq == "1":
         ok("MASQUERADE ровно 1 (без дублей)")
     else:

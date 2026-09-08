@@ -965,11 +965,16 @@ def _probe(pool, providers, row, current_host, cfg=None, persist=True):
     return res
 
 
-def _cooldown_after_fail(pool, uid, log):
+def _cooldown_after_fail(pool, uid, log, probe_result=None):
+    """Back off confirmed failures; incomplete evidence keeps the candidate eligible."""
+    if (probe_result or {}).get("persistence_outcome") == health_mod.PROBE_INCONCLUSIVE:
+        log("  проба %s неопределённая — cooldown не назначаю" % uid)
+        return False
     fc = int((pool.get(uid) or {}).get("fail_count") or 1)
     secs = cooldown_seconds(fc)
     pool.set_cooldown(uid, secs)
     log("  cooldown %s: %d мин (провал #%d)" % (uid, secs // 60, fc))
+    return True
 
 
 def _strategy_ranked_rows(cfg, providers, pool, current_host, extra_rows=None,
@@ -1056,7 +1061,9 @@ def _converge_strategy_locked(cfg, providers, pool, log=print, actor="user"):
         if current_res.get("disqualified") or not current_res.get("ok"):
             exclusions.append({"uid": current_row["uid"],
                                "reason": current_res.get("disqualified") or "probe-failed"})
-            _cooldown_after_fail(pool, current_row["uid"], log)
+            if not _cooldown_after_fail(pool, current_row["uid"], log, current_res):
+                return {"ok": False, "action": "probe-inconclusive", "strategy": desired,
+                        "tried": tried, "detail": "проба текущего канала неопределённая; повтор следующим циклом"}
         elif synthetic_current:
             current_extra = dict(current_row)
             current_extra.update({
@@ -1087,7 +1094,9 @@ def _converge_strategy_locked(cfg, providers, pool, log=print, actor="user"):
                 if res.get("disqualified") or not res.get("ok"):
                     exclusions.append({"uid": top["uid"],
                                        "reason": res.get("disqualified") or "probe-failed"})
-                    _cooldown_after_fail(pool, top["uid"], log)
+                    if not _cooldown_after_fail(pool, top["uid"], log, res):
+                        return {"ok": False, "action": "probe-inconclusive", "strategy": desired,
+                                "tried": tried, "detail": "проба текущего канала неопределённая; повтор следующим циклом"}
                 continue
             detail = "текущий %s уже лучший по %s" % (current_host, desired)
             emit_strategy("stable", detail, ranked)
@@ -1101,7 +1110,9 @@ def _converge_strategy_locked(cfg, providers, pool, log=print, actor="user"):
         if res.get("disqualified") or not res.get("ok"):
             exclusions.append({"uid": row["uid"],
                                "reason": res.get("disqualified") or "probe-failed"})
-            _cooldown_after_fail(pool, row["uid"], log)
+            if not _cooldown_after_fail(pool, row["uid"], log, res):
+                return {"ok": False, "action": "probe-inconclusive", "strategy": desired,
+                        "tried": tried, "detail": "проба кандидата неопределённая; повтор следующим циклом"}
             continue
 
         # Проба обновила score. Кандидат обязан остаться лучшим и после свежего
@@ -1519,11 +1530,16 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
         ensure_reserve(cfg, providers, pool, alerter, log, actor)   # N+1: из пула, не покупкой (§6.5)
         return _state(pool, result, OK, "rotate", rot.get("detail", "ротация ок"))
 
-    # Остановились по лимиту кандидатов/цикл, в пуле ещё есть непроверенные (§8, снос №5):
-    # НЕ покупаем — честный ЖЁЛТЫЙ ROTATING (F3), а не «авария». Прямой выход на время
-    # перебора — СТРОГО под флагом (инвариант: сторож не вернёт default в мёртвый tun0);
-    # маршрутами ROTATING управляет ровно как EMERGENCY, отличие — только UI и алерты.
-    if rot.get("capped"):
+    # Незавершённый обход не доказывает выход из уже активного EMERGENCY.
+    # Из остальных состояний продолжаем перебор в ROTATING с защищённым прямым выходом.
+    if rot.get("capped") or rot.get("inconclusive"):
+        if state_before == EMERGENCY:
+            pool.set_setting("emergency_last_retry", None)
+            outcome = "inconclusive" if rot.get("inconclusive") else "probing"
+            detail = ("проба резерва неопределённая" if rot.get("inconclusive") else "перебор резерва не завершён")
+            detail += " — аварийный выход сохранён, повтор следующим циклом без покупки"
+            pool.log_event("rotating", actor=actor, result=outcome, detail=detail)
+            return _state(pool, result, EMERGENCY, "pool-" + outcome, detail)
         if not emergency_on(cfg, log):
             pool.log_event("rotating", actor=actor, result="direct-failed",
                            detail="не удалось подтвердить прямой выход для безопасного перебора")
@@ -1673,8 +1689,8 @@ def try_retune(cfg, providers, pool, alerter, log, actor, prior_evidence=None):
             res.get("socks_port"), res.get("http_port"))
     except apply_mod.ApplyError:
         return {"ok": False, "why": "нет рабочей комбинации порт×протокол"}
-    changed = (socks_out["type"] != cur_socks[0] or socks_out["server_port"] != cur_socks[1]
-               or http_tg["type"] != cur_tg[0] or http_tg["server_port"] != cur_tg[1])
+    changed = (apply_mod.outbound_fingerprint([socks_out, http_tg])
+               != apply_mod.outbound_fingerprint(sb.get("outbounds", [])))
     if not changed:
         # F2: прокси ЖИВ (проба только что прошла), комбинация уже оптимальна —
         # значит виноват не прокси (egress флапнул / sing-box завис). Раньше это
@@ -1720,6 +1736,11 @@ def try_rotating(cfg, providers, pool, alerter, log, actor):
     # Кандидаты уже упорядочены по стране+score (rank_candidates): сначала пробуем
     # надёжные страны (Латвия перед Нигерией), чёрный список выброшен (§6.1, снос №5).
     cands = selectable_candidates(pool, cfg, host, providers)
+    # UNKNOWN keeps eligibility, so a bounded cycle needs an explicit cursor
+    # to avoid probing the same high-ranked candidates forever.
+    next_uid = pool.get_setting("rotation_next_uid")
+    next_index = next((i for i, row in enumerate(cands) if row["uid"] == next_uid), 0)
+    cands = cands[next_index:] + cands[:next_index]
     candidate_uids = {row["uid"] for row in cands}
     exclusions = []
     now = _now_iso()
@@ -1753,11 +1774,13 @@ def try_rotating(cfg, providers, pool, alerter, log, actor):
                 rows=cands[:10], current_host=host, exclusions=exclusions[-20:]))
 
     if not cands:
+        pool.set_setting("rotation_next_uid", None)
         detail = "пригодных кандидатов нет (все off/gone/на cooldown/в чёрном списке)"
         log("  ROTATING: " + detail)
         emit_rotate("empty", detail)
         return {"ok": False, "exhausted": True}
     tried = 0
+    inconclusive = False
     for row in cands:
         if tried >= MAX_CANDIDATES_PER_CYCLE:
             # Остановились по лимиту, но в пуле ещё есть НЕпробованные кандидаты. Это НЕ
@@ -1765,14 +1788,17 @@ def try_rotating(cfg, providers, pool, alerter, log, actor):
             detail = "лимит ≤%d кандидатов/цикл — остальные в следующем цикле" % MAX_CANDIDATES_PER_CYCLE
             log("  ROTATING: " + detail)
             emit_rotate("capped", detail)
+            pool.set_setting("rotation_next_uid", row["uid"])
             return {"ok": False, "exhausted": False, "capped": True,
+                    "inconclusive": inconclusive,
                     "tried": tried, "total": len(cands)}
         tried += 1
         res = _probe(pool, providers, row, host, cfg)
         if res.get("disqualified") or not res.get("ok"):
             exclusions.append({"uid": row["uid"],
                                "reason": res.get("disqualified") or "probe-failed"})
-            _cooldown_after_fail(pool, row["uid"], log)
+            if not _cooldown_after_fail(pool, row["uid"], log, res):
+                inconclusive = True
             continue
         try:
             r = apply_mod.apply_candidate(cfg, row, res, log=log, _locked=True,
@@ -1801,11 +1827,17 @@ def try_rotating(cfg, providers, pool, alerter, log, actor):
             mark_selection_applied(pool, pending_revision["desired"], actor=actor,
                                    detail="успешная fault rotation применила desired strategy")
         apply_mod.commit_operation(pool, r)
+        pool.set_setting("rotation_next_uid", None)
         alerter.rotated(old_ip=host, new_ip=r["new_ip"], uid=row["uid"],
                         egress=r["verify"]["egress_ip"], cc=r["verify"]["exit_cc"],
                         tg_code=r["verify"]["tg_code"], score=res.get("score"), candidates_tried=tried)
         return {"ok": True, "uid": row["uid"], "new_ip": r["new_ip"], "verify": r["verify"],
                 "detail": "ротация %s -> %s (%s)" % (host, r["new_ip"], row["uid"])}
+    pool.set_setting("rotation_next_uid", None)
+    if inconclusive:
+        emit_rotate("inconclusive", "есть кандидаты с неопределённой пробой; повтор следующим циклом")
+        return {"ok": False, "exhausted": False, "inconclusive": True,
+                "tried": tried, "total": len(cands)}
     # перебрали всех пригодных, никто не прошёл живую пробу (провалившиеся ушли на cooldown) —
     # пул честно исчерпан, только теперь допустима докупка (REPLENISH)
     emit_rotate("exhausted", "все пригодные кандидаты провалили живую пробу")
@@ -1890,7 +1922,7 @@ def _switch_locked(cfg, providers, pool, alerter, from_provider,
         tried += 1
         pres = _probe(pool, providers, row, host, cfg)
         if pres.get("disqualified") or not pres.get("ok"):
-            _cooldown_after_fail(pool, row["uid"], log)
+            _cooldown_after_fail(pool, row["uid"], log, pres)
             continue
         try:
             r = apply_mod.apply_candidate(cfg, row, pres, log=log, _locked=True,

@@ -794,7 +794,7 @@ def _scrub_primary_test_bypass(cfg, deadline_monotonic=None):
     except DNSRuntimeError as error:
         errors.append(str(error))
         remains = True
-    if remains or errors:
+    if remains:
         raise DNSRuntimeError("primary recovery bypass cleanup not proven: "
                               + "; ".join(errors)[:500])
     return True
@@ -971,14 +971,14 @@ def firewall_attached(cfg, deadline_monotonic=None):
 
 
 def firewall_effective(cfg, scope="all", deadline_monotonic=None):
-    """Compatibility wrapper used by the coordinator for a declared scope."""
+    """Return True/False for a proven match/mismatch, None if inspection fails."""
     deadline_monotonic = (deadline_monotonic if deadline_monotonic is not None
                           else time.monotonic() + 10.0)
     try:
         return _firewall_attached_strict(cfg, scope=scope,
                                          deadline_monotonic=deadline_monotonic)
     except (DNSRuntimeError, KeyError, TypeError, ValueError):
-        return False
+        return None
 
 
 def _redirect_detached_strict(cfg, deadline_monotonic=None):

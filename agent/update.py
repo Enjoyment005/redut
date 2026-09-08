@@ -705,7 +705,11 @@ def _verify_once(cfg, baseline):
             return False, "DNS Rescue generation не очищено после update"
         if (cfg or {}).get("has_dnsmasq") and not now_dns.get("dnsmasq"):
             return False, "dnsmasq не активен после update"
-        if now_dns != baseline["dns"]:
+        expected_dns = dict(baseline["dns"])
+        # Manual repair may restore dnsmasq; Rescue identity/state must stay unchanged.
+        if expected_dns.get("dnsmasq") is False and now_dns.get("dnsmasq") is True:
+            expected_dns["dnsmasq"] = True
+        if now_dns != expected_dns:
             return False, "DNS data-plane изменился: было %r, стало %r" % (baseline["dns"], now_dns)
     if baseline.get("intent") is not None:
         now_intent = _network_intent_state(cfg)

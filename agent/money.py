@@ -891,7 +891,7 @@ def _plan_and_buy_locked(pool, provider, cfg, *, country, period=None, count=1,
             pool.transition_spend_operation(op["id"], "failed", str(e))
             e.replace_request = True
             raise
-        ambiguous = not bool(getattr(e, "definitive", False))
+        ambiguous = not (getattr(e, "definitive", False) or getattr(e, "unsent", False))
         if not ambiguous:
             pool.transition_spend_operation(op["id"], "failed", str(e))
             e.replace_request = True
@@ -1073,7 +1073,7 @@ def _prolong_with_limits_locked(pool, provider, cfg, *, row, days,
             pool.transition_spend_operation(op["id"], "failed", str(error))
             error.replace_request = True
             raise
-        ambiguous = not bool(getattr(error, "definitive", False))
+        ambiguous = not (getattr(error, "definitive", False) or getattr(error, "unsent", False))
         if not ambiguous:
             pool.transition_spend_operation(op["id"], "failed", str(error))
             error.replace_request = True

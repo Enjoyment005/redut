@@ -3,6 +3,7 @@ import unittest
 
 import _ctx
 from providers.proxywing import ProxyWing
+from providers.base import ProviderError
 
 
 class StubProxyWing(ProxyWing):
@@ -25,10 +26,13 @@ class TestProxyWing(unittest.TestCase):
         self.assertEqual({x["ext_id"].split("|", 1)[0] for x in got}, {"datacenter", "isp"})
         self.assertEqual(p.calls, ["/datacenter/proxies", "/isp/proxies"])
 
-    def test_non_active_and_broken_rows_are_ignored(self):
+    def test_non_active_rows_are_ignored_but_incomplete_active_rows_reject_listing(self):
         gone = {"orders": [{"id": "ord_gone", "status": "terminated", "proxies": [{}]}]}
         broken = {"orders": [{"id": "ord_bad", "status": "active", "proxies": [{"id": "p"}]}]}
         p = StubProxyWing({"/datacenter/proxies": gone, "/isp/proxies": broken})
+        with self.assertRaises(ProviderError):
+            p.list()
+        p.responses["/isp/proxies"] = {"orders": []}
         self.assertEqual(p.list(), [])
 
     def test_balance(self):

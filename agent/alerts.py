@@ -104,11 +104,8 @@ class Alerter:
             else:
                 with smtplib.SMTP(host, port, timeout=self.timeout) as srv:
                     srv.ehlo()
-                    try:
-                        srv.starttls(context=ssl.create_default_context())
-                        srv.ehlo()
-                    except smtplib.SMTPException:
-                        pass  # сервер без STARTTLS — шлём как есть (внутренняя почта)
+                    srv.starttls(context=ssl.create_default_context())
+                    srv.ehlo()
                     if s.get("user"):
                         srv.login(s["user"], s.get("password") or "")
                     srv.send_message(msg)

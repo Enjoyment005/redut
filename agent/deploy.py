@@ -159,6 +159,8 @@ PANEL_FILES = ["webpanel/__init__.py", "webpanel/auth.py", "webpanel/sysinfo.py"
                "webpanel/hygiene.py",
                "webpanel/server.py", "webpanel/views.py", "webpanel/setup_admin.py",
                "webpanel/clients.py", "webpanel/qrcode.py"]
+DNS_SERVICE_FILES = ("redut-dns-rescue.service", "redut-dns-rescue-watchdog.service",
+                     "redut-dns-rescue-watchdog.timer")
 
 WRAPPER = "#!/bin/bash\nexec python3 /opt/vpn-panel/agent.py \"$@\"\n"
 
@@ -505,6 +507,32 @@ def build_config(name):
     return cfg
 
 
+def local_deploy_preflight(files, secrets_path):
+    """Read required upload sources and parse local secrets before opening SSH."""
+    template_dir = os.path.join(PANEL_DIR, os.pardir, "install", "templates")
+    paths = [os.path.join(PANEL_DIR, rel.replace("/", os.sep)) for rel in files]
+    paths.extend(os.path.join(template_dir, name) for name in DNS_SERVICE_FILES)
+    version_path = os.path.join(PANEL_DIR, os.pardir, "VERSION")
+    if os.path.isfile(version_path):
+        paths.append(version_path)
+    for path in paths:
+        try:
+            with open(path, "rb") as source:
+                source.read()
+        except OSError:
+            raise SystemExit("не удалось прочитать локальный файл %s" % path) from None
+    if secrets_path is None:
+        return {}
+    try:
+        with open(secrets_path, encoding="utf-8") as source:
+            local_secrets = json.load(source)
+    except (OSError, ValueError):
+        raise SystemExit("не удалось прочитать JSON секретов %s" % secrets_path) from None
+    if not isinstance(local_secrets, dict):
+        raise SystemExit("JSON секретов %s должен содержать объект" % secrets_path)
+    return local_secrets
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -528,6 +556,7 @@ def main(argv=None):
         sys.exit("Нет %s — положи ключи провайдеров (не в репо), либо запусти с --clean" % secrets_path)
     cfg = build_config(a.server)
     files = AGENT_FILES + (PANEL_FILES if a.with_panel else [])
+    local_secrets = local_deploy_preflight(files, None if a.clean else secrets_path)
 
     print("=== ДЕПЛОЙ %s (%s) ===" % (a.server, SERVERS[a.server]["host"]))
     print("config.json:\n" + json.dumps(cfg, ensure_ascii=False, indent=2))
@@ -539,10 +568,10 @@ def main(argv=None):
         return 0
 
     with contextlib.ExitStack() as resources:
-        return _deploy(a, cfg, files, resources)
+        return _deploy(a, cfg, files, resources, local_secrets)
 
 
-def _deploy(a, cfg, files, resources):
+def _deploy(a, cfg, files, resources, local_secrets):
     """Every exit releases SFTP, the remote network lock and its SSH transport."""
     c = connect(SERVERS[a.server]["host"], SERVERS[a.server]["pw"])
     resources.callback(c.close)
@@ -653,8 +682,7 @@ def _deploy(a, cfg, files, resources):
                               json.dumps(bootstrap, ensure_ascii=False, indent=2) + "\n")
             print("  admin не настроен — мастер /setup завершит защищённый первый вход")
     else:
-        with open(secrets_path, encoding="utf-8") as fh:
-            merged_secrets = json.load(fh)
+        merged_secrets = dict(local_secrets)
         raw_sec = run(c, "cat /etc/vpn-panel/secrets.json 2>/dev/null").strip()
         if raw_sec:
             try:
@@ -675,9 +703,7 @@ def _deploy(a, cfg, files, resources):
         with sftp.open("/etc/systemd/system/vpn-panel.service", "w") as f:
             f.write(PANEL_SERVICE)
     template_dir = os.path.join(PANEL_DIR, os.pardir, "install", "templates")
-    for unit_name in ("redut-dns-rescue.service",
-                      "redut-dns-rescue-watchdog.service",
-                      "redut-dns-rescue-watchdog.timer"):
+    for unit_name in DNS_SERVICE_FILES:
         unit_src = os.path.join(template_dir, unit_name)
         if not os.path.isfile(unit_src):
             sys.exit("нет systemd-шаблона %s" % unit_src)

@@ -59,10 +59,12 @@ class TestBootstrapResult(unittest.TestCase):
             if "wg show wg0 peers" in command:
                 return "1"
             if "mangle -S PREROUTING" in command:
-                return ("-A PREROUTING -d 192.0.2.10/32 -j RETURN\n"
-                        "-A PREROUTING -d %s -j RETURN\n"
-                        "-A PREROUTING -j MARK --set-xmark 0x64/0xffffffff"
-                        % profile["subnet"])
+                return "-A PREROUTING -s %s -j REDUT_PREROUTING" % profile["subnet"]
+            if "mangle -S REDUT_PREROUTING" in command:
+                prefix = "-A REDUT_PREROUTING -s %s " % profile["subnet"]
+                return (prefix + "-d 192.0.2.10/32 -j RETURN\n"
+                        + prefix + "-d %s -j RETURN\n" % profile["subnet"]
+                        + prefix + "-j MARK --set-xmark 0x64/0xffffffff")
             if "MASQUERADE" in command:
                 return "1"
             if "CHANGE_ME" in command:
@@ -77,6 +79,7 @@ class TestBootstrapResult(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             problems, _warnings = bootstrap.verify(object(), profile, net, True)
         self.assertTrue(any("панель /healthz" in item for item in problems))
+        self.assertEqual(len(problems), 1)
 
 
 class TestDeployResult(unittest.TestCase):
