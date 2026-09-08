@@ -12,6 +12,42 @@ from providers.proxy6 import norm_proxy6
 
 
 class TestProviderReadContracts(unittest.TestCase):
+    def test_proxy6_catalog_and_stock_reject_malformed_values(self):
+        p = Proxy6('fake-key')
+        for value in ('us', {'us': 1}, None, ['us', 'not-a-country']):
+            with self.subTest(countries=value), mock.patch.object(p, '_api', return_value={'list':value}):
+                with self.assertRaises(ProviderError):
+                    p.getcountry()
+        for value in (True, 1.5, None, -1, 'bad'):
+            with self.subTest(count=value), mock.patch.object(p, '_api', return_value={'count':value}):
+                with self.assertRaises(ProviderError):
+                    p.getcount('us')
+
+    def test_proxy6_price_must_match_requested_quantity_and_period(self):
+        p = Proxy6('fake-key')
+        correct = dict(price=28,balance=500,currency='RUB',period=7,count=1)
+        for changes in ({'period':30}, {'count':2}, {'period':True}, {'count':None}):
+            with self.subTest(changes=changes), mock.patch.object(p, '_api', return_value=dict(correct,**changes)):
+                with self.assertRaises(ProviderError):
+                    p.getprice(1,7)
+
+    def test_proxy6_invalid_amount_cannot_pass_financial_preflight(self):
+        import money
+        from test_money import cfg
+        provider = Proxy6('fake-key')
+        pool = SimpleNamespace(buys_today=lambda:0,spent_today=lambda currency:0)
+        correct = dict(price=28,balance='500.00',currency='RUB',period=7,count=1)
+        for field in ('price','balance'):
+            for value in (True,[],{},None,'',-1,float('inf')):
+                with self.subTest(field=field,value=value), mock.patch.object(
+                        provider,'_api',return_value=dict(correct,**{field:value})):
+                    with self.assertRaises(ProviderError):
+                        money.preflight_buy(pool,provider,cfg(),country='de',period=7,auto=False)
+        with mock.patch.object(provider,'_api',return_value=dict(correct,price='28.00')):
+            result = money.preflight_buy(pool,provider,cfg(),country='de',period=7,auto=False)
+        self.assertEqual(result['price'],28)
+        self.assertEqual(result['balance_before'],500)
+
     def test_proxy6_requires_an_explicit_success_status(self):
         for reply in ({}, [], {'error': 'upstream failed'}, {'status': 'maybe'}):
             with self.subTest(reply=reply), mock.patch.object(p6_mod, 'http_get_json', return_value=reply):
@@ -20,7 +56,7 @@ class TestProviderReadContracts(unittest.TestCase):
 
     def test_missing_currency_is_not_assumed_to_be_rubles(self):
         p = Proxy6('fake-key')
-        with mock.patch.object(p, '_api', return_value={'price': 5, 'balance': 50}):
+        with mock.patch.object(p, '_api', return_value={'price': 5, 'balance': 50, 'count':1, 'period':7}):
             self.assertIsNone(p.balance()['currency'])
             self.assertIsNone(p.getprice(1, 7)['currency'])
 
@@ -161,7 +197,8 @@ class TestCatalogPanel(unittest.TestCase):
     def test_proxyline_market_works_without_proxy6_and_never_spends(self):
         from webpanel import server
         provider = ProxyLine('fake-key')
-        app = SimpleNamespace(cfg={}, providers={'proxyline': provider})
+        app = SimpleNamespace(cfg={}, providers={'proxyline': provider}, pool=SimpleNamespace(
+            pending_spend_operations=lambda: [], unacknowledged_spend_operations=lambda: []))
         with mock.patch.object(server, 'APP', app), \
                 mock.patch.object(provider, 'countries', return_value=[
                     {'code': 'us', 'name': 'USA'}, {'code': 'ru', 'name': 'Russia'}]), \
@@ -169,7 +206,7 @@ class TestCatalogPanel(unittest.TestCase):
                 mock.patch.object(provider, 'prolong') as spend:
             result = server.Handler._market(SimpleNamespace(), {'provider': ['proxyline']})
         self.assertEqual([c['code'] for c in result['countries']], ['us'])
-        self.assertFalse(result['money_supported'])
+        self.assertTrue(result['money_supported'])
         spend.assert_not_called()
 
     def test_blocked_country_is_rejected_before_quote_or_stock(self):

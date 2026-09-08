@@ -44,8 +44,8 @@ BOOTSTRAP_TTL = 24 * 3600
 AGENT_FILES = ["update.py", "config_store.py", "config_schema.py", "health.py", "learning.py",
                "metrics.py", "replay.py",
                "dns_probe.py", "dns_evidence.py", "dns_runtime.py", "dns_rescue.py",
-               "agent.py", "pool.py", "probe.py", "apply.py", "money.py", "proxywing_orders.py",
-               "states.py", "alerts.py", "country.py",
+               "agent.py", "pool.py", "probe.py", "apply.py", "money.py", "proxywing_orders.py", "proxyline_orders.py",
+               "auto_purchase.py", "states.py", "alerts.py", "country.py",
                "providers/__init__.py", "providers/base.py",
                "providers/proxyline.py", "providers/proxy6.py", "providers/proxywing.py"]
 # server.py импортирует sysinfo и hygiene — класть ДО server.py, чтобы окно между
@@ -96,7 +96,7 @@ DEFAULTS = {
         # (country.STRATEGIES: reputation | balanced | speed)
         "strategy": "speed",
     },
-    "auto_prolong": {"enabled": True, "days_before": 3, "period_days": 30},
+    "auto_prolong": {"enabled": True, "days_before": 3, "period_days": 30, "proxywing_months": 1},
     "learning": {"mode": "shadow", "shadow_min_days": 30,
                  "owner_approved": False, "canary_servers": [],
                  "exploration_enabled": False, "exploration_rate": 0.05,

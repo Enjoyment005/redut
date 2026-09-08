@@ -26,7 +26,7 @@ class TestTypedCapabilities(unittest.TestCase):
             with self.assertRaises(TypeError):
                 adapter.caps["buy"] = True
         self.assertTrue(adapters[0].caps[Capability.BUY])
-        self.assertFalse(adapters[1].caps[Capability.BUY])
+        self.assertTrue(adapters[1].caps[Capability.BUY])
         self.assertFalse(adapters[2].caps[Capability.PROLONG])
 
 
@@ -218,7 +218,8 @@ class TestProviderConformance(unittest.TestCase):
                        for raw in order["proxies"]]
         self.assertGreaterEqual(len(normalized), 4)
         for item in normalized:
-            self.assertEqual(set(item), self.REQUIRED_PROXY_FIELDS)
+            expected = self.REQUIRED_PROXY_FIELDS | ({'order_id'} if item['provider'] == 'proxyline' else set())
+            self.assertEqual(set(item), expected)
             self.assertTrue(item["provider"] in PROVIDER_CLASSES)
             self.assertTrue(item["ext_id"] and item["host"])
 

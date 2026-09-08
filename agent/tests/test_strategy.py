@@ -105,7 +105,7 @@ class TestAutoBuyGate(unittest.TestCase):
         self.assertNotIn("ng", cands)                  # рискованные — только вручную
         self.assertNotIn("kz", cands)
         self.assertIn("jp", cands)
-        self.assertEqual(cands[:2], ["fi", "ee"])      # trusted вперёд, порядок списка сохранён
+        self.assertEqual(cands, ["jp"])  # Countries absent from the actual catalog cannot be bought.
         self.assertEqual(cands, money.buy_candidates(
                                                      {"countries": {"whitelist": WL,
                                                                     "strategy": "reputation"}},
@@ -121,7 +121,7 @@ class TestAutoBuyGate(unittest.TestCase):
         # авто-гейта у «скорости» нет (вес страны 0 — рейтинг никого не двигает):
         # порядок — внутренний, ближние первыми, страны провайдера в хвосте
         cands = money.buy_candidates(cfg("speed"), available=["ng", "jp"])
-        self.assertEqual(cands[0], "fi")
+        self.assertEqual(cands[0], "jp")
         self.assertEqual(set(cands[-2:]), {"ng", "jp"})
 
 

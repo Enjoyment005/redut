@@ -1,4 +1,5 @@
-"""Explicit monthly ProxyWing purchases with USD budgets and durable receipts."""
+"""Explicit monthly ProxyWing orders with exact prices and durable payment receipts."""
+import datetime
 import hashlib
 import re
 
@@ -13,7 +14,7 @@ BUDGET_DEFAULTS = {'enabled': False, 'max_price_per_buy': 0.0,
 
 
 def validate_budget(value):
-    """Require an explicit independent USD budget, never reuse numeric RUB limits."""
+    """Validate the legacy budget endpoint for older clients; the new shop does not use it."""
     if not isinstance(value, dict) or type(value.get('enabled')) is not bool:
         raise money.SpendDenied('ProxyWing: задай отдельный бюджет в USD')
     out = {'enabled': value['enabled']}
@@ -67,7 +68,9 @@ def quote(provider, cfg, kind, request):
         if len(items) != 1:
             raise money.SpendDenied('ProxyWing: товар отсутствует или неоднозначен')
         product = items[0]
-        cc = product['country'] or request.get('country')
+        cc = product['country']
+        if not cc:
+            raise money.SpendDenied('ProxyWing: API не подтвердил страну этого тарифа')
         if country.is_blocked(cc, cfg):
             raise money.SpendDenied('ProxyWing: страна товара запрещена')
         if product['country'] and request.get('country') and product['country'] != request['country']:
@@ -88,19 +91,11 @@ def quote(provider, cfg, kind, request):
 
 def _gates(pool, cfg, kind, request, price, balance, *, reserved=False):
     check_spend_config(cfg)
-    limits = budget(cfg)
-    if not limits['enabled']:
-        raise money.SpendDenied('ProxyWing: ручные траты выключены в отдельном бюджете USD')
-    if kind == 'buy' and not money.limits(cfg)['buy_enabled']:
-        raise money.SpendDenied('ProxyWing: покупка новых прокси запрещена настройкой покупок')
-    if price > request['max_total'] or price > limits['max_price_per_buy']:
-        raise money.SpendDenied('ProxyWing: цена выше подтверждённой суммы или лимита операции USD')
-    if money._safe_spent_today(pool, 'USD') + price > limits['max_spend_per_day']:
-        raise money.SpendDenied('ProxyWing: исчерпан дневной бюджет USD')
-    if not reserved and balance - price < limits['min_balance_reserve']:
-        raise money.SpendDenied('ProxyWing: недостаточно баланса с учётом резерва USD')
-    if kind == 'buy' and pool.buys_today() >= money.limits(cfg)['max_buys_per_day']:
-        raise money.SpendDenied('ProxyWing: исчерпан общий лимит числа покупок')
+    money._safe_spent_today(pool, 'USD', allow_unreported=True)
+    if price > request['max_total']:
+        raise money.SpendDenied('ProxyWing: цена выше выбранной суммы продления или покупки')
+    if not reserved and balance < price:
+        raise money.SpendDenied('ProxyWing: недостаточно средств на балансе USD')
 
 
 def _receipt(op, response):
@@ -144,11 +139,13 @@ def finish(pool, op, receipt, recovered=False):
               'date_end': receipt.get('next_due_date'), 'recovered': recovered,
               'uids': [r['uid'] for r in siblings], 'spend_operation_id': op['id'],
               'warning': 'API списал сумму выше предварительной цены' if receipt['total'] > op['quote_price'] else ''}
+    if op['kind'] == 'prolong':
+        result['days'] = (money._date_value(receipt['next_due_date']) - money._date_value(req['date_before'])).days
     pool.complete_spend_operation(op['id'], [{'provider': 'proxywing', 'op': op['kind'],
         'price': receipt['total'], 'currency': 'USD', 'uid': op.get('uid'),
         'order_id': receipt['order_id']}], date_updates=updates, result=result,
         hold_order=('proxywing', req['family'], receipt['order_id']) if op['kind'] == 'buy' else None)
-    pool.log_event(op['kind'], actor='user', result='recovered' if recovered else 'ok',
+    pool.log_event(op['kind'], actor=req.get('actor', 'user'), result='recovered' if recovered else 'ok',
                    detail='ProxyWing %s: %.2f USD, %s months' % (receipt['order_id'], receipt['total'], req['months']))
     return result
 
@@ -161,8 +158,9 @@ def recover(pool, op):
     return finish(pool, op, response, recovered=True)
 
 
-def execute(pool, provider, cfg, body):
-    """An authenticated manual request may replay the exact provider idempotency key."""
+def execute(pool, provider, cfg, body, *, actor='user', job_key=None, job_raw=None,
+            before_submit=None):
+    """Only manual retries may resend an uncertain provider idempotency key."""
     kind, expected = intent(body)
     if getattr(provider, 'name', None) != 'proxywing':
         raise money.SpendDenied('ProxyWing: неверный адаптер')
@@ -171,6 +169,8 @@ def execute(pool, provider, cfg, body):
         raise money.SpendDenied('ProxyWing: нужен request_id')
     rid, key = money._request_identity(body['request_id'])
     with money._spend_lock(pool):
+        if actor != 'user' and (not job_key or not job_raw or pool.get_setting(job_key) != job_raw):
+            raise money.SpendDenied('ProxyWing: автоматический запрос изменился; дождись следующего цикла')
         op = pool.get_spend_operation_by_idempotency(key)
         if op:
             money._validate_bound_request(op, kind, 'proxywing', expected)
@@ -180,10 +180,27 @@ def execute(pool, provider, cfg, body):
                 raise money.SpendDenied('ProxyWing: запрос завершён ошибкой', replace_request=True)
             if (op.get('result') or {}).get('provider_response'):
                 return money._deliver_result(pool, recover(pool, op), rid)
+            if actor != 'user' and op['phase'] == 'submitted':
+                raise money.SpendDenied('ProxyWing: результат оплаты неизвестен; нужен повтор исходного запроса в панели')
         else:
             money._guard_new_request(pool, {'proxywing': provider}, actor='user')
         with money._retire_planned_on_denial(pool, op):
+            if actor != 'user':
+                if kind == 'buy':
+                    from auto_purchase import check_buy
+                    check_buy(cfg, pool, expected['country'])
+                else:
+                    if not ((cfg or {}).get('auto_prolong') or {}).get('enabled', True):
+                        raise money.SpendDenied('ProxyWing: автопродление выключено')
+                    if op is None and renewed_today(pool, expected['order_id']):
+                        raise money.SpendDenied('ProxyWing: этот заказ уже продлевался сегодня')
             current = quote(provider, cfg, kind, expected)
+            if actor != 'user' and kind == 'prolong':
+                import probe
+                days = probe.days_left(current.get('next_due_date'))
+                threshold = float(((cfg or {}).get('auto_prolong') or {}).get('days_before', 3))
+                if days is None or days > threshold:
+                    raise money.SpendDenied('ProxyWing: по сроку провайдера продлевать ещё рано')
             # A submitted request reserves this local operation and blocks new ones.
             # The account balance may already include its charge. A fresh price
             # ceiling still protects a crash between journaling and actual HTTP.
@@ -192,6 +209,7 @@ def execute(pool, provider, cfg, body):
             if op and current['total'] > op['quote_price']:
                 raise money.SpendDenied('ProxyWing: цена выросла; требуется сверка исходной операции')
             if op is None:
+                expected['actor'] = actor
                 if kind == 'prolong':
                     if money._date_value(current.get('next_due_date')) is None:
                         raise money.SpendDenied('ProxyWing: исходная дата заказа не подтверждена')
@@ -204,6 +222,12 @@ def execute(pool, provider, cfg, body):
         expected = op['request']
         already_submitted = op['phase'] == 'submitted'
         def on_submit():
+            if actor != 'user':
+                if not callable(before_submit):
+                    raise money.SpendDenied('ProxyWing: отсутствует проверка боевого канала перед оплатой')
+                before_submit()
+                if pool.get_setting(job_key) != job_raw:
+                    raise money.SpendDenied('ProxyWing: автоматический запрос изменился')
             if pool.get_spend_operation(op['id'])['phase'] == 'planned':
                 pool.transition_spend_operation(op['id'], 'submitted')
         try:
@@ -211,7 +235,7 @@ def execute(pool, provider, cfg, body):
                 response = provider.order_product(expected['family'], expected['product_id'], 'monthly', rid, on_submit)
             else:
                 response = provider.extend_order(expected['family'], expected['order_id'], expected['months'], rid, on_submit)
-        except ProviderError as error:
+        except (ProviderError, money.SpendDenied) as error:
             phase = pool.get_spend_operation(op['id'])['phase']
             if phase == 'planned' or (not already_submitted and
                     (getattr(error, 'definitive', False) or getattr(error, 'unsent', False))):
@@ -225,3 +249,23 @@ def execute(pool, provider, cfg, body):
         pool.record_spend_response(op['id'], {'provider_response': receipt})
         result = finish(pool, op, receipt)
         return money._deliver_result(pool, result, rid)
+
+
+def renewed_today(pool, order_id):
+    """An order may contain several IPs, but automatic renewal is charged once."""
+    day = datetime.datetime.now().strftime('%Y-%m-%d')
+    return bool(pool.conn.execute(
+        "SELECT 1 FROM money WHERE provider='proxywing' AND op='prolong' "
+        "AND order_id=? AND ts LIKE ? LIMIT 1", (order_id, day + '%')).fetchone())
+
+
+def pending_renewal(pool, family, order_id):
+    """Expose only the exact retry intent, never the account credential fingerprint."""
+    for op in pool.pending_spend_operations() + pool.unacknowledged_spend_operations():
+        req = op['request']
+        if (op['provider'] == 'proxywing' and op['kind'] == 'prolong'
+                and req.get('family') == family and req.get('order_id') == order_id):
+            return dict(kind='prolong', family=family, order_id=order_id,
+                        months=req['months'], max_total=req['max_total'],
+                        request_id=op['idempotency_key'].removeprefix('request-v1:'))
+    return None

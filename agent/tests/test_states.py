@@ -411,6 +411,9 @@ class TestBuyOnlyWhenPoolEmpty(unittest.TestCase):
     class _Prov:
         caps = {"buy": True}
 
+        def getcountry(self, version):
+            return ['fi', 'lv']
+
         def __init__(self):
             self.bought = False
 

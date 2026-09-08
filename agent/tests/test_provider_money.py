@@ -244,7 +244,9 @@ class TestProxylineProlong(unittest.TestCase):
 
         def fake(url, fields, headers=None, timeout=None, host_label="", **kw):
             cap.update(url=url, fields=fields, headers=headers)
-            return {"balance": "59.33", "price": "1.20", "currency": "USD"}
+            return [dict(id=ident, order_id=42, ip='203.0.113.10', type='1',
+                         country='us', ip_version=4, date_end='2026-10-10T12:00:00')
+                    for ident in (27039329, 27914928)]
         pl_mod.http_post_form = fake
         r = ProxyLine("PLKEY").prolong(["27039329", "27914928"], 30)
         self.assertTrue(cap["url"].endswith("/api/renew/"))
@@ -253,6 +255,8 @@ class TestProxylineProlong(unittest.TestCase):
         self.assertEqual(cap["headers"]["API-KEY"], "PLKEY")
         self.assertEqual(r["period"], 30)
         self.assertEqual(r["currency"], "USD")
+        self.assertIsNone(r['price'])
+        self.assertEqual(len(r['proxies']), 2)
 
     def test_validation(self):
         p = ProxyLine("PLKEY")

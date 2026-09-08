@@ -78,7 +78,7 @@ def load_config(path=None):
                             "exploration_enabled": False, "exploration_rate": 0.05,
                             "exploration_max_per_day": 1,
                             "exploration_purchase_budget_per_day": 0.0}
-    defaults["auto_prolong"] = {"enabled": True, "days_before": 3, "period_days": 30}
+    defaults["auto_prolong"] = {"enabled": True, "days_before": 3, "period_days": 30, "proxywing_months": 1}
     defaults["update"] = {"auto": True, "window": "04:00-06:00",
                           "repo": "Enjoyment005/redut"}
     src = "dev-дефолты"
@@ -1039,8 +1039,10 @@ def cmd_auto_prolong(cfg, args):
     r = states_mod.auto_prolong(cfg, providers, p, alerter, log=print, actor="auto")
     if r.get("skipped"):
         print("  пропуск: %s" % r["skipped"])
+    elif r.get("errors") or not r.get("ok"):
+        print("  автопродление не выполнено: %s" % (r.get("reason") or r.get("errors")))
     elif not r.get("prolonged"):
-        print("  продлевать нечего — до истечения ещё далеко")
+        print("  продлений нет: проверены срок и состояние текущего канала")
     p.close()
     return 0 if r.get("ok") else 1
 

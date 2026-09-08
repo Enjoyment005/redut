@@ -68,6 +68,7 @@ class TestCleanInstallAndReinstall(unittest.TestCase):
         for rel in installed:
             self.assertTrue(os.path.isfile(os.path.join(self.installer.OPT, rel)), rel)
         self.assertTrue(os.path.isfile(os.path.join(self.installer.OPT, "metrics.py")))
+        self.assertTrue(os.path.isfile(os.path.join(self.installer.OPT, "auto_purchase.py")))
         self.assertTrue(os.path.isfile(os.path.join(self.installer.OPT, "VERSION")))
 
         config_path = os.path.join(self.installer.ETC, "config.json")

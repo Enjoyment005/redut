@@ -38,6 +38,8 @@ import country as country_mod
 import health as health_mod
 import money as money_mod
 import probe as probe_mod
+import proxywing_orders as proxywing_orders_mod
+import proxyline_orders as proxyline_orders_mod
 from providers import ProviderError
 
 # --- состояния (§8) ---
@@ -1997,56 +1999,10 @@ def try_replenish(cfg, providers, pool, alerter, log, actor):
             % len(still))
         return {"ok": False, "reason": "в пуле есть %d непроверенных кандидатов — покупка не нужна" % len(still),
                 "have_candidates": len(still)}
-    prov = providers.get("proxy6")
-    if prov is None or not prov.caps.get("buy"):
-        _alert_once(pool, alerter, "pool_empty", detail="нет ключа PROXY6 — докупить нечем")
-        return {"ok": False, "reason": "нет провайдера с покупкой (PROXY6)"}
-    lim = money_mod.limits(cfg)
-    # порядок перебора задаёт умная оценка: сначала надёжные страны выхода,
-    # страны с низкой репутацией автоматика не берёт вовсе (§6.1, 2026-08-15);
-    # выученная стабильность пар добавляет свой бонус (F8)
-    wl = money_mod.buy_candidates(cfg, pool=pool)
-    period = int(lim["buy_period_days"])
-    version = int(lim["buy_version"])
-    if job is None and not lim.get("buy_enabled"):
-        _alert_once(pool, alerter, "no_funds", detail="тумблер покупок buy_enabled=false — купи руками")
-        return {"ok": False, "reason": "покупки выключены тумблером (§6.2)"}
-
-    # На retry используем точное durable-намерение, а не новый снимок рынка.
-    if job is not None:
-        intent = job["intent"]
-        try:
-            pick = str(intent["country"])
-            period = int(intent["period"])
-            version = int(intent["version"])
-        except (KeyError, TypeError, ValueError) as error:
-            raise money_mod.SpendDenied("durable replenish intent повреждён") from error
-        avail = "retry"
-    else:
-        pick = avail = None
-        for cc in wl:
-            try:
-                n = prov.getcount(cc, version)
-            except ProviderError as e:
-                if e.code == 105:
-                    alerter.api_105(detail=str(e))
-                    return {"ok": False, "reason": "PROXY6 105 (неверный IP)", "api105": True}
-                log("  getcount %s: %s" % (cc, e))
-                continue
-            if n > 0:
-                pick, avail = cc, n
-                break
-        if not pick:
-            _alert_once(pool, alerter, "no_market", detail="проверены страны: %s" % ",".join(wl))
-            return {"ok": False, "reason": "нет прокси version=%d в наличии (§10 error 300)" % version}
-        job, job_raw = _begin_money_job(
-            pool, job_key, {"country": pick, "period": period, "version": version})
-
-    log("  REPLENISH: покупаю в %s (в наличии %s), период %d дн" % (pick, avail, period))
     try:
-        r = money_mod.plan_and_buy(pool, prov, cfg, country=pick, period=period, count=1,
-                                   version=version, server=cfg.get("server"), actor=actor,
-                                   request_id=job["request_id"])
+        from auto_purchase import purchase
+        r, job, job_raw = purchase(cfg, providers, pool, job_key, actor=actor, log=log)
+        pick = r['country']
     except money_mod.SpendDenied as e:
         _drop_unbound_money_job(pool, job_key, job, job_raw)
         _alert_once(pool, alerter, "no_funds", detail=str(e))
@@ -2067,8 +2023,16 @@ def try_replenish(cfg, providers, pool, alerter, log, actor):
     # постфактум проверка реальной страны выхода (§6.1) + apply рабочего
     checks = postbuy_check(cfg, pool, providers, r["proxies"], actor, log)
     for uid, res, blocked in checks:
+        if res.get('ok') and not blocked:
+            pool.set_role(uid, 'auto')
+    for uid, res, blocked in checks:
         if blocked or not res.get("ok"):
             continue
+        from auto_purchase import activation_allowed
+        if not activation_allowed(cfg, pool, job):
+            _finish_money_job(pool, job_key, job_raw)
+            return {'ok': False, 'bought': True,
+                    'reason': 'покупка подтверждена; канал или стратегия изменились, применение отменено'}
         row = pool.get(uid) or dict(uid=uid)
         try:
             ar = apply_mod.apply_candidate(cfg, row, res, log=log, _locked=True,
@@ -2104,27 +2068,20 @@ def try_replenish(cfg, providers, pool, alerter, log, actor):
 
 
 def postbuy_check(cfg, pool, providers, bought, actor, log):
-    """§6.1 постфактум: подтянуть паспорт (getproxy) и проверить РЕАЛЬНУЮ страну
-    выхода. Выход в жёстком блоке СНГ -> off + алерт, не используем."""
+    """Import confirmed purchases and test their real exit; failed or forbidden stays off."""
     current_host = apply_mod.current_upstream(apply_mod.load_json(cfg["singbox_config"]))
-    prov = providers.get("proxy6")
-    if prov is not None:
-        try:
-            # keep_hosts: refresh убирает из пула всё, чего провайдер не отдал, —
-            # строка боевого канала должна пережить постпокупочный опрос
-            pool.refresh({"proxy6": prov}, actor=actor,
-                         keep_hosts={current_host} if current_host else None)
-        except Exception:
-            pass
     out = []
     for pxy in bought:
-        uid = "%s:%s" % (pxy["provider"], pxy["ext_id"])
-        row = pool.get(uid) or dict(pxy, uid=uid)
+        uid = pool.upsert_proxy(pxy)
+        row = pool.get(uid)
         res = _probe(pool, providers, row, current_host, cfg)
-        blocked = (res.get("exit_cc") in probe_mod.HARD_BLOCK_CC
+        blocked = (country_mod.is_blocked(res.get('exit_cc'), cfg)
+                   or country_mod.is_blocked(pxy.get('country'), cfg)
+                   or res.get("exit_cc") in probe_mod.HARD_BLOCK_CC
                    or str(res.get("disqualified") or "").startswith("blocked-cc"))
-        if blocked:
+        if blocked or not res.get('ok'):
             pool.set_role(uid, "off")
+        if blocked:
             pool.log_event("buy-postcheck", actor=actor, to_uid=uid, result="blocked-cc",
                            detail="реальный выход cc=%s в жёстком блоке §6.1 -> off" % res.get("exit_cc"))
         out.append((uid, res, blocked))
@@ -2135,6 +2092,7 @@ def postbuy_check(cfg, pool, providers, bought, actor, log):
 # Охват — только текущий боевой. Прежний scope "current+reserve" опирался на роль
 # reserve и умер вместе с ней (П9, роли v2): ролей две — auto|off.
 DEFAULT_AUTO_PROLONG = {
+    "proxywing_months": 1,
     "enabled": True,        # тумблер: выключить — и продлевать будем только руками
     "days_before": 3,       # продлевать, когда до конца осталось не больше стольких дней
     "period_days": 30,      # на сколько продлевать за раз (у PROXY6 цена линейна: 4 ₽/сутки)
@@ -2163,7 +2121,7 @@ def notify_vanished(pool, alerter, log=print, actor="auto"):
         days = probe_mod.days_left(item.get("date_end"))
         if days is None or days <= 0:
             continue                     # аренда и так кончилась — это не потеря денег
-        paid.append(dict(item, days_left=round(days, 1)))
+        paid.append(dict(item, days_left=round(days, 1) if days is not None else None))
     if not paid:
         return {"notified": 0, "seen": len(items)}
     detail = "; ".join("%s (%s, оплачено ещё %s дн)"
@@ -2187,24 +2145,42 @@ def auto_prolong(cfg, providers, pool, alerter, log=print, actor="auto"):
 
     Кого трогаем: только текущий боевой и только если он ЗДОРОВ — мёртвый
     продлевать бессмысленно, его заменит ротация.
-    Деньги идут через те же гейты §6.2 (тумблер, потолок цены, суточный лимит, остаток).
+    Автопродление управляется отдельным переключателем; проверяем доступный баланс и журнал оплаты.
     """
     pool.observe_provider_errors(providers, actor=actor)
     ap = auto_prolong_cfg(cfg)
     if not ap.get("enabled"):
         return {"ok": True, "skipped": "автопродление выключено тумблером"}
 
+    _retire_obsolete_proxywing_renewals(cfg, pool)
+
     current_host = apply_mod.current_upstream(apply_mod.load_json(cfg["singbox_config"]))
     # include_gone (ревью 1.3.0): после удаления ключа строки провайдера помечены
     # gone, но боевой канал в sing-box живёт — без gone-строк главный C5-случай
     # «продлить боевой нечем» давал молчаливый skip вместо события и письма
     rows = pool.list(include_gone=True)
-    targets = [r for r in rows if current_host and r["host"] == current_host]
+    current_uid = _current_proxy_uid(pool, apply_mod.load_json(cfg['singbox_config']))
+    targets = [r for r in rows if r['uid'] == current_uid]
+    _retire_obsolete_proxy6_renewals(cfg, pool)
+    _retire_obsolete_proxyline_renewals(cfg, pool)
     if not targets:
-        return {"ok": True, "skipped": "боевой прокси не найден в пуле"}
+        reason = 'боевой прокси не определён однозначно по адресу, порту и учётным данным'
+        pool.log_event('auto-prolong', actor=actor, result='denied', detail=reason)
+        alerter.prolong_failed(uid=None, days_left=None, reason=reason)
+        return {'ok': False, 'prolonged': [], 'reason': reason}
 
-    done = []
+    done, errors = [], []
     for row in targets:
+        if row['provider'] == 'proxyline':
+            result = _auto_prolong_proxyline(cfg, providers, pool, alerter, row, ap, log, actor, errors=errors)
+            if result:
+                done.append(result)
+            continue
+        if row['provider'] == 'proxywing':
+            result = _auto_prolong_proxywing(cfg, providers, pool, alerter, row, ap, log, actor, errors=errors)
+            if result:
+                done.append(result)
+            continue
         uid = row["uid"]
         job_key = "money_request:auto-prolong:%s" % uid
         job = job_raw = None
@@ -2214,16 +2190,19 @@ def auto_prolong(cfg, providers, pool, alerter, log=print, actor="auto"):
             log("  автопродление: %s durable request повреждён — %s" % (uid, e))
             pool.log_event("auto-prolong", actor=actor, to_uid=uid,
                            result="denied", detail=str(e))
+            errors.append({"uid":uid,"reason":"продление не выполнено; см. событие auto-prolong"})
             alerter.prolong_failed(uid=uid, days_left=None, reason=str(e))
             continue
+        bound = money_mod.bound_spend_request(pool, job["request_id"]) if job else None
+        unsent = bound is None or bound["phase"] == "planned"
         days = probe_mod.days_left(row["date_end"])
-        if job is None and (days is None or days > float(ap["days_before"])):
+        if unsent and (days is None or days > float(ap["days_before"])):
             continue                      # ещё рано — не морозим деньги заранее
-        if job is None and not row["probe_ok"]:
+        if unsent and not row["probe_ok"]:
             log("  автопродление: %s не прошёл последнюю пробу — продлевать не буду, "
                 "пусть его заменит ротация" % uid)
             continue
-        if job is None and pool.prolonged_today(uid):
+        if unsent and pool.prolonged_today(uid):
             # защита от повторов: крон может сработать не раз
             continue
         # C5: адаптер СТРОГО по провайдеру строки. Константа proxy6 при боевом от
@@ -2236,7 +2215,8 @@ def auto_prolong(cfg, providers, pool, alerter, log=print, actor="auto"):
                 % (uid, row["provider"]))
             pool.log_event("auto-prolong", actor=actor, to_uid=uid, result="no-provider",
                            detail="нет ключа/адаптера %s — продление невозможно" % row["provider"])
-            alerter.prolong_failed(uid=uid, days_left=round(days, 1),
+            errors.append({"uid":uid,"reason":"продление не выполнено; см. событие auto-prolong"})
+            alerter.prolong_failed(uid=uid, days_left=round(days, 1) if days is not None else None,
                                    reason="нет ключа провайдера %s — боевой истечёт без продления"
                                           % row["provider"])
             continue
@@ -2251,9 +2231,16 @@ def auto_prolong(cfg, providers, pool, alerter, log=print, actor="auto"):
                     raise money_mod.SpendDenied(
                         "durable auto-prolong intent связан с другим uid")
                 period_days = int(intent["days"])
+            def before_submit():
+                latest = pool.get(uid)
+                if (not latest or not latest['probe_ok']
+                        or _current_proxy_uid(pool, apply_mod.load_json(cfg['singbox_config'])) != uid
+                        or pool.get_setting(job_key) != job_raw):
+                    raise money_mod.SpendDenied('боевой канал или запрос изменился перед оплатой')
             r = money_mod.prolong_with_limits(pool, prov, cfg, row=row,
                                               days=period_days, actor=actor,
-                                              request_id=job["request_id"])
+                                              request_id=job["request_id"], automatic=True,
+                                              before_submit=before_submit)
             log("  автопродление: %s +%s дн за %s %s (до %s)"
                 % (uid, r["days"], r["price"], r["currency"], r["date_end"]))
             alerter.prolonged(uid=uid, days=r["days"], price=r["price"], currency=r["currency"],
@@ -2267,13 +2254,217 @@ def auto_prolong(cfg, providers, pool, alerter, log=print, actor="auto"):
             # Тихо промолчать нельзя: иначе якорь истечёт и мы получим холодный IP.
             log("  автопродление: %s ОТКАЗ гейта — %s" % (uid, e))
             pool.log_event("auto-prolong", actor=actor, to_uid=uid, result="denied", detail=str(e))
-            alerter.prolong_failed(uid=uid, days_left=round(days, 1), reason=str(e))
+            errors.append({"uid":uid,"reason":"продление не выполнено; см. событие auto-prolong"})
+            alerter.prolong_failed(uid=uid, days_left=round(days, 1) if days is not None else None, reason=str(e))
         except Exception as e:
             _drop_unbound_money_job(pool, job_key, job, job_raw)
             log("  автопродление: %s ошибка провайдера — %s" % (uid, e))
             pool.log_event("auto-prolong", actor=actor, to_uid=uid, result="fail", detail=str(e))
-            alerter.prolong_failed(uid=uid, days_left=round(days, 1), reason=str(e))
-    return {"ok": True, "prolonged": done, "checked": [r["uid"] for r in targets]}
+            errors.append({"uid":uid,"reason":"продление не выполнено; см. событие auto-prolong"})
+            alerter.prolong_failed(uid=uid, days_left=round(days, 1) if days is not None else None, reason=str(e))
+    return {"ok": not errors, "prolonged": done, "errors": errors,
+            "checked": [r["uid"] for r in targets]}
+
+
+def _current_proxy_uid(pool, sb):
+    """Match the complete outbound endpoint; a shared IP alone cannot identify a proxy."""
+    outbounds = [o for o in sb.get('outbounds', []) if o.get('tag') == 'socks-out']
+    if len(outbounds) != 1:
+        return None
+    outbound = outbounds[0]
+    port_field = {'socks': 'port_socks5', 'http': 'port_http'}.get(outbound.get('type'))
+    port = outbound.get('server_port')
+    if not port_field or type(port) is not int or not 1 <= port <= 65535:
+        return None
+    matches = [r for r in pool.list(include_gone=True)
+               if r['host'] == outbound.get('server') and r.get(port_field) == port
+               and (r.get('user') or '') == (outbound.get('username') or '')
+               and (r.get('password') or '') == (outbound.get('password') or '')]
+    return matches[0]['uid'] if len(matches) == 1 else None
+
+
+def _retire_obsolete_proxy6_renewals(cfg, pool):
+    """Cancel only unsent jobs whose active endpoint changed; keep uncertain payments."""
+    try:
+        with money_mod._spend_lock(pool):
+            current = _current_proxy_uid(pool, apply_mod.load_json(cfg['singbox_config']))
+            for op in pool.pending_spend_operations():
+                if op['provider'] != 'proxy6' or op['kind'] != 'prolong' or op['phase'] != 'planned':
+                    continue
+                key = 'money_request:auto-prolong:' + str(op.get('uid'))
+                job, raw = _load_money_job(pool, key)
+                if (job and op.get('uid') != current
+                        and op['idempotency_key'] == 'request-v1:' + job['request_id']):
+                    pool.transition_spend_operation(op['id'], 'failed', 'боевой прокси изменился до отправки')
+                    _finish_money_job(pool, key, raw)
+    except money_mod.SpendDenied:
+        pass
+
+
+def _retire_obsolete_proxyline_renewals(cfg, pool):
+    """Release only proven unsent automatic requests after the active proxy changes."""
+    try:
+        with money_mod._spend_lock(pool):
+            current_uid = _current_proxy_uid(pool, apply_mod.load_json(cfg['singbox_config']))
+            for op in pool.pending_spend_operations():
+                req = op.get('request') or {}
+                if (op['provider'] != 'proxyline' or op['phase'] != 'planned'
+                        or op['kind'] != 'prolong' or req.get('actor') != 'auto'
+                        or op.get('uid') == current_uid):
+                    continue
+                pool.transition_spend_operation(op['id'], 'failed', 'боевой прокси изменился до отправки')
+                key = 'money_request:auto-prolong:' + op['uid']
+                job, raw = _load_money_job(pool, key)
+                if job and op['idempotency_key'] == 'request-v1:' + job['request_id']:
+                    _finish_money_job(pool, key, raw)
+    except money_mod.SpendDenied:
+        pass
+
+
+def _auto_prolong_proxyline(cfg, providers, pool, alerter, row, ap, log, actor, errors=None):
+    """Renew the healthy current ProxyLine proxy once, using a durable automatic job."""
+    uid, job, raw = row['uid'], None, None
+    key = 'money_request:auto-prolong:' + uid
+    left = probe_mod.days_left(row['date_end'])
+    try:
+        job, raw = _load_money_job(pool, key)
+        op = money_mod.bound_spend_request(pool, job['request_id']) if job else None
+        if op is None or op['phase'] == 'planned':
+            if (left is None or left > float(ap['days_before']) or not row['probe_ok']
+                    or pool.prolonged_today(uid)):
+                return None
+        provider = providers.get('proxyline')
+        if provider is None:
+            raise money_mod.SpendDenied('Нет ключа ProxyLine для продления боевого прокси')
+        if op is None or op['phase'] == 'planned':
+            current_uid = _current_proxy_uid(pool, apply_mod.load_json(cfg['singbox_config']))
+            if current_uid is None:
+                raise money_mod.SpendDenied('ProxyLine: боевой прокси не определён однозначно по адресу, порту и учётным данным')
+            if current_uid != uid:
+                return None
+        if job is None:
+            period = ap.get('period_days', 30)
+            request = {'kind': 'prolong', 'uid': uid, 'period': period}
+            proxyline_orders_mod.intent(request)
+            job, raw = _begin_money_job(pool, key, request)
+        request = dict(job['intent'], request_id=job['request_id'])
+        if request.get('kind') != 'prolong' or request.get('uid') != uid:
+            raise money_mod.SpendDenied('ProxyLine: сохранённый запрос относится к другому прокси')
+        def before_submit():
+            latest = pool.get(uid)
+            current_uid = _current_proxy_uid(pool, apply_mod.load_json(cfg['singbox_config']))
+            if not latest or not latest['probe_ok'] or current_uid != uid:
+                raise money_mod.SpendDenied('ProxyLine: боевой канал изменился или не прошёл проверку')
+        result = proxyline_orders_mod.execute(pool, provider, cfg, request, actor='auto',
+            job_key=key, job_raw=raw, before_submit=before_submit)
+        log('  автопродление: %s +%s дн, до %s; сумма в кабинете ProxyLine' % (
+            uid, result['days'], result['date_end']))
+        alerter.prolonged(uid=uid, days=result['days'], price='сумма в кабинете', currency='USD',
+            balance_after=result.get('balance_after'), date_end=result['date_end'],
+            cc=row.get('exit_cc') or row.get('country'))
+        _finish_money_job(pool, key, raw)
+        return result
+    except Exception as error:
+        if errors is not None:
+            errors.append({"uid":uid, "reason":str(error)})
+        if job:
+            _drop_unbound_money_job(pool, key, job, raw)
+        pool.log_event('auto-prolong', actor=actor, to_uid=uid,
+                       result='no-provider' if providers.get('proxyline') is None else 'denied', detail=str(error))
+        log('  автопродление: %s — %s' % (uid, error))
+        alerter.prolong_failed(uid=uid, days_left=round(left, 1) if left is not None else None,
+                              reason=str(error))
+        return None
+
+
+def _retire_obsolete_proxywing_renewals(cfg, pool):
+    """Release proven unsent auto renewals after rotation; never retire a submitted payment."""
+    from providers.proxywing import order_identity
+    try:
+        with money_mod._spend_lock(pool):
+            current = _current_proxy_uid(pool, apply_mod.load_json(cfg['singbox_config']))
+            active_orders = {order_identity(row['ext_id']) for row in pool.list(include_gone=True)
+                             if row['uid'] == current and row['provider'] == 'proxywing'}
+            for operation in pool.pending_spend_operations():
+                request = operation['request']
+                identity = (request.get('family'), request.get('order_id'))
+                if (operation['provider'] != 'proxywing' or operation['kind'] != 'prolong'
+                        or operation['phase'] != 'planned' or request.get('actor') != 'auto'
+                        or identity in active_orders or (operation.get('result') or {}).get('provider_response')):
+                    continue
+                pool.transition_spend_operation(operation['id'], 'failed', 'боевой заказ изменился до отправки')
+                key = 'money_request:auto-prolong:proxywing:%s|%s' % identity
+                job, raw = _load_money_job(pool, key)
+                if job and operation['idempotency_key'] == 'request-v1:' + job['request_id']:
+                    _finish_money_job(pool, key, raw)
+    except money_mod.SpendDenied:
+        return  # An in-flight spend owns the lock; let the normal cycle retry later.
+
+
+def _auto_prolong_proxywing(cfg, providers, pool, alerter, row, ap, log, actor, errors=None):
+    """Renew the healthy current monthly order with one durable job for all its IPs."""
+    from providers.proxywing import order_identity, MONTHS
+    uid = row['uid']
+    days = probe_mod.days_left(row['date_end'])
+    job = raw = key = None
+    try:
+        family, order_id = order_identity(row['ext_id'])
+        key = 'money_request:auto-prolong:proxywing:%s|%s' % (family, order_id)
+        job, raw = _load_money_job(pool, key)
+        bound = money_mod.bound_spend_request(pool, job['request_id']) if job else None
+        if bound is None or bound['phase'] == 'planned':
+            latest = pool.get(uid)
+            current = _current_proxy_uid(pool, apply_mod.load_json(cfg['singbox_config']))
+            if (days is None or days > float(ap['days_before']) or not row['probe_ok']
+                    or not latest or not latest['probe_ok'] or latest['uid'] != current
+                    or proxywing_orders_mod.renewed_today(pool, order_id)):
+                return None
+        provider = providers.get('proxywing')
+        if provider is None:
+            raise money_mod.SpendDenied('Нет ключа ProxyWing для продления боевого заказа')
+        if job is None:
+            months = ap.get('proxywing_months', 1)
+            if type(months) is not int or months not in MONTHS:
+                raise money_mod.SpendDenied('ProxyWing: срок автопродления — 1, 3, 6 или 12 месяцев')
+            request = {'kind': 'prolong', 'family': family, 'order_id': order_id, 'months': months}
+            current = proxywing_orders_mod.quote(provider, cfg, 'prolong', request)
+            request['max_total'] = current['total']
+            job, raw = _begin_money_job(pool, key, request)
+        request = dict(job['intent'], request_id=job['request_id'])
+        if (request.get('kind') != 'prolong' or request.get('family') != family
+                or request.get('order_id') != order_id):
+            raise money_mod.SpendDenied('ProxyWing: сохранённый запрос относится к другому заказу')
+        def before_submit():
+            latest = pool.get(uid)
+            current = _current_proxy_uid(pool, apply_mod.load_json(cfg['singbox_config']))
+            if not latest or not latest['probe_ok'] or latest['uid'] != current:
+                raise money_mod.SpendDenied('ProxyWing: боевой канал изменился или не прошёл проверку')
+        result = proxywing_orders_mod.execute(pool, provider, cfg, request, actor='auto',
+                                              job_key=key, job_raw=raw, before_submit=before_submit)
+        log('  автопродление: %s +%s мес за %s USD (до %s)' % (
+            uid, result['months'], result['price'], result['date_end']))
+        added_days = result['days']
+        alerter.prolonged(uid=uid, days=added_days, price=result['price'], currency='USD',
+                          balance_after='не подтверждён', date_end=result['date_end'],
+                          cc=row.get('exit_cc') or row.get('country'))
+        _finish_money_job(pool, key, raw)
+        return dict(result, uid=uid, days=added_days)
+    except Exception as error:
+        if errors is not None:
+            errors.append({"uid":uid, "reason":str(error)})
+        if key and job:
+            try:
+                with money_mod._spend_lock(pool):
+                    op = money_mod.bound_spend_request(pool, job['request_id'])
+                    if op is None or op['phase'] == 'failed':
+                        pool.compare_and_delete_setting(key, raw)
+            except money_mod.SpendDenied:
+                pass  # Another process may be binding this job; preserve its intent.
+        pool.log_event('auto-prolong', actor=actor, to_uid=uid, result='denied', detail=str(error))
+        log('  автопродление: %s — %s' % (uid, error))
+        alerter.prolong_failed(uid=uid, days_left=round(days, 1) if days is not None else None,
+                              reason=str(error))
+        return None
 
 
 # ------------------------------------------------------------------- N+1 (§6.5)
@@ -2306,42 +2497,16 @@ def ensure_reserve(cfg, providers, pool, alerter, log, actor, min_reserve=1):
             log("  N+1: запас=%d, но покупки выключены — пропускаю" % have)
             return {"ok": False, "have": have, "bought": False}
         log("  N+1: пригодных кандидатов в пуле %d < %d — докупаю в фоне (§6.5)" % (have, min_reserve))
-        prov = providers.get("proxy6")
-        if prov is None or not prov.caps.get("buy"):
-            return {"ok": False, "have": have, "bought": False}
-        # На retry продолжаем точное сохранённое намерение, не выбираем новую страну.
-        if job is not None:
-            intent = job["intent"]
-            try:
-                pick = str(intent["country"])
-                period = int(intent["period"])
-                version = int(intent["version"])
-            except (KeyError, TypeError, ValueError) as error:
-                raise money_mod.SpendDenied("durable reserve intent повреждён") from error
-        else:
-            version = int(lim["buy_version"])
-            period = int(lim["buy_period_days"])
-            pick = None
-            for cc in money_mod.buy_candidates(cfg, pool=pool):
-                try:
-                    if prov.getcount(cc, version) > 0:
-                        pick = cc
-                        break
-                except ProviderError:
-                    continue
-            if not pick:
-                return {"ok": False, "have": have, "bought": False}
-            job, job_raw = _begin_money_job(
-                pool, job_key, {"country": pick, "period": period, "version": version})
-        r = money_mod.plan_and_buy(
-            pool, prov, cfg, country=pick, period=period,
-            count=1, version=version, server=cfg.get("server"), actor=actor,
-            request_id=job["request_id"])
+        from auto_purchase import purchase
+        r, job, job_raw = purchase(cfg, providers, pool, job_key, actor=actor,
+                                   min_reserve=min_reserve, log=log)
         checks = postbuy_check(cfg, pool, providers, r["proxies"], actor, log)
         good = [uid for uid, res, blocked in checks if res.get("ok") and not blocked]
         for uid, res, blocked in checks:
             if blocked:
                 alerter.blocked_cc(uid=uid, cc=res.get("exit_cc"))
+        for uid in good:
+            pool.set_role(uid, "auto")
         if good:
             alerter.bought(uid=good[0], price=r["price"], currency=r["currency"],
                            balance_after=r["balance_after"], country=r["country"],

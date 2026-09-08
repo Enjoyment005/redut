@@ -264,9 +264,14 @@ def _provider_api(events):
 def _spend(money, events):
     totals = defaultdict(float)
     daily = defaultdict(float)
+    unreported = Counter()
     ignored = 0
     for row in money:
         if row.get("op") not in ("buy", "prolong"):
+            continue
+        if (row.get('provider') == 'proxyline' and row.get('price_source') == 'unreported'
+                and row.get('price') is None and row.get('currency') == 'USD'):
+            unreported['USD'] += 1
             continue
         try:
             amount = float(row.get("price"))
@@ -289,6 +294,8 @@ def _spend(money, events):
                    "amount": round(daily[(day, currency)], 6)}
                   for day, currency in sorted(daily)],
         "denied": denied, "ignored_invalid_amounts": ignored,
+        "unreported": [{"currency": currency, "count": unreported[currency]}
+                       for currency in sorted(unreported)],
     }
 
 
@@ -364,7 +371,7 @@ def local_report(pool, cfg=None, now=None, window_days=DEFAULT_WINDOW_DAYS,
             pool.conn, "SELECT id,ts,ok,tg_ok,is_current FROM probe_log "
                        "ORDER BY id DESC LIMIT ?", limit)
         money_rows, money_truncated = _bounded_rows(
-            pool.conn, "SELECT id,ts,price,currency,op FROM money "
+            pool.conn, "SELECT id,ts,provider,price,currency,op,price_source FROM money "
                        "ORDER BY id DESC LIMIT ?", limit)
         shadow_rows, shadow_truncated = _bounded_rows(
             pool.conn, "SELECT id,ts,server,mode,formula_version FROM shadow_decision "

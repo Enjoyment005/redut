@@ -13,6 +13,17 @@ CSS-градиенты и inline-SVG, шрифты — системные.
 """
 
 _BASE_CSS = """
+#card_money [hidden]{display:none!important}
+.shop-head{display:flex;align-items:end;gap:18px;flex-wrap:wrap}
+.shop-head select{min-width:180px}.shop-balance{display:flex;flex-direction:column;gap:5px;margin-left:auto}
+.shop-balance strong{font-size:22px;color:var(--green,#05ffa1)}
+.shop-types{display:flex;gap:8px;margin:16px 0}#card_money .shop-types [aria-pressed="true"]{color:var(--cyan,#00e5ff);border-color:var(--cyan,#00e5ff);background:rgba(0,229,255,.08)}
+.shop-fields{display:flex;gap:12px;align-items:end;flex-wrap:wrap}.shop-fields>div{flex:1;min-width:130px}
+.shop-fields select,.shop-fields input{width:100%;min-height:42px}.shop-buy{min-height:42px;min-width:200px}
+.shop-foot{margin-top:18px;padding-top:12px;border-top:1px solid rgba(100,150,190,.15)}
+.shop-transaction{padding:6px 0}.shop-transaction b{white-space:nowrap}
+@media(max-width:650px){.shop-head{gap:10px}.shop-head select{min-width:120px}.shop-buy{width:100%}.shop-fields>div{min-width:110px}.shop-balance strong{font-size:18px}}
+
 :root{
 --bg:#04060c;--card:#0c1120;--card2:#111a2e;--line:#1a2744;--line2:#243559;
 --fg:#e3ebf7;--mut:#8095bb;--dim:#4d5d80;
@@ -452,66 +463,49 @@ _DASH_HTML = """
   </div>
 
   <div class="card fold folded" id="card_money">
-    <h2 onclick="foldClick(event,'money')">Деньги<span class="sub" id="sum_money"></span><span class="r"><button class="btn s tiny" onclick="market()">Что есть в продаже</button><span class="arr" id="fa_money">▸</span></span></h2>
-    <div class="fold-body">
-    <div class="ex">Панель умеет сама покупать прокси, когда старый умирает. Чтобы она не потратила лишнего,
-      стоят лимиты (сколько покупок в день, потолок цены, неснижаемый остаток). Лимиты меняются только
-      для PROXY6 на сервере в файле <span class="mono">/etc/vpn-panel/config.json</span>.
-      Отдельные лимиты ProxyWing в USD настраиваются ниже и требуют подтверждения.<br>
-      <b>Где покупать:</b> Россия, Украина и Беларусь — <b>никогда</b> (жёсткий запрет в коде).
-      Остальные страны разрешены, но панель ранжирует их по оценке и сама берёт только надёжные;
-      рискованную страну можно купить вручную, вписав её код в поле ниже — тогда решение на тебе.<br>
-      <b>Про адрес:</b> боевой прокси панель <b>продлевает сама</b>, пока он здоров — чтобы твой IP
-      не менялся. Это важнее экономии: цена продления и покупки одинаковая (4 ₽/сутки), но новый адрес
-      «холодный» — сайты начнут просить перелогины, капчи и подтверждения оплаты. Менять IP имеет смысл,
-      только когда старый действительно умер.</div>
-    <div class="grid" id="money"></div>
-    <div class="field"><label>Каталог провайдера</label><select id="marketprovider"><option value="proxy6">PROXY6</option><option value="proxyline">ProxyLine</option><option value="proxywing">ProxyWing · Datacenter / ISP</option></select></div>
-    <div id="marketbox" class="sub" style="margin-top:9px"></div>
-    <div id="stabbox" class="sub" style="margin-top:6px"></div>
-    <div class="field" style="margin-top:12px">
-      <div><label>страна <i class="q" tabindex="0" data-h="Список — страны из белого списка; «есть в продаже» появляется после кнопки «Что есть в продаже». Первый пункт — панель выберет сама. «Другая страна…» открывает свободный ввод кода (fi, de, nl…) — решение на тебе, сервер всё равно не пропустит запрещённые.">?</i></label>
-        <select id="buycc" style="width:220px" onchange="buyccChange(this)"><option value="">— панель выберет сама —</option></select></div>
-      <div id="buyccfreebox" style="display:none"><label>код страны</label>
-        <input id="buyccfree" style="width:100px" placeholder="fi" autocomplete="off"></div>
-      <div><label>на сколько дней</label><input id="buyperiod" style="width:110px" placeholder="7" autocomplete="off"></div>
-      <button class="btn g" onclick="buy()">Купить PROXY6</button>
-      <span class="pill warn">спишутся реальные деньги</span>
-    </div>
-    <details style="margin-top:16px" id="plbox"><summary>ProxyLine · наличие и цена в USD</summary>
-      <p class="sub">Здесь можно проверить наличие и цену нового заказа. Покупка и продление доступны
-        <a href="https://panel.proxyline.net/" target="_blank" rel="noopener noreferrer">в кабинете ProxyLine</a>.
-        Цена нового заказа не подтверждает цену продления.</p>
-      <div class="field"><button class="btn s" onclick="plMarket()">Загрузить страны ProxyLine</button>
-        <select id="plcountry"></select><select id="plkind"><option value="dedicated">Индивидуальные IPv4</option><option value="shared">Общие IPv4</option></select>
-        <div><label>Количество</label><input id="plquantity" type="number" min="1" max="100" value="1" style="width:90px"></div>
-        <div><label>Дней</label><select id="plperiod"></select></div>
-        <button class="btn s" onclick="plQuote(this)">Узнать наличие и цену</button></div>
-      <p class="sub" id="plinfo"></p><p class="sub" id="plquote"></p>
-    </details>
-    <details style="margin-top:16px" id="pwbox"><summary>ProxyWing · покупка и продление в USD</summary>
-      <p class="sub">Datacenter — обычные серверные прокси; ISP — прокси интернет-провайдера.
-      Покупка на месяц. Продление всего заказа на 1/3/6/12 месяцев — кнопкой «Продлить» в пуле.
-      Новые каналы добавляются с ролью off: сначала проверь их и выбери нужный.</p>
-      <div class="field"><button class="btn s" onclick="pwMarket()">Загрузить каталог ProxyWing</button>
-        <select id="pwfamily" onchange="pwProducts()"><option value="datacenter">Обычные · Datacenter</option><option value="isp">ISP</option></select></div>
-      <p class="sub" id="pwinfo"></p>
-      <div class="field"><select id="pwproduct" style="max-width:100%" onchange="pwProductChanged()"></select>
-        <select id="pwcountry"></select><button class="btn g" onclick="pwBuy()">Купить на месяц</button></div>
-      <p class="sub" id="pwproductinfo"></p>
-      <button class="btn s" onclick="pwResume()">Повторить незавершённый запрос</button>
-      <details style="margin-top:12px" id="pwbudgetbox"><summary>Отдельный бюджет ProxyWing в USD</summary>
-        <p class="sub">Укажи допустимые суммы и сохрани бюджет. Нулевой лимит запрещает траты.
-        Запрет новых покупок не блокирует продление действующих заказов в рамках этого бюджета.
-        Автоматические дневные покупки и продления не используют этот бюджет.</p>
-        <p class="sub" id="pwbudgethint" role="status"></p>
-        <div class="field"><label><input id="pwenabled" type="checkbox"> разрешить ручные траты</label>
-          <div><label>за операцию, USD</label><input id="pwmax" type="number" min="0" step="0.01" value="0" style="width:100px"></div>
-          <div><label>за сутки, USD</label><input id="pwday" type="number" min="0" step="0.01" value="0" style="width:100px"></div>
-          <div><label>остаток резерва, USD</label><input id="pwreserve" type="number" min="0" step="0.01" value="0" style="width:100px"></div>
-          <button class="btn s" onclick="pwBudget()">Сохранить бюджет</button></div>
-      </details>
-    </details>
+    <h2 onclick="foldClick(event,'money')">Деньги<span class="sub" id="sum_money"></span><span class="r"><span class="arr" id="fa_money">▸</span></span></h2>
+    <div class="fold-body shop">
+      <div class="shop-head">
+        <div><label for="marketprovider">Провайдер</label><select id="marketprovider" onchange="shopSelect()"><option value="proxywing">ProxyWing</option></select></div>
+        <div class="shop-balance"><span class="sub">Баланс</span><strong id="shopbalance">—</strong></div>
+        <button class="btn s tiny" onclick="shopSelect(true)" id="shoprefresh" title="Обновить каталог">Обновить</button>
+      </div>
+      <p class="sub" id="shopmessage" role="status"></p>
+      <div id="shop-proxywing" class="shop-pane" hidden>
+        <div class="shop-types" role="group" aria-label="Тип прокси">
+          <button class="btn s" id="pw-datacenter" onclick="pwChooseFamily('datacenter')" aria-pressed="true">Датацентр IPv4</button>
+          <button class="btn s" id="pw-isp" onclick="pwChooseFamily('isp')" aria-pressed="false">ISP прокси</button>
+        </div>
+        <div class="shop-fields">
+          <div><label for="pwcountry">Страна</label><select id="pwcountry" onchange="pwCountriesChanged()"></select></div>
+          <div id="pwlocationbox" hidden><label for="pwlocation">Локация</label><select id="pwlocation" onchange="pwLocationsChanged()"></select></div>
+          <div><label for="pwquantity">Количество</label><select id="pwquantity" onchange="pwProductChanged()"></select></div>
+          <button class="btn g shop-buy" id="pwbuy" onclick="pwBuy()" disabled>Выбери прокси</button>
+        </div>
+        <p class="sub" id="pwproductinfo">Покупка на 1 месяц. Цена указана за весь пакет.</p>
+        <button class="btn s tiny" id="pwresume" onclick="pwResume()" hidden>Завершить предыдущую операцию</button>
+      </div>
+      <div id="shop-proxy6" class="shop-pane" hidden>
+        <div class="shop-fields">
+          <div><label for="buycc">Страна</label><select id="buycc"></select></div>
+          <div><label for="buyperiod">Дней</label><input id="buyperiod" type="number" min="1" max="365" value="7" onchange="shopProxy6Quote()"></div>
+          <button class="btn g shop-buy" id="p6buy" onclick="buy()" disabled>Купить PROXY6</button>
+        </div>
+        <p class="sub" id="p6info"></p>
+      </div>
+      <div id="shop-proxyline" class="shop-pane" hidden>
+        <div class="shop-fields">
+          <div><label for="plcountry">Страна</label><select id="plcountry" onchange="plQuote()"></select></div>
+          <div><label for="plkind">Тип IPv4</label><select id="plkind" onchange="plQuote()"><option value="dedicated">Индивидуальные</option><option value="shared">Общие</option></select></div>
+          <div><label for="plquantity">Количество</label><input id="plquantity" type="number" min="1" max="100" value="1" onchange="plQuote()"></div>
+          <div><label for="plperiod">Дней</label><select id="plperiod" onchange="plQuote()"></select></div>
+        </div>
+        <p class="sub" id="plquote"></p>
+        <button class="btn g" id="plbuy" onclick="plBuy()" disabled>Купить ProxyLine</button>
+        <button class="btn y" id="plresume" onclick="plResume()" hidden>Проверить незавершённый запрос</button>
+      </div>
+      <p class="shop-foot sub" id="shopauto"></p>
+      <details id="shophistory" hidden><summary>Последние операции</summary><div id="shoptransactions" class="sub"></div></details>
     </div>
   </div>
 
@@ -1178,7 +1172,6 @@ async function loadStatus(){const s=await api('/api/status');window.__S=s;
   /* заголовок свернутой карточки стратегий: название активной — из статуса,
      дорогой GET /api/strategy при этом не дёргается (П4) */
   const sn=document.getElementById('stnow');if(sn)sn.textContent=s.strategy_title||'';
-  fillBuyCC();
   document.getElementById('ts').textContent='обновлено '+new Date().toLocaleTimeString('ru-RU');
   const cur=s.upstream||{};
   const dr=s.dns_rescue||{},drs=dr.state||{},drc=dr.coverage||{};
@@ -1326,142 +1319,141 @@ async function loadMetrics(){const m=await api('/api/metrics?days=30'),a=m.avail
     tile('false-switch',(s.false_switches||0)+' · '+metricPct(s.false_switch_rate),s.false_switch_definition||''),
     tile('MANUAL',metricNum((u.seconds||0)/3600,1)+' ч',(u.exits||0)+' выходов из ручной фиксации.'),
     tile('provider API',(p.errors||0)+' ошибок · '+(p.rate_limits||0)+' rate-limit','Типизированные ошибки на transport-boundary; ключи/текст ответа не хранятся.'),
-    tile('расходы',spend,(sp.denied||0)+' запрещённых политикой трат.'),
+    tile('расходы',spend,(sp.denied||0)+' запрещённых политикой трат.'+((sp.unreported||[]).length?' Без суммы в API: '+sp.unreported.map(x=>x.count+' операций '+x.currency).join(', '):'')),
     tile('learning',Math.round(100*(l.maturity||0))+'% · '+(l.coverage_days||0)+' дн','drift 7/90: '+metricNum(l.drift_7_vs_90,4)+'; shadow '+(l.shadow_days||0)+'/'+(l.shadow_min_days||30)+' дн.'),
     tile('stale score',st.with_stale_inputs||0,(st.total_decisions||0)+' решений; '+(st.superseded_decisions||0)+' устаревших intent.')].join('');
   const q=m.quality||{};document.getElementById('metrics_detail').innerHTML='<details><summary>Качество данных и пороги</summary><pre class="mono" style="white-space:pre-wrap">'+
     esc(JSON.stringify({fault_recovery:f,learning:l,quality:q},null,2))+'</pre></details>';
   sum('metrics','egress '+metricPct((a.egress||{}).ratio)+' · MTTR p95 '+mttr)}
 
-async function loadMoney(){try{const m=await api('/api/money');const L=m.limits||{},t=m.today||{};
-  /* F8: чему узел научился — надёжность пар (провайдер, страна) по своему опыту */
-  const st=(m.stability||[]);const sb=document.getElementById('stabbox');
-  if(sb)sb.innerHTML=st.length?('Надёжность по опыту узла: '+st.map(x=>{
-    const lbl=country(x.country)+(x.provider!=='proxy6'?(' ('+esc(x.provider)+')'):'')+' '+x.rel_pct+'% ('+
-      x.probes+' проб, '+x.days+' дн'+(x.drops?(', обрывов '+x.drops):'')+')';
-    return x.learning?('<span class="mut" title="данных ещё мало — пара не влияет на выбор покупки">'+esc(lbl)+' · учусь</span>')
-      :('<span title="бонус к выбору страны при покупке: '+esc(''+x.bonus)+'">'+esc(lbl)+'</span>')}).join(' · ')):'';
-  document.getElementById('money').innerHTML=[
-    tile('покупок сегодня',(t.buys||0)+' из '+L.max_buys_per_day,'Больше этого числа панель за сутки не купит — ни сама, ни по кнопке.'),
-    tile('потрачено сегодня',(t.spent_rub||0)+' / '+L.max_spend_per_day+' ₽','Дневной потолок трат.'),
-    tile('потолок одной покупки','до '+L.max_price_per_buy+' ₽','Прокси дороже этой цены не купится.'),
-    tile('неснижаемый остаток','от '+L.min_balance_reserve+' ₽','Ниже этой суммы на балансе покупки прекращаются.'),
-    tile('покупка / удаление',(L.buy_enabled?'<span class="ok">разрешена</span>':'<span class="bad">запрещена</span>')+
-      ' / '+(L.delete_enabled?'<span class="warn">разрешено</span>':'запрещено'),
-      'Тумблеры в конфиге на сервере. Пока покупка запрещена, автоматика не потратит ни рубля.'),
-    apTile(),
-    stTile(),
-  ].join('')}catch(e){}}
-/* какое правило выбора стран сейчас действует — подробности в карточке ниже */
-function stTile(){const s=window.__S||{};
-  if(s.selection_mode==='manual')return tile('выбор канала','<span class="warn">ручной</span> · '+esc(s.manual_host||'—'),
-    'Канал закреплён человеком: стратегии не переключают его и не покупают резерв. Redut продолжает проверки и продление. '+
-    'Только после подтверждённого отказа фиксация снимется и включится «Скорость и отклик».');
-  return tile('стратегия стран',esc(s.strategy_title||'—'),
-    (s.strategy_short?(s.strategy_short+'. '):'')+
-    'Правило, как панель выбирает между надёжной страной и хорошими замерами: где ей разрешено '+
-    'покупать и в каком порядке перебирать пул. Меняется в карточке «Стратегия выбора стран» ниже.')}
-/* автопродление «якоря» — состояние берём из /api/status */
-function apTile(){const a=(window.__S||{}).auto_prolong;
-  if(!a)return tile('автопродление','<span class="mut">—</span>','Панель ещё не сообщила настройки.');
-  return tile('автопродление боевого',
-    a.enabled?('<span class="ok">вкл</span> · за '+a.days_before+' дн · +'+a.period_days+' дн')
-             :'<span class="warn">выкл</span>',
-    'Продлевает срок аренды боевого прокси, пока он здоров, — чтобы IP не менялся. Смена адреса стоит столько же, '+
-    'сколько продление, но новый IP «холодный»: сайты начинают требовать перелогины, капчи и подтверждения оплаты. '+
-    'Если продлить не выйдет (лимит, баланс, сбой у провайдера) — придёт письмо, молча истечь не даст.')}
-
-async function market(){if(document.getElementById('marketprovider').value==='proxyline')return plMarket();if(document.getElementById('marketprovider').value==='proxywing')return pwMarket();await openFold('money');toast('Спрашиваю провайдера, что есть в продаже…');try{const m=await api('/api/market');if(m.error)throw Error(m.error);window.__MARKET=m;const box=document.getElementById('marketbox');
-  const pr=m.price?('цена '+m.price.price+' '+m.price.currency+' за 1 шт × '+m.period+' дн · баланс '+m.price.balance):(m.price_error||'цена недоступна');
-  box.textContent=(m.country_error?('рынок недоступен ('+m.country_error+') · '):
-    ('Доступные страны ('+(m.available||[]).length+'): '+((m.available||[]).map(a=>country(a.cc)).join(', ')||'—')+' · '))+pr;
-  fillBuyCC();
-  toast('Список обновлён','ok')}catch(e){toast(e.message,'bad')}}
-
-/* ── форма покупки (приёмка №7): белого списка больше нет ──
-   Опции — ВСЕ страны провайдера в продаже (кроме чёрного списка), отранжированы
-   внутренним рейтингом на сервере, с пометкой оценки (✅/🟢/⚪/⚠️);
-   пока рынок не спрошен или недоступен — полный словарь стран минус чёрный список;
-   «другая страна…» открывает свободный ввод (сервер валидирует сам). */
-function buyccChange(sel){document.getElementById('buyccfreebox').style.display=(sel.value==='__other__')?'':'none'}
-function fillBuyCC(){const s=window.__S||{};const m=window.__MARKET||null;
-  const sel=document.getElementById('buycc');if(!sel)return;
-  if(document.activeElement===sel)return; /* не пересобирать открытый список под руками (loadStatus идёт каждые 30 с) */
-  const cur=sel.value;
-  const bl=new Set(s.cc_blacklist||[]);
-  let list,suffix='';const tiers={};
-  if(m&&!m.country_error&&(m.available||[]).length){
-    list=(m.available||[]).map(a=>{tiers[a.cc]=a.tier;return a.cc}).filter(c=>!bl.has(c))}
-  else{list=Object.keys(CC).filter(c=>!bl.has(c));
-    if(m&&m.country_error)suffix=' · рынок недоступен, страна не проверена'}
-  const opts=['<option value="">— панель выберет сама —</option>'];
-  for(const c of list){const t=TIER[tiers[c]];
-    opts.push('<option value="'+esc(c)+'"'+(cur===c?' selected':'')+'>'+
-      esc(country(c))+(t?(' '+t[0]):'')+esc(suffix)+'</option>')}
-  opts.push('<option value="__other__"'+(cur==='__other__'?' selected':'')+'>другая страна…</option>');
-  sel.innerHTML=opts.join('')}
-
 const __moneyRequestFallback={};
-async function plMarket(){await openFold('money');document.getElementById('plbox').open=true;
-  try{const m=await api('/api/market?provider=proxyline');if(m.error)throw Error(m.error);
-    document.getElementById('plcountry').innerHTML=m.countries.map(c=>'<option value="'+esc(c.code)+'">'+esc(country(c.code))+'</option>').join('');
-    document.getElementById('plperiod').innerHTML=m.periods.map(p=>'<option value="'+p+'"'+(p===30?' selected':'')+'>'+p+'</option>').join('');
-    document.getElementById('plquote').textContent='';document.getElementById('plinfo').textContent='Баланс: '+m.balance.balance+' USD · '+m.notice;
-  }catch(e){document.getElementById('plinfo').textContent=e.message;toast(e.message,'bad')}}
-async function plQuote(btn){const cc=document.getElementById('plcountry').value;if(!cc)return toast('Сначала загрузи страны ProxyLine','warn');btn.disabled=true;
-  try{const qs=new URLSearchParams({provider:'proxyline',country:cc,type:document.getElementById('plkind').value,version:'4',quantity:document.getElementById('plquantity').value,period:document.getElementById('plperiod').value});
-    const m=await api('/api/market?'+qs);if(m.error)throw Error(m.error);const q=m.quote;
-    document.getElementById('plquote').textContent=country(q.country)+' · '+q.type+' · в наличии '+(m.stock===1000?'не менее 1000':m.stock)+' · '+q.quantity+' шт на '+q.period+' дней: '+q.amount+' USD всего. Это расчёт без списания денег.';
-  }catch(e){document.getElementById('plquote').textContent=e.message;toast(e.message,'bad')}finally{btn.disabled=false}}
+const __shop={cache:{},balances:{},provider:'',epoch:0,family:'datacenter',money:null,quoteEpoch:0,p6Busy:false};
+const SHOP_NAMES={proxywing:'ProxyWing',proxy6:'PROXY6',proxyline:'ProxyLine'};
+function shopEl(id){return document.getElementById(id)}
+function shopOptions(id,items,preferred){const el=shopEl(id),old=preferred===undefined?el.value:String(preferred);
+  el.innerHTML=items.map(item=>'<option value="'+esc(item.value)+'">'+esc(item.label)+'</option>').join('');
+  el.value=items.some(item=>String(item.value)===old)?old:(items.length?String(items[0].value):'');el.disabled=!items.length}
+async function loadMoney(){try{const m=await api('/api/money');__shop.money=m;
+  const providers=(m.providers||Object.keys((window.__S||{}).balances||{})).filter(p=>SHOP_NAMES[p]);
+  const selected=providers.includes(__shop.provider)?__shop.provider:(providers.includes('proxywing')?'proxywing':providers[0]);
+  shopOptions('marketprovider',providers.map(p=>({value:p,label:SHOP_NAMES[p]})),selected||'');
+  const a=(window.__S||{}).auto_prolong||{};
+  shopEl('shopauto').textContent=a.enabled?'Боевой прокси продлевается автоматически перед окончанием аренды.':'Автопродление выключено. Действующие прокси продлеваются кнопкой в пуле.';
+  const rows=m.rows||[];shopEl('shophistory').hidden=!rows.length;
+  shopEl('shoptransactions').innerHTML=rows.slice(0,5).map(r=>'<div class="shop-transaction">'+esc(r.ts)+' · '+esc(SHOP_NAMES[r.provider]||r.provider)+' · '+esc(r.op==='buy'?'Покупка':'Продление')+' <b>'+(r.price==null?'сумма в кабинете':esc(r.price)+' '+esc(r.currency))+'</b></div>').join('');
+  if(selected!==__shop.provider||!__shop.provider)await shopSelect();
+  }catch(e){shopEl('shopmessage').textContent=e.message}}
+async function shopSelect(refresh=false){const provider=shopEl('marketprovider').value,epoch=++__shop.epoch;
+  ++__shop.quoteEpoch;
+  __shop.provider=provider;
+  for(const p of Object.keys(SHOP_NAMES))shopEl('shop-'+p).hidden=p!==provider;
+  shopEl('shopmessage').textContent=provider?'Загружаю предложения…':'Добавь ключ провайдера в разделе «Ключи провайдеров».';
+  shopEl('shopbalance').textContent='—';shopEl('pwbuy').disabled=true;shopEl('p6buy').disabled=true;shopEl('plbuy').disabled=true;
+  if(provider==='proxyline'){window.__PLQUOTE=null;plButtons()}
+  if(!provider)return;
+  if(refresh){delete __shop.cache[provider];delete __shop.balances[provider]}
+  if(!__shop.cache[provider])__shop.cache[provider]=api('/api/market?provider='+provider);
+  try{const m=await __shop.cache[provider];if(epoch!==__shop.epoch)return;
+    if(provider==='proxyline'){if(m.pending)plRemember(m.pending);plButtons()}
+    if(m.error)throw Error(m.error);
+    shopEl('shopmessage').textContent='';
+    const balance=Object.prototype.hasOwnProperty.call(__shop.balances,provider)?__shop.balances[provider]:(m.balance||m.price);
+    shopEl('shopbalance').textContent=balance&&balance.balance!=null?balance.balance+' '+balance.currency:'Недоступен';
+    if(provider==='proxywing'){window.__PW=m;pwChooseFamily(__shop.family)}
+    if(provider==='proxy6'){window.__MARKET=m;
+      shopOptions('buycc',(m.available||[]).map(c=>({value:c.cc,label:country(c.cc)})));
+      shopEl('buyperiod').value=m.period;shopProxy6Price(m)}
+    if(provider==='proxyline'){shopOptions('plcountry',(m.countries||[]).map(c=>({value:c.code,label:country(c.code)})));
+      shopOptions('plperiod',(m.periods||[]).map(p=>({value:String(p),label:String(p)})),'30');await plQuote()}
+  }catch(e){if(epoch===__shop.epoch)shopEl('shopmessage').textContent=e.message+' · нажми «Обновить».'}}
+function pwChooseFamily(family){__shop.family=family;
+  for(const f of ['datacenter','isp'])shopEl('pw-'+f).setAttribute('aria-pressed',String(f===family));
+  const m=window.__PW||{},items=(m.products||[]).filter(p=>p.family===family&&p.country&&p.quantity);
+  const codes=[...new Set(items.map(p=>p.country))].sort((a,b)=>country(a).localeCompare(country(b),'ru'));
+  shopOptions('pwcountry',codes.map(cc=>({value:cc,label:country(cc)})));
+  shopEl('shopmessage').textContent=(m.errors||{})[family]||(!items.length?'Сейчас нет предложений этого типа.':'');
+  pwCountriesChanged()}
+function pwCountryProducts(){return ((window.__PW||{}).products||[]).filter(p=>p.family===__shop.family&&p.country===shopEl('pwcountry').value)}
+function pwCountriesChanged(){const products=pwCountryProducts(),groups=[...new Set(products.map(p=>p.group||''))];
+  shopEl('pwlocationbox').hidden=groups.length<2;
+  shopOptions('pwlocation',groups.map(g=>({value:g,label:g.replace(/^ISP /,'').replace(/ Premium( NEW)?$/,'')})));
+  pwLocationsChanged()}
+function pwLocationsChanged(){const products=pwCountryProducts().filter(p=>(p.group||'')===shopEl('pwlocation').value).sort((a,b)=>a.quantity-b.quantity);
+  shopOptions('pwquantity',products.map(p=>({value:p.product_id,label:p.quantity+' IP'})));pwProductChanged()}
+function pwProduct(){return pwCountryProducts().find(p=>p.product_id===shopEl('pwquantity').value&&(p.group||'')===shopEl('pwlocation').value)}
+function pwProductChanged(){const p=pwProduct(),button=shopEl('pwbuy'),pending=pwPending();
+  button.disabled=!p||__pwBusy||!!pending;button.textContent=p?'Купить за '+p.price_monthly+' USD':'Нет предложений';
+  shopEl('pwproductinfo').textContent=p?country(p.country)+' · '+p.quantity+' IP · 1 месяц · '+p.price_monthly+' USD за весь пакет.':'Выбери доступное предложение.';
+  shopEl('pwresume').hidden=!pending}
+async function pwBuy(){const p=pwProduct();if(!p||__pwBusy)return;
+  shopEl('pwbuy').disabled=true;
+  try{await pwSpend({kind:'buy',family:p.family,product_id:p.product_id,months:1,country:p.country,max_total:p.price_monthly})}
+  finally{pwProductChanged()}}
+function shopAmount(value){if(typeof value!=='number'&&(typeof value!=='string'||!/^[0-9]+(?:[.][0-9]+)?$/.test(value.trim())))return null;
+  const amount=Number(value);return Number.isFinite(amount)&&amount>=0?amount:null}
+function shopPaidBalance(provider,r){const amount=shopAmount(r.balance_after),balance=amount!==null&&['RUB','USD'].includes(r.currency)?{balance:amount,currency:r.currency}:null;
+  __shop.balances[provider]=balance;
+  if(__shop.provider===provider)shopEl('shopbalance').textContent=balance?balance.balance+' '+balance.currency:'Недоступен'}
+function shopProxy6Price(m){const p=m.price,amount=p?shopAmount(p.price):null,ready=p&&amount!==null&&amount>0&&['RUB','USD'].includes(p.currency)&&!m.country_error&&shopEl('buycc').value;
+  window.__P6QUOTE=ready?{period:m.period,max_total:amount,currency:p.currency}:null;
+  shopEl('p6buy').disabled=!ready||__shop.p6Busy;shopEl('p6buy').textContent=ready?'Купить за '+p.price+' '+p.currency:'Нет предложений';
+  shopEl('p6info').textContent=m.country_error||m.price_error||(p?'1 IP · '+m.period+' дн · '+p.price+' '+p.currency:'Цена недоступна')}
+async function shopProxy6Quote(){const epoch=++__shop.quoteEpoch;shopEl('p6buy').disabled=true;
+  window.__P6QUOTE=null;
+  try{const m=await api('/api/market?provider=proxy6&quote=1&period='+encodeURIComponent(shopEl('buyperiod').value));
+    if(epoch!==__shop.quoteEpoch||__shop.provider!=='proxy6')return;
+    if(m.error)throw Error(m.error);shopProxy6Price(m)}catch(e){if(epoch===__shop.quoteEpoch)shopEl('p6info').textContent=e.message}}
+async function plQuote(){const cc=shopEl('plcountry').value,epoch=++__shop.quoteEpoch;
+  window.__PLQUOTE=null;plButtons();if(!cc){shopEl('plquote').textContent='Нет доступных стран.';return}
+  shopEl('plquote').textContent='Проверяю наличие и цену…';
+  try{const qs=new URLSearchParams({provider:'proxyline',country:cc,type:shopEl('plkind').value,version:'4',quantity:shopEl('plquantity').value,period:shopEl('plperiod').value});
+    const m=await api('/api/market?'+qs);if(epoch!==__shop.quoteEpoch||__shop.provider!=='proxyline')return;
+    if(m.error)throw Error(m.error);const q=m.quote,amount=q?shopAmount(q.amount):null;
+    if(!q||amount===null||amount<=0||q.country!==cc||q.type!==shopEl('plkind').value||q.quantity!==Number(shopEl('plquantity').value)||q.period!==Number(shopEl('plperiod').value)||!Number.isInteger(m.stock)||m.stock<q.quantity)throw Error('Выбранное предложение недоступно');
+    window.__PLQUOTE={kind:'buy',country:cc,type:q.type,version:4,quantity:q.quantity,period:q.period,max_total:amount};
+    shopEl('plquote').textContent=q.quantity+' IP · '+q.period+' дн · '+q.amount+' USD по расчёту API · в наличии '+m.stock+'.';plButtons();
+  }catch(e){if(epoch===__shop.quoteEpoch)shopEl('plquote').textContent=e.message}}
+
+let __plPending=undefined,__plBusy=false;
+function plPending(){if(__plPending!==undefined)return __plPending;try{return JSON.parse(sessionStorage.getItem('redut-pl-pending')||'null')}catch(_){return null}}
+function plRemember(body){__plPending=body;try{if(body)sessionStorage.setItem('redut-pl-pending',JSON.stringify(body));else sessionStorage.removeItem('redut-pl-pending')}catch(_){}}
+function plButtons(){const q=window.__PLQUOTE;shopEl('plbuy').disabled=!q||__plBusy||!!plPending();shopEl('plbuy').textContent=q?'Купить за '+q.max_total+' USD':'Нет предложений';shopEl('plresume').hidden=!plPending();shopEl('plresume').disabled=__plBusy}
+function plDone(body){const original={...body};delete original.request_id;moneyRequestDone({key:'redut-money-v1:proxyline:'+JSON.stringify(original),id:body.request_id});plRemember(null);if(__shop.cache.proxyline)delete __shop.cache.proxyline}
+async function plBuy(){const q=window.__PLQUOTE;if(!q||__plBusy||shopEl('plbuy').disabled)return;await plSpend({...q})}
+async function plRenew(btn,uid){if(__plBusy||btn.disabled)return;btn.disabled=true;
+  try{const q=await api('/api/proxyline/renewal?uid='+encodeURIComponent(uid));
+    if(q.pending){plRemember(q.pending);if(q.pending.kind!=='prolong'||q.pending.uid!==uid){plButtons();return toast('Есть другая незавершённая операция ProxyLine. Проверь её в разделе «Деньги».','warn')}return await plSpend(q.pending)}
+    const value=prompt('Продлить '+uid+'. Доступные сроки: '+q.periods.join(', ')+' дней. Оплата со счёта по тарифу ProxyLine; OK сразу продлит:',String(q.default_period));if(value===null)return;
+    const period=q.periods.find(p=>String(p)===value.trim());if(!period)return toast('Выбери доступный срок','bad');
+    await plSpend({kind:'prolong',uid,period})
+  }catch(e){toast(e.message,'bad')}finally{btn.disabled=false}}
+async function plSpend(body){if(__plBusy)return;if(plPending()&&!body.request_id)return toast('Сначала проверь незавершённый запрос ProxyLine.','warn');
+  if(!body.request_id)body.request_id=moneyRequest('proxyline',JSON.stringify(body)).id;plRemember(body);__plBusy=true;plButtons();
+  try{const r=await api('/api/proxyline/spend',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    plDone(body);shopPaidBalance('proxyline',r);toast((r.kind==='buy'?'Куплено '+r.uids.length+' IP':'Прокси продлён')+' · до '+r.date_end+' · сумма списания в кабинете ProxyLine'+(r.warning?' · '+r.warning:''),r.warning?'warn':'ok');await reloadAll()
+  }catch(e){if(e.replace_request)plDone(body);toast(e.message+' · ID: '+body.request_id,'bad')}
+  finally{__plBusy=false;plButtons()}}
+function plResume(){const pending=plPending();if(pending)return plSpend(pending)}
+
 let __pwPending=undefined,__pwBusy=false;
 function pwPending(){if(__pwPending!==undefined)return __pwPending;try{return JSON.parse(sessionStorage.getItem('redut-pw-pending')||'null')}catch(_){return null}}
 function pwRemember(body){__pwPending=body;try{if(body)sessionStorage.setItem('redut-pw-pending',JSON.stringify(body));else sessionStorage.removeItem('redut-pw-pending')}catch(_){}}
 function pwDone(body){const original={...body};delete original.request_id;moneyRequestDone({key:'redut-money-v1:proxywing:'+JSON.stringify(original),id:body.request_id});pwRemember(null)}
-async function pwMarket(){await openFold('money');document.getElementById('pwbox').open=true;
-  try{const m=await api('/api/market?provider=proxywing');window.__PW=m;
-    document.getElementById('pwinfo').textContent=(m.error||'')+' '+Object.entries(m.errors||{}).map(([k,v])=>k+': '+v).join(' · ')+(m.balance?' · баланс '+m.balance.balance+' '+m.balance.currency:'');
-    pwFillBudget(m.budget);
-    pwProducts();toast(m.error?'Каталог недоступен':'Каталог ProxyWing обновлён',m.error?'bad':'ok')
-  }catch(e){toast(e.message,'bad')}}
-function pwProducts(){const family=document.getElementById('pwfamily').value;
-  const products=((window.__PW||{}).products||[]).filter(p=>p.family===family);
-  document.getElementById('pwproduct').innerHTML=products.map(p=>'<option value="'+esc(p.product_id)+'">'+esc((p.group?p.group+' · ':'')+p.name)+' · '+esc(p.price_monthly)+' USD / мес</option>').join('');pwProductChanged()}
-function pwProduct(){return (((window.__PW||{}).products)||[]).find(p=>p.family===document.getElementById('pwfamily').value&&p.product_id===document.getElementById('pwproduct').value)}
-function pwProductChanged(){const p=pwProduct(),select=document.getElementById('pwcountry');
-  const bl=new Set((window.__S||{}).cc_blacklist||[]);select.innerHTML='<option value="">Выбери страну тарифа</option>'+Object.keys(CC).filter(c=>!bl.has(c)).map(c=>'<option value="'+esc(c)+'">'+esc(country(c))+'</option>').join('');
-  select.value=p&&p.country||'';select.disabled=!!(p&&p.country);
-  document.getElementById('pwproductinfo').textContent=p?('Пакет: '+(p.quantity==null?'количество указано в названии тарифа':p.quantity+' IP')+' · всего '+p.price_monthly+' USD за месяц'+(!p.country?' · API не указал код страны: выбери страну по названию тарифа.':'')):'Нет товаров этого типа или каталог недоступен'}
-function pwFillBudget(b){b=b||{};document.getElementById('pwenabled').checked=b.enabled===true;
-  for(const [id,key] of [['pwmax','max_price_per_buy'],['pwday','max_spend_per_day'],['pwreserve','min_balance_reserve']])document.getElementById(id).value=b[key]||0}
-async function pwRenewalBudget(q,price){const b=q.budget||{};let reason='';
-  if(b.enabled!==true)reason='Ручные траты в USD выключены';
-  else if(!Number.isFinite(b.max_price_per_buy)||price>b.max_price_per_buy)reason='Лимит за операцию ниже цены продления';
-  else if(!Number.isFinite(q.spent_today)||!Number.isFinite(b.max_spend_per_day)||q.spent_today+price>b.max_spend_per_day)reason='Недостаточно суточного бюджета';
-  if(!reason)return true;
-  await openFold('money');document.getElementById('pwbox').open=true;pwFillBudget(b);
-  const box=document.getElementById('pwbudgetbox');box.open=true;
-  document.getElementById('pwbudgethint').textContent=reason+'. Продление действующего заказа '+q.order_id+' стоит '+price+' USD. '+
-    'Проверь разрешение и лимиты, сохрани бюджет, затем снова нажми «Продлить» у этого прокси. Сохранение бюджета не списывает деньги.';
-  box.scrollIntoView({block:'center',behavior:'smooth'});document.getElementById('pwenabled').focus();
-  toast(reason+' — открыты настройки бюджета продления','warn');return false}
-async function pwBudget(){const b={enabled:document.getElementById('pwenabled').checked,max_price_per_buy:Number(document.getElementById('pwmax').value),max_spend_per_day:Number(document.getElementById('pwday').value),min_balance_reserve:Number(document.getElementById('pwreserve').value)};
-  if(!confirm('Сохранить отдельный бюджет ProxyWing в USD: до '+b.max_price_per_buy+' за операцию, '+b.max_spend_per_day+' за сутки, резерв '+b.min_balance_reserve+'?'))return;
-  try{await api('/api/proxywing/budget',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});toast('Бюджет USD сохранён','ok')}catch(e){toast(e.message,'bad')}}
-async function pwBuy(){const p=pwProduct();if(!p)return toast('Сначала загрузи каталог','bad');const cc=document.getElementById('pwcountry').value;if(!cc)return toast('Укажи страну тарифа','bad');
-  if(!confirm('Купить '+p.name+' ('+p.family+') на месяц за '+p.price_monthly+' USD? Это цена всего выбранного пакета. Спишутся реальные деньги.'))return;
-  return pwSpend({kind:'buy',family:p.family,product_id:p.product_id,months:1,country:cc,max_total:p.price_monthly})}
 async function pwRenew(btn,uid){btn.disabled=true;try{const q=await api('/api/proxywing/renewal?uid='+encodeURIComponent(uid));
-  const value=prompt('Продлевается весь заказ '+q.order_id+' ('+q.affected_count+' IP в пуле). Сроки: '+q.options.map(o=>o.months+' мес = '+o.total+' USD').join('; ')+'. Введи число месяцев:',String(q.options[0].months));if(value===null)return;
+  if(q.pending){if(confirm('Проверить и завершить прежнее продление заказа '+q.order_id+' на '+q.pending.months+' мес, до '+q.pending.max_total+' USD? Сохранён исходный запрос, повторного списания не будет.'))await pwSpend(q.pending);return}
+  const value=prompt('Продлевается весь заказ '+q.order_id+' ('+q.affected_count+' IP в пуле). Сроки: '+q.options.map(o=>o.months+' мес = '+o.total+' USD').join('; ')+'. Введи число месяцев — OK сразу оплатит продление:',String(q.options[0].months));if(value===null)return;
   const chosen=q.options.find(o=>String(o.months)===value.trim());if(!chosen)return toast('Выбери доступный срок','bad');
-  if(!await pwRenewalBudget(q,chosen.total))return;
-  if(!confirm('Продлить весь заказ '+q.order_id+' на '+chosen.months+' мес за '+chosen.total+' USD?'))return;
   await pwSpend({kind:'prolong',family:q.family,order_id:q.order_id,months:chosen.months,max_total:chosen.total})
   }catch(e){toast(e.message,'bad')}finally{btn.disabled=false}}
 async function pwSpend(body){if(__pwBusy)return;const pending=pwPending();if(pending&&!body.request_id)return toast('Есть незавершённый запрос ProxyWing. Нажми «Повторить незавершённый запрос».','warn');
   if(!body.request_id)body.request_id=moneyRequest('proxywing',JSON.stringify(body)).id;pwRemember(body);__pwBusy=true;
   try{const r=await api('/api/proxywing/spend',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});pwDone(body);
+    if(window.__PW)window.__PW.balance=r.balance;
+    if(typeof document!=='undefined'&&shopEl('shopbalance')&&__shop.provider==='proxywing'){
+      shopEl('shopbalance').textContent=r.balance?r.balance.balance+' USD':'Недоступен'}
     toast('Оплачено '+r.price+' USD · заказ '+r.order_id+(r.date_end?' · до '+r.date_end:'')+(r.warning?' · '+r.warning:''),r.warning?'warn':'ok');await reloadAll()
-  }catch(e){if(e.replace_request)pwDone(body);toast(e.message+' · ID: '+body.request_id,'bad')}finally{__pwBusy=false}}
+  }catch(e){if(e.replace_request)pwDone(body);toast(e.message+' · ID: '+body.request_id,'bad')}finally{__pwBusy=false;
+    if(typeof document!=='undefined'&&__shop.provider==='proxywing')pwProductChanged()}}
 function pwResume(){const body=pwPending();if(!body)return toast('Незавершённого запроса в этой вкладке нет','warn');if(confirm('Повторить исходный запрос '+body.request_id+' ('+body.kind+', '+body.months+' мес, до '+body.max_total+' USD) с тем же ключом защиты от двойного списания?'))return pwSpend(body)}
 function moneyRequest(kind,intent){const key='redut-money-v1:'+kind+':'+intent;let id='';
   if(Object.prototype.hasOwnProperty.call(__moneyRequestFallback,key))id=__moneyRequestFallback[key];
@@ -1475,26 +1467,30 @@ function moneyRequestDone(req){if(!Object.prototype.hasOwnProperty.call(__moneyR
   try{if(sessionStorage.getItem(req.key)===req.id)sessionStorage.removeItem(req.key)}catch(_){}}
 
 async function buy(){const _sel=document.getElementById('buycc');
-  const cc=(_sel.value==='__other__'?(document.getElementById('buyccfree').value||''):_sel.value).trim().toLowerCase();
+  const cc=_sel.value.trim().toLowerCase();
   const per=document.getElementById('buyperiod').value.trim();
   if(per&&(!/^[0-9]+$/.test(per)||Number(per)<1||Number(per)>365))return toast('Срок должен быть целым числом от 1 до 365 дней','bad');
-  if(!confirm('Купить прокси'+(cc?(' в стране '+cc):' (страну выберет панель)')+(per?(', на '+per+' дн'):'')+'?\\n\\n'+
-    'Спишутся РЕАЛЬНЫЕ деньги с баланса у провайдера. После покупки панель сама проверит, из какой страны реально выходит прокси.'))return;
+  const quote=window.__P6QUOTE;if(!quote||Number(per)!==quote.period||__shop.p6Busy||shopEl('p6buy').disabled)return;
+  if(!confirm('Купить 1 IP в стране '+country(cc)+' на '+per+' дн за '+quote.max_total+' '+quote.currency+'?'))return;
+  __shop.p6Busy=true;shopEl('p6buy').disabled=true;
   const req=moneyRequest('buy',(cc||'auto')+':'+(per||'default'));
-  toast('Покупаю: узнаю цену → покупка → проверка…');try{const b={request_id:req.id};if(cc)b.country=cc;if(per)b.period=Number(per);
+  toast('Покупаю: узнаю цену → покупка → проверка…');try{const b={request_id:req.id,max_total:quote.max_total,currency:quote.currency};if(cc)b.country=cc;if(per)b.period=Number(per);
     const r=await api('/api/buy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
     moneyRequestDone(req);
+    shopPaidBalance('proxy6',r);
     const pc=(r.postcheck||[]).map(x=>x.uid+' страна выхода '+(x.exit_cc||'?')+(x.blocked?' → заблокирован, роль off':' → годен')).join('; ');
     toast('Куплено: '+(r.uids||[]).join(',')+' за '+r.price+' '+r.currency+(r.recovered?' (восстановлено по описанию)':'')+'. '+pc+
       (r.warning?(' ⚠️ '+r.warning):''),r.warning?'warn':'ok');await reloadAll()}
-  catch(e){if(e.replace_request)moneyRequestDone(req);toast('покупка: '+e.message,'bad');await reloadAll()}}
+  catch(e){if(e.replace_request)moneyRequestDone(req);toast('покупка: '+e.message,'bad');await reloadAll()}
+  finally{__shop.p6Busy=false;if(__shop.provider==='proxy6')shopEl('p6buy').disabled=!window.__P6QUOTE}}
 
-async function prolong(btn,uid){if(uid.startsWith('proxyline:'))return toast('Продление ProxyLine доступно в кабинете провайдера. В Редуте нет подтверждённой цены продления.','warn');if(uid.startsWith('proxywing:'))return pwRenew(btn,uid);const d=prompt('На сколько дней продлить '+uid+'?\\nСпишутся реальные деньги.','30');if(!d)return;
+async function prolong(btn,uid){if(uid.startsWith('proxyline:'))return plRenew(btn,uid);if(uid.startsWith('proxywing:'))return pwRenew(btn,uid);const d=prompt('На сколько дней продлить '+uid+'?\\nСпишутся реальные деньги.','30');if(!d)return;
   if(!/^[0-9]+$/.test(d.trim())||Number(d)<1||Number(d)>365)return toast('Срок должен быть целым числом от 1 до 365 дней','bad');
   const req=moneyRequest('prolong',uid+':'+d);
   btn.disabled=true;toast('Продлеваю '+uid+'…');try{const r=await api('/api/proxy/'+encodeURIComponent(uid)+'/prolong',
     {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days:Number(d),request_id:req.id})});
     moneyRequestDone(req);
+    shopPaidBalance('proxy6',r);
     toast('Продлён '+uid+' на '+r.days+' дн · '+r.price+' '+r.currency+' · действует до '+(r.date_end||'?'),'ok');await reloadAll()}catch(e){if(e.replace_request)moneyRequestDone(req);toast(e.message,'bad')}btn.disabled=false}
 
 async function del(btn,uid){if(!confirm('Удалить прокси '+uid+' НАВСЕГДА?\\n\\nСервер пропустит удаление, только если: удаление разрешено тумблером, '+
@@ -1514,13 +1510,12 @@ async function loadStrategy(){try{const r=await api('/api/strategy');
     /* П3: строка «Сейчас с ней» обязана быть стратегийно-разной — и по правилу
        докупки, и по судьбе стран нынешнего пула, и по выбору канала */
     const names=a=>(a||[]).map(country).join(', ');
-    const more=(s.buy_total||0)>(s.buy||[]).length?' и ещё '+(s.buy_total-(s.buy||[]).length):'';
     let buy;
-    if(s.buy_mode==='gated')buy='сама докупает только надёжные: '+(names(s.buy)||'—')+more+
+    if(s.buy_mode==='gated')buy='сама докупает в странах с высокой репутацией'+
       (s.pool_block&&s.pool_block.length?'; страны пула '+names(s.pool_block)+' сама не купит (вручную — можно)':'');
     else buy='сама докупает везде, кроме запрещённых'+
       (s.pool_pass&&s.pool_pass.length?' — страны пула ('+names(s.pool_pass)+') разрешены':'')+
-      '; сначала пробует: '+(names((s.buy||[]).slice(0,4))||'—');
+      '; выбирает из доступных предложений подключённых провайдеров';
     const pick=s.pick?(esc(s.pick.host)+(s.pick.cc?(' · '+country(s.pick.cc)):'')+
       (s.pick.is_current?' — текущий канал, останется':' — переключится сразу после включения')):'пул пуст';
     return '<div class="step" style="margin-top:10px'+(s.current?';border-color:rgba(5,255,161,.45);background:rgba(5,255,161,.05)':'')+'">'+
@@ -1558,7 +1553,7 @@ const PROV={
   proxyline:{t:'ProxyLine',h:'Запасной провайдер: в панели доступны импорт, баланс, наличие и цена нового заказа; покупка и продление — в кабинете ProxyLine, '+
     'цены в долларах. Ключ: кабинет panel.proxyline.net → раздел «API».'},
   proxywing:{t:'ProxyWing',h:'Datacenter и ISP: Редут импортирует уже купленные HTTP/SOCKS-каналы и проверяет их как остальные. '+
-    'Каталог, покупка и продление доступны в разделе «Деньги», с отдельным бюджетом USD. Сроки — в месяцах; продлевается весь заказ. Ключ: dashboard.proxywing.com → Account → Security.'}};
+    'Каталог и покупка доступны в разделе «Деньги», с бюджетом USD для новых покупок. Продление действует без настройки бюджета. Сроки — в месяцах; продлевается весь заказ. Ключ: dashboard.proxywing.com → Account → Security.'}};
 async function loadKeys(){try{const r=await api('/api/key/status');
   document.getElementById('keys').innerHTML=(r.providers||[]).map(p=>{const m=PROV[p.provider]||{};
     return '<div class="step" style="margin-top:10px">'+

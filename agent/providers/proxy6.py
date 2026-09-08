@@ -16,6 +16,7 @@ SOCKS5 в Chrome-расширении) — в коде стоит предохр
 Портировано с common.js (p6Api / p6ErrorText / normProxy6 / fetchProxy6Data).
 """
 import re
+import math
 import urllib.parse
 
 from .base import (Provider, ProviderError, ProviderErrorKind, Capability,
@@ -32,6 +33,20 @@ DESCR_MAX = 50          # ограничение API PROXY6 на длину desc
 _RE_DESCR = re.compile(r"^[A-Za-z0-9._:-]{1,%d}$" % DESCR_MAX)
 _RE_ISO2 = re.compile(r"^[a-z]{2}$")
 _RE_IDS = re.compile(r"^\d+$")
+
+
+def _as_amount(value, field, *, positive=False):
+    """Accept finite JSON numbers or decimal strings, never booleans/containers."""
+    if type(value) not in (int, float) and not (
+            isinstance(value, str) and re.fullmatch(r'[0-9]+(?:[.][0-9]+)?', value.strip())):
+        raise ProviderError('PROXY6: некорректная сумма %s' % field)
+    try:
+        amount = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ProviderError('PROXY6: некорректная сумма %s' % field) from None
+    if not math.isfinite(amount) or amount < 0 or (positive and amount == 0):
+        raise ProviderError('PROXY6: некорректная сумма %s' % field)
+    return amount
 
 # Коды ошибок, которые агент обязан различать (§2.2 + PDF-дока)
 P6_ERRORS = {
@@ -276,7 +291,11 @@ class Proxy6(Provider):
         """Список доступных к покупке стран (iso2, lower) для версии."""
         version = _as_int(version, "version")
         r = self._api("getcountry", {"version": version})
-        return [str(c).lower() for c in (r.get("list") or []) if isinstance(c, str)]
+        rows = r.get('list')
+        if not isinstance(rows, list) or any(
+                not isinstance(cc, str) or not _RE_ISO2.fullmatch(cc.lower()) for cc in rows):
+            raise ProviderError('PROXY6: каталог стран не подтверждён')
+        return list(dict.fromkeys(cc.lower() for cc in rows))
 
     def getcount(self, country, version=4):
         """Сколько прокси доступно к покупке в стране (int)."""
@@ -285,7 +304,10 @@ class Proxy6(Provider):
             raise ProviderError("PROXY6.getcount: страна %r не iso2" % country)
         version = _as_int(version, "version")
         r = self._api("getcount", {"country": country, "version": version})
-        return int(r.get("count") or 0)
+        count = _as_int(r.get('count'), 'count')
+        if count < 0:
+            raise ProviderError('PROXY6: наличие не подтверждено')
+        return count
 
     def getprice(self, count, period, version=4):
         """Стоимость заказа ДО покупки (§6.2: сверяем M₽ до buy). getprice
@@ -296,9 +318,12 @@ class Proxy6(Provider):
         if count < 1 or period < 1:
             raise ProviderError("PROXY6.getprice: count/period должны быть ≥1")
         r = self._api("getprice", {"count": count, "period": period, "version": version})
-        return {"price": r.get("price"), "price_single": r.get("price_single"),
+        if (_as_int(r.get('count'), 'count') != count
+                or _as_int(r.get('period'), 'period') != period):
+            raise ProviderError('PROXY6: цена относится к другому количеству или сроку')
+        return {"price": _as_amount(r.get("price"), 'price', positive=True), "price_single": r.get("price_single"),
                 "period": r.get("period"), "count": r.get("count"),
-                "balance": r.get("balance"), "currency": r.get("currency")}
+                "balance": _as_amount(r.get("balance"), 'balance'), "currency": r.get("currency")}
 
     # ------------------------------------------------------------- деньги (§6, фаза 2)
     def _check_buy_country(self, country, allow_cc):

@@ -343,11 +343,11 @@ EVENT_KEEP_DAYS = 180
 # дальше уже не воскрешение мигнувшей выдачи, а новая покупка того же id.
 MEMO_KEEP_DAYS = 30
 
-SCHEMA_VERSION = "11"
+SCHEMA_VERSION = "12"
 
 # Поля, которые обновляет refresh (остальные — роль/проба/счётчики — сохраняются)
 _REFRESH_FIELDS = ("ip", "host", "port_http", "port_socks5", "user", "password",
-                   "country", "ip_version", "kind", "date_end", "descr")
+                   "country", "ip_version", "kind", "date_end", "descr", "order_id")
 
 
 def now_iso():
@@ -357,6 +357,8 @@ def now_iso():
 # Колонки, добавленные после первого релиза. CREATE TABLE IF NOT EXISTS их в живую
 # базу не принесёт, поэтому досыпаем ALTER'ом (сверяясь с pragma — идемпотентно).
 _ADD_COLUMNS = (
+    ('proxy', 'order_id', 'TEXT'),
+    ('money', 'price_source', "TEXT NOT NULL DEFAULT 'provider'"),
     ("proxy", "exit_cc_alt", "TEXT"),     # страна по второй geoip-базе (2026-08-15)
     ("proxy", "geo_agree", "INTEGER"),    # 1 — базы сошлись, 0 — разошлись
     ("proxy", "asn", "TEXT"),             # learning v2: ASN exit-IP
@@ -1298,6 +1300,23 @@ class Pool:
     def _initial_proxy_role(self, norm):
         """Keep newly purchased order members off, including imports during a lost reply."""
         name = norm['provider']
+        if name == 'proxy6':
+            pending = self.conn.execute(
+                "SELECT 1 FROM spend_operation WHERE provider='proxy6' AND kind='buy' "
+                "AND (phase IN ('planned','submitted') OR "
+                "(phase IN ('committed','acknowledged') AND descr=? AND descr<>'')) LIMIT 1",
+                (str(norm.get('descr') or ''),)).fetchone()
+            if pending:
+                return 'off'
+        if name == 'proxyline':
+            held = self.conn.execute(
+                "SELECT 1 FROM provider_order_hold WHERE provider='proxyline' AND family='static' AND order_id=?",
+                (str(norm.get('order_id') or ''),)).fetchone()
+            pending = self.conn.execute(
+                "SELECT 1 FROM spend_operation WHERE provider='proxyline' AND kind='buy'"
+                " AND phase IN ('planned','submitted') LIMIT 1").fetchone()
+            if held or pending:
+                return 'off'
         if name == 'proxywing':
             parts = str(norm.get('ext_id') or '').split('|')
             held = len(parts) == 3 and self.conn.execute(
@@ -1343,7 +1362,7 @@ class Pool:
     # ---------- деньги (§13: отдельная таблица money) ----------
     @staticmethod
     def _validated_money(provider, op, uid, price, currency,
-                         balance_after=None, order_id=None, descr=None):
+                         balance_after=None, order_id=None, descr=None, price_source='provider'):
         """Нормализовать ledger-строку; buy/prolong никогда не бывают <=0/NaN."""
         operation = str(op or "").strip().lower()
         try:
@@ -1351,8 +1370,12 @@ class Pool:
         except (TypeError, ValueError, OverflowError):
             amount = None
         code = str(currency or "").strip().upper()
+        unreported = (price_source == 'unreported' and provider == 'proxyline'
+                      and price is None and code == 'USD')
+        if price_source not in ('provider', 'unreported') or (price_source == 'unreported' and not unreported):
+            raise ValueError('некорректный источник суммы платежа')
         if operation in ("buy", "prolong"):
-            if amount is None or not math.isfinite(amount) or amount <= 0:
+            if not unreported and (amount is None or not math.isfinite(amount) or amount <= 0):
                 raise ValueError("цена %s должна быть конечной и положительной" % operation)
             if not re.fullmatch(r"[A-Z]{3}", code):
                 raise ValueError("валюта %s некорректна" % operation)
@@ -1362,7 +1385,7 @@ class Pool:
                 None if uid is None else str(uid), amount, code or None,
                 None if balance_after is None else str(balance_after),
                 None if order_id is None else str(order_id),
-                None if descr is None else str(descr))
+                None if descr is None else str(descr), price_source)
 
     def record_money(self, provider, op, uid, price, currency,
                      balance_after=None, order_id=None, descr=None):
@@ -1370,8 +1393,8 @@ class Pool:
         values = self._validated_money(provider, op, uid, price, currency,
                                        balance_after, order_id, descr)
         self.conn.execute(
-            "INSERT INTO money(ts, provider, op, uid, price, currency, balance_after, order_id, descr)"
-            " VALUES(?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO money(ts, provider, op, uid, price, currency, balance_after, order_id, descr,price_source)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)",
             values)
         self.conn.commit()
 
@@ -1383,27 +1406,32 @@ class Pool:
             "SELECT COUNT(*) FROM money WHERE op='buy' AND ts LIKE ?", (day + "%",)).fetchone()[0]
 
     def spent_today(self, currency, day=None):
-        """Сумма трат (buy+prolong) за сегодня в валюте — для лимита ≤N/сутки (§6.2)."""
+        """Return the exact daily total, or None when that currency has unreported charges."""
         day = day or datetime.date.today().isoformat()
         rows = self.conn.execute(
-            "SELECT id,price,currency FROM money"
+            "SELECT id,provider,price,currency,price_source FROM money"
             " WHERE op IN ('buy','prolong') AND ts LIKE ?", (day + "%",)).fetchall()
         total = 0.0
+        unreported = False
         expected = str(currency or "").strip().upper()
         for row in rows:
+            if (row['price_source'] == 'unreported' and row['provider'] == 'proxyline'
+                    and row['price'] is None and row['currency'] == 'USD'):
+                unreported = unreported or expected == 'USD'
+                continue
             try:
                 amount = float(row["price"])
             except (TypeError, ValueError, OverflowError):
                 amount = None
             code = str(row["currency"] or "").strip().upper()
-            if (amount is None or not math.isfinite(amount) or amount <= 0
+            if (row['price_source'] != 'provider' or amount is None or not math.isfinite(amount) or amount <= 0
                     or not re.fullmatch(r"[A-Z]{3}", code)):
                 raise PoolCorrupt("семантически повреждена строка money id=%s" % row["id"])
             if code == expected:
                 total += amount
         if not math.isfinite(total) or total < 0:
             raise PoolCorrupt("семантически повреждён агрегат money")
-        return total
+        return None if unreported else total
 
     def begin_spend_operation(self, kind, provider, request, idempotency_key,
                               *, uid=None, descr=None, quote_price=None,
@@ -1418,7 +1446,12 @@ class Pool:
             quote = None
         if kind not in ("buy", "prolong") or not provider:
             raise ValueError("некорректная денежная операция")
-        if quote is None or not math.isfinite(quote) or quote <= 0:
+        # The legacy NOT NULL column uses zero only with this explicit tariff contract.
+        # It denotes an unavailable quote, never a free renewal or a charged amount.
+        unquoted = (provider == 'proxyline' and kind == 'prolong' and quote == 0
+                    and (request or {}).get('contract') == 'proxyline-list-v1'
+                    and (request or {}).get('pricing') == 'provider_tariff')
+        if not unquoted and (quote is None or not math.isfinite(quote) or quote <= 0):
             raise ValueError("quote_price должна быть конечной и положительной")
         if not re.fullmatch(r"[A-Z]{3}", code):
             raise ValueError("валюта intent некорректна")
@@ -1539,16 +1572,19 @@ class Pool:
         validated = [self._validated_money(
             row.get("provider"), row.get("op"), row.get("uid"), row.get("price"),
             row.get("currency"), row.get("balance_after"), row.get("order_id"),
-            row.get("descr")) for row in (money_rows or [])]
+            row.get("descr"), row.get('price_source', 'provider')) for row in (money_rows or [])]
         if not validated:
             raise ValueError("денежная сага не может завершиться без ledger")
         updates = [(str(date_end), str(uid)) for uid, date_end in (date_updates or [])
                    if uid and date_end]
         if hold_order is not None:
             from providers.proxywing import family_name, identifier
-            if len(hold_order) != 3 or hold_order[0] != 'proxywing':
+            if len(hold_order) != 3 or hold_order[0] not in ('proxywing', 'proxyline'):
                 raise ValueError('unsupported order hold')
-            hold_order = ('proxywing', family_name(hold_order[1]), identifier(hold_order[2]))
+            if hold_order[0] == 'proxywing':
+                hold_order = ('proxywing', family_name(hold_order[1]), identifier(hold_order[2]))
+            elif hold_order[1] != 'static' or not re.fullmatch('[0-9]+', str(hold_order[2])):
+                raise ValueError('invalid ProxyLine order hold')
         result_json = json.dumps(result or {}, ensure_ascii=False, sort_keys=True,
                                  separators=(",", ":"), allow_nan=False)
         stamp = now_iso()
@@ -1563,8 +1599,8 @@ class Pool:
             if row[0] != "submitted":
                 raise ValueError("завершить можно только submitted spend_operation")
             conn.executemany(
-                "INSERT INTO money(ts,provider,op,uid,price,currency,balance_after,order_id,descr)"
-                " VALUES(?,?,?,?,?,?,?,?,?)", validated)
+                "INSERT INTO money(ts,provider,op,uid,price,currency,balance_after,order_id,descr,price_source)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?)", validated)
             if updates:
                 conn.executemany("UPDATE proxy SET date_end=? WHERE uid=?", updates)
             if hold_order is not None:

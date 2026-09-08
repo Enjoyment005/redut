@@ -749,7 +749,7 @@ class TestProlong(Base):
         self.assertEqual(submitted, [])
         self.assertEqual(self.money_rows("prolong"), [])
 
-    def test_proxyline_is_denied_before_unquoted_mutation(self):
+    def test_proxyline_legacy_echo_adapter_is_denied_before_mutation(self):
         class EchoOnly(FakeProxy6):
             name = "proxyline"
             prolong_calls = 0
@@ -770,7 +770,7 @@ class TestProlong(Base):
         self.assertEqual(provider.prolong_calls, 0)
         self.assertEqual(self.money_rows("prolong"), [])
 
-    def test_proxyline_observed_extension_still_cannot_supply_a_preflight_quote(self):
+    def test_proxyline_legacy_adapter_requires_the_new_account_and_receipt_contract(self):
         class Confirmed(FakeProxy6):
             name = "proxyline"
             prolong_calls = 0

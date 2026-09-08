@@ -52,7 +52,7 @@ async function scenario(mode) {
   assert.notEqual(requests[2].request_id, requests[0].request_id, mode + ': new purchase needs a new key');
 }
 
-async function renewalScenario(budget, configure = false) {
+async function renewalScenario(budget, mode = 'normal') {
   const elements = new Map(), requests = [], messages = [], opened = [];
   const element = id => {
     if (!elements.has(id)) elements.set(id, {value:'', checked:false, open:false,
@@ -61,12 +61,14 @@ async function renewalScenario(budget, configure = false) {
   };
   const quote = {order_id:'ord_existing', family:'isp', affected_count:2,
     budget:{...budget}, spent_today:0, options:[{months:3,total:9}]};
+  if(mode==='pending')quote.pending={kind:'prolong',family:'isp',order_id:'ord_existing',
+    months:3,max_total:9,request_id:'original-auto-request'};
   let confirmations = 0;
   const context = vm.createContext({
     window:{}, document:{getElementById:element},
     sessionStorage:{getItem:()=>null, setItem() {}, removeItem() {}},
     crypto:{randomUUID:()=> 'renew-existing-request'},
-    prompt:()=> '3', confirm:()=> { confirmations++; return true; },
+    prompt:()=> mode==='cancel'?null:mode==='invalid'?'2':'3', confirm:()=> { confirmations++; return true; },
     openFold:async name=>opened.push(name), toast:message=>messages.push(message),
     reloadAll:async()=>{},
     api:async(url, options)=> {
@@ -81,44 +83,29 @@ async function renewalScenario(budget, configure = false) {
   });
   vm.runInContext(source.slice(start,end),context);
   await vm.runInContext("pwRenew({},'proxywing:isp|ord_existing|ip_1')",context);
-  const blocked = !budget.enabled || budget.max_price_per_buy<9 || budget.max_spend_per_day<9;
-  if (blocked) {
-    assert.equal(requests.length,1,'blocked renewal must only read its quote');
-    assert.equal(confirmations,0,'no payment confirmation before budget is ready');
-    assert.equal(opened[0],'money');
-    assert.equal(element('pwbudgetbox').open,true,'renew button exposes its budget');
-    assert.equal(element('pwenabled').checked,budget.enabled,'no silent permission change');
-    assert.equal(element('pwmax').value,budget.max_price_per_buy,'owner limit is preserved');
-    assert.ok(element('pwbudgethint').textContent.includes('ord_existing'));
-    assert.equal(vm.runInContext('pwPending()',context),null);
-    if (configure) {
-      element('pwenabled').checked=true;
-      element('pwmax').value=9; element('pwday').value=9; element('pwreserve').value=1;
-      await vm.runInContext('pwBudget()',context);
-      assert.equal(requests.at(-1).url,'/api/proxywing/budget');
-      assert.equal(requests.filter(r=>r.url==='/api/proxywing/spend').length,0,
-        'saving budget must not charge the order');
-      await vm.runInContext("pwRenew({},'proxywing:isp|ord_existing|ip_1')",context);
-    }
+  assert.equal(confirmations,mode==='pending'?1:0,'one confirmation at most');
+  assert.deepEqual(opened,[],'renewal must not open purchase settings');
+  const paid=requests.filter(r=>r.url==='/api/proxywing/spend');
+  if(mode==='cancel'||mode==='invalid') {
+    assert.equal(paid.length,0,'cancel or invalid term must not charge');return;
   }
-  if (!blocked || configure) {
-    const paid=requests.filter(r=>r.url==='/api/proxywing/spend');
-    assert.equal(paid.length,1,'existing order is renewed once');
-    assert.equal(paid[0].body.kind,'prolong');
-    assert.equal(paid[0].body.order_id,'ord_existing');
-    assert.equal(paid[0].body.months,3);
-    assert.equal(paid[0].body.max_total,9);
-    assert.equal(vm.runInContext('pwPending()',context),null);
-  }
+  assert.equal(paid.length,1,'existing order is renewed once');
+  assert.equal(paid[0].body.kind,'prolong');
+  assert.equal(paid[0].body.order_id,'ord_existing');
+  assert.equal(paid[0].body.months,3);
+  assert.equal(paid[0].body.max_total,9);
+  if(mode==='pending')assert.equal(paid[0].body.request_id,'original-auto-request');
+  assert.equal(vm.runInContext('pwPending()',context),null);
   assert.ok(requests.every(r=>!r.url.includes('market')),'renewal does not need the purchase catalog');
 }
 
 (async () => {
   for (const mode of ['normal', 'quota', 'remove', 'reload-remove']) await scenario(mode);
   const budget={enabled:true,max_price_per_buy:50,max_spend_per_day:100,min_balance_reserve:1};
-  await renewalScenario({...budget,enabled:false,max_price_per_buy:0,max_spend_per_day:0},true);
+  await renewalScenario({...budget,enabled:false,max_price_per_buy:0,max_spend_per_day:0});
   await renewalScenario({...budget,max_price_per_buy:8});
   await renewalScenario({...budget,max_spend_per_day:8});
   await renewalScenario(budget);
-  console.log('ProxyWing UI: 4 storage and 4 existing-order renewal scenarios PASS');
+  for(const mode of ['normal','pending','cancel','invalid'])await renewalScenario({},mode);
+  console.log('ProxyWing UI: 4 storage and 8 existing-order renewal scenarios PASS');
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -25,6 +25,7 @@ buy НЕ повторяем, а ищем `getproxy?descr=<тот же>`: про�
 import datetime
 import contextlib
 import json
+import hashlib
 import math
 import os
 import re
@@ -283,9 +284,12 @@ def buy_candidates(cfg, available=None, pool=None, provider="proxy6"):
     список (rating is None) отсекается ДО бонуса, auto_allowed бонусом не обходится.
     """
     pref = country_mod.preference_order(cfg)
-    rest = [c for c in (available or []) if c not in pref]
+    market = {country_mod.norm(c) for c in available} if available is not None else set(pref)
+    market.discard(None)
+    market.discard('')
+    rest = sorted(c for c in market if c not in pref)
     out = []
-    for i, cc in enumerate(list(pref) + list(rest)):
+    for i, cc in enumerate([c for c in pref if c in market] + rest):
         c = country_mod.norm(cc)
         r = country_mod.rating(c, True, cfg)
         if r is None:
@@ -322,14 +326,17 @@ def gen_descr(server, now=None):
     return d[:50]
 
 
-def _safe_spent_today(pool, currency):
+def _safe_spent_today(pool, currency, *, allow_unreported=False):
     """Ledger — часть safety boundary: любая semantic corruption закрывает траты."""
     try:
-        spent = _num(pool.spent_today(currency))
+        raw = pool.spent_today(currency)
+        if raw is None and allow_unreported:
+            return None
+        spent = _num(raw)
     except Exception as error:
         raise SpendDenied("денежный ledger повреждён — траты заблокированы: %s" % error) from error
     if spent is None or spent < 0:
-        raise SpendDenied("денежный ledger содержит некорректный агрегат — траты заблокированы")
+        raise SpendDenied("точная сумма трат в этой валюте неизвестна — расход по бюджету заблокирован")
     return spent
 
 
@@ -433,6 +440,9 @@ def _finalize_buy(pool, op, proxies, response, *, actor, src_ip, recovered):
 
 
 def _recover_buy(pool, op, provider, *, actor="auto", src_ip=""):
+    if op.get('provider') == 'proxyline':
+        from proxyline_orders import recover
+        return recover(pool, op)
     if op.get('provider') == 'proxywing':
         from proxywing_orders import recover
         return recover(pool, op)
@@ -494,6 +504,9 @@ def _finalize_prolong(pool, op, response, new_end, *, actor, src_ip, recovered):
 
 
 def _recover_prolong(pool, op, provider, *, actor="auto", src_ip=""):
+    if op.get('provider') == 'proxyline':
+        from proxyline_orders import recover
+        return recover(pool, op)
     if op.get('provider') == 'proxywing':
         from proxywing_orders import recover
         return recover(pool, op)
@@ -561,6 +574,16 @@ def _resume_bound_request(pool, provider, key, request_id, kind, expected,
     op = pool.get_spend_operation_by_idempotency(key)
     if not op:
         return None, None
+    if (op['provider'] == 'proxy6' and 'credential_identity' in expected
+            and not (op.get('request') or {}).get('credential_identity')):
+        legacy_expected = {k:v for k,v in expected.items() if k != 'credential_identity'}
+        _validate_bound_request(op, kind, getattr(provider, 'name', ''), legacy_expected, uid=uid)
+        if op['phase'] in ('committed', 'acknowledged'):
+            return _deliver_result(pool, _stored_result(op), request_id), op
+        if op['phase'] == 'planned':
+            pool.transition_spend_operation(op['id'], 'failed', 'старый неотправленный запрос: нужно заново привязать аккаунт')
+            raise SpendDenied('старый запрос отменён до отправки; следующий цикл создаст новый', replace_request=True)
+        raise SpendDenied('старая оплата без привязки аккаунта требует сверки; повторное списание заблокировано')
     _validate_bound_request(op, kind, str(getattr(provider, "name", "") or ""),
                             expected, uid=uid)
     if op["phase"] in ("committed", "acknowledged"):
@@ -624,6 +647,10 @@ def _reconcile_pending_locked(pool, providers, *, actor="auto", src_ip="",
         if provider is None:
             raise SpendDenied("нет адаптера для восстановления незавершённой траты %s"
                               % op["provider"])
+        identity = _account_identity(provider)
+        if op['provider'] == 'proxy6' and identity and any(
+                op['request'].get(k) != v for k, v in identity.items()):
+            raise SpendDenied('аккаунт незавершённой оплаты PROXY6 не подтверждён; нужна сверка')
         if op["kind"] == "buy":
             result = _recover_buy(pool, op, provider, actor=actor, src_ip=src_ip)
         elif op["kind"] == "prolong":
@@ -659,6 +686,12 @@ def bound_spend_request(pool, request_id):
     """Return the durable operation bound to a caller request ID, if any."""
     _, key = _request_identity(request_id)
     return pool.get_spend_operation_by_idempotency(key)
+
+
+def _account_identity(provider):
+    """Bind real provider credentials without storing or logging the secret itself."""
+    key = getattr(provider, 'api_key', None)
+    return {'credential_identity': hashlib.sha256(key.encode()).hexdigest()} if isinstance(key, str) and key else {}
 
 
 def replay_completed_request(pool, request_id, kind, *, expected=None, uid=None):
@@ -775,7 +808,8 @@ def preflight_buy(pool, provider, cfg, *, country, period=None, count=1, version
 
 
 def plan_and_buy(pool, provider, cfg, *, country, period=None, count=1, version=None,
-                 server=None, actor="auto", src_ip="", auto=True, request_id=None):
+                 server=None, actor="auto", src_ip="", auto=True, request_id=None,
+                 before_submit=None):
     """Гейты §6.2 -> идемпотентная покупка -> запись в money+журнал.
 
     ВАЖНО: постфактум-проба на реальную страну выхода (§6.1) — на вызывающем
@@ -790,12 +824,12 @@ def plan_and_buy(pool, provider, cfg, *, country, period=None, count=1, version=
         return _plan_and_buy_locked(
             pool, provider, cfg, country=country, period=period, count=count,
             version=version, server=server, actor=actor, src_ip=src_ip, auto=auto,
-            request_id=request_id)
+            request_id=request_id, before_submit=before_submit)
 
 
 def _plan_and_buy_locked(pool, provider, cfg, *, country, period=None, count=1,
                          version=None, server=None, actor="auto", src_ip="", auto=True,
-                         request_id=None):
+                         request_id=None, before_submit=None):
     pname = str(getattr(provider, "name", "") or "")
     lim = limits(cfg)
     try:
@@ -805,6 +839,7 @@ def _plan_and_buy_locked(pool, provider, cfg, *, country, period=None, count=1,
                     "version": whole_number(version if version is not None else lim['buy_version'], 'version')}
     except (TypeError, ValueError, OverflowError) as error:
         raise SpendDenied("параметры покупки некорректны") from error
+    expected.update(_account_identity(provider))
     rid, request_key = _request_identity(request_id)
     replay, existing = _resume_bound_request(
         pool, provider, request_key, rid, "buy", expected,
@@ -816,7 +851,7 @@ def _plan_and_buy_locked(pool, provider, cfg, *, country, period=None, count=1,
     with _retire_planned_on_denial(pool, existing):
         pre = preflight_buy(pool, provider, cfg, country=country, period=period,
                             count=count, version=version, auto=auto)
-        if any(pre.get(key) != value for key, value in expected.items()):
+        if any(pre.get(key) != expected[key] for key in ('count', 'period', 'country', 'version')):
             raise SpendDenied("нормализованные параметры покупки не совпали с request intent")
         if existing is not None:
             if (_num(existing.get("quote_price")) != _num(pre.get("price"))
@@ -840,6 +875,8 @@ def _plan_and_buy_locked(pool, provider, cfg, *, country, period=None, count=1,
     def on_submit():
         nonlocal submitted, op
         if not submitted:
+            if before_submit is not None:
+                before_submit()
             pool.transition_spend_operation(op["id"], "submitted")
             op = pool.get_spend_operation(op["id"])
             submitted = True
@@ -849,7 +886,7 @@ def _plan_and_buy_locked(pool, provider, cfg, *, country, period=None, count=1,
         resp = provider.buy(pre["count"], pre["period"], pre["country"],
                             version=pre["version"], descr=descr, allow_cc=None,
                             on_submit=on_submit)
-    except ProviderError as e:
+    except (ProviderError, SpendDenied) as e:
         if not submitted:
             pool.transition_spend_operation(op["id"], "failed", str(e))
             e.replace_request = True
@@ -890,20 +927,23 @@ def _plan_and_buy_locked(pool, provider, cfg, *, country, period=None, count=1,
 
 # ------------------------------------------------------------------- продление
 def prolong_with_limits(pool, provider, cfg, *, row, days, actor="auto", src_ip="",
-                        request_id=None):
+                        request_id=None, automatic=False, before_submit=None):
     """Продлить один прокси на days (§6.3) под гейтами трат + запись в money.
 
-    row — запись пула (provider, ext_id, uid, descr). Для PROXY6 сверяем цену
-    через getprice ДО траты. ProxyLine не даёт доверенной preflight-цены
-    и коррелируемого request id, поэтому его продление блокируем до мутации."""
+    PROXY6 uses price/budget gates; ProxyLine uses its explicit tariff contract."""
+    if row.get('provider') == 'proxyline':
+        from proxyline_orders import execute
+        return execute(pool, provider, cfg, {'kind': 'prolong', 'uid': row['uid'],
+                       'period': whole_number(days, 'days'), 'request_id': request_id}, actor=actor)
     with _spend_lock(pool):
         return _prolong_with_limits_locked(
             pool, provider, cfg, row=row, days=days, actor=actor, src_ip=src_ip,
-            request_id=request_id)
+            request_id=request_id, automatic=automatic, before_submit=before_submit)
 
 
 def _prolong_with_limits_locked(pool, provider, cfg, *, row, days,
-                                actor="auto", src_ip="", request_id=None):
+                                actor="auto", src_ip="", request_id=None,
+                                automatic=False, before_submit=None):
     lim = limits(cfg)
     days = whole_number(days, 'days')
     if not (1 <= days <= 365):
@@ -915,7 +955,7 @@ def _prolong_with_limits_locked(pool, provider, cfg, *, row, days,
     if getattr(provider, "name", None) != pname:
         raise SpendDenied("адаптер %r не совпадает с провайдером строки %r — продление отклонено"
                           % (getattr(provider, "name", None), pname))
-    expected = {"ext_id": str(ext_id), "days": days}
+    expected = dict(ext_id=str(ext_id), days=days, **_account_identity(provider))
     rid, request_key = _request_identity(request_id)
     replay, existing = _resume_bound_request(
         pool, provider, request_key, rid, "prolong", expected, uid=uid,
@@ -929,7 +969,12 @@ def _prolong_with_limits_locked(pool, provider, cfg, *, row, days,
             return SpendDenied(message, replace_request=True)
         return SpendDenied(message)
 
-    if not lim["buy_enabled"]:
+    if automatic:
+        if (not ((cfg or {}).get('auto_prolong') or {}).get('enabled', True)
+                or ((cfg or {}).get('_config_meta') or {}).get('safe_mode')
+                or not callable(before_submit)):
+            raise pre_submit_denial('автопродление отключено или отсутствует проверка боевого канала')
+    elif not lim["buy_enabled"]:
         raise pre_submit_denial(
             "траты выключены тумблером buy_enabled — продление недоступно (§6.2)")
     if pname != "proxy6":
@@ -956,6 +1001,12 @@ def _prolong_with_limits_locked(pool, provider, cfg, *, row, days,
     if _date_value(date_before) is None:
         raise pre_submit_denial(
             "не удалось зафиксировать date_end до продления — трата отменена")
+    if automatic:
+        import probe
+        left = probe.days_left(date_before)
+        if (left is None or left > float(((cfg or {}).get('auto_prolong') or {}).get('days_before', 3))
+                or pool.prolonged_today(uid)):
+            raise pre_submit_denial('по сроку провайдера продлевать ещё рано или уже продлено сегодня')
 
     if pname == "proxy6":
         ip_version = (remote_before or {}).get("ip_version")
@@ -978,17 +1029,20 @@ def _prolong_with_limits_locked(pool, provider, cfg, *, row, days,
             raise pre_submit_denial(
                 "getprice вернул некорректный остаток %r — продление отменено"
                 % pr.get("balance"))
-        if price > lim["max_price_per_buy"]:
+        if not automatic and price > lim["max_price_per_buy"]:
             raise pre_submit_denial(
                 "цена продления %.2f %s > лимита %.2f/покупка (§6.2)"
                 % (price, currency, lim["max_price_per_buy"]))
-        if _safe_spent_today(pool, currency) + price > lim["max_spend_per_day"]:
+        spent = _safe_spent_today(pool, currency)
+        if not automatic and spent + price > lim["max_spend_per_day"]:
             raise pre_submit_denial("суточный лимит трат превышен продлением (§6.2)")
-        if (bal - price) < lim["min_balance_reserve"]:
+        if bal < price:
+            raise pre_submit_denial('недостаточно средств для продления')
+        if not automatic and (bal - price) < lim["min_balance_reserve"]:
             raise pre_submit_denial(
                 "продление опустит баланс ниже неснижаемого остатка (§6.2)")
 
-    request = dict(expected, date_before=str(date_before).replace(" ", "T"))
+    request = dict(expected, date_before=str(date_before).replace(" ", "T"), actor=actor)
     if existing is not None:
         if ((existing.get("request") or {}).get("date_before") != request["date_before"]
                 or _num(existing.get("quote_price")) != _num(price)
@@ -1007,12 +1061,14 @@ def _prolong_with_limits_locked(pool, provider, cfg, *, row, days,
     def on_submit():
         nonlocal submitted, op
         if not submitted:
+            if before_submit is not None:
+                before_submit()
             pool.transition_spend_operation(op["id"], "submitted")
             op = pool.get_spend_operation(op["id"])
             submitted = True
     try:
         resp = provider.prolong(ext_id, days, on_submit=on_submit)
-    except ProviderError as error:
+    except (ProviderError, SpendDenied) as error:
         if not submitted:
             pool.transition_spend_operation(op["id"], "failed", str(error))
             error.replace_request = True

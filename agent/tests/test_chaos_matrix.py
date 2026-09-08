@@ -62,6 +62,12 @@ class TestPostBuyFailureBoundary(PoolCase):
         class Provider:
             caps = {"buy": True}
 
+            def getcountry(self, version):
+                return ['fi']
+
+            def getprice(self, count, period, version):
+                return {'price':28, 'balance':900, 'currency':'RUB'}
+
             def getcount(self, country_code, version):
                 return 1
 

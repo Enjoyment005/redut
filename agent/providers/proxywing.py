@@ -49,6 +49,27 @@ def amount(value):
     return number
 
 
+def product_location(row, family):
+    """Read ISO country and package size from structured data or the ISP product name."""
+    location = str(row.get('location') or '').upper()
+    quantity = row.get('quantity')
+    if quantity is not None and (type(quantity) is not int or quantity < 1):
+        raise ProviderError('ProxyWing: некорректный размер пакета')
+    named = re.fullmatch(r'(\d+) Prox(?:y|ies) ISP ([A-Z]{2})', str(row.get('name') or ''), re.I)
+    if family == 'isp' and named:
+        named_country = named[2].upper()
+        if location and location.replace('UK', 'GB') != named_country.replace('UK', 'GB'):
+            raise ProviderError('ProxyWing: страна тарифа противоречит его названию')
+        location = location or named_country
+        if quantity is not None and quantity != int(named[1]):
+            raise ProviderError('ProxyWing: размер пакета противоречит названию тарифа')
+        quantity = int(named[1])
+    country = ('gb' if location == 'UK' else location.lower()) if re.fullmatch('[A-Z]{2}', location) else ''
+    if location == 'EU':
+        country = ''  # Regional bundles do not identify the country being purchased.
+    return country, quantity
+
+
 def _ip_version(value):
     try:
         return ipaddress.ip_address(str(value)).version
@@ -122,9 +143,9 @@ class ProxyWing(Provider):
             for row in data['products']:
                 if not isinstance(row, dict) or row.get('category', name) != name:
                     raise ProviderError('ProxyWing: некорректная категория товара')
-                location = str(row.get('location') or '').lower()
-                country = 'gb' if location == 'uk' else location if re.fullmatch('[a-z]{2}', location) else ''
-                quantity = row.get('quantity')
+                if str(row.get('ip_version', row.get('version', 4))) != '4':
+                    continue
+                country, quantity = product_location(row, name)
                 if quantity is not None and (type(quantity) is not int or quantity < 1):
                     raise ProviderError('ProxyWing: некорректный размер пакета')
                 out.append({'product_id': identifier(row.get('product_id')), 'family': name,

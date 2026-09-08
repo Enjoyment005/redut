@@ -273,13 +273,11 @@ class TestMonthlyLedger(unittest.TestCase):
         self.assertEqual(self.pool.conn.execute('SELECT count(*) FROM money').fetchone()[0], 1)
 
     def test_rejection_gates_run_before_post(self):
-        cases = [('budget', lambda: self.cfg.pop('proxywing_money')),
-                 ('disabled', lambda: self.cfg['money'].update(buy_enabled=False)),
-                 ('price', lambda: setattr(self.provider, 'monthly_price', 4)),
+        cases = [('price', lambda: setattr(self.provider, 'monthly_price', 4)),
                  ('currency', lambda: setattr(self.provider, 'currency', 'RUB')),
                  ('missing_currency', lambda: setattr(self.provider, 'currency', None)),
-                 ('balance', lambda: setattr(self.provider, 'usd_balance', 3)),
-                 ('daily', lambda: self.cfg['proxywing_money'].update(max_spend_per_day=2))]
+                 ('balance', lambda: setattr(self.provider, 'usd_balance', 2)),
+                 ('safe_mode', lambda: self.cfg.update(_config_meta={'safe_mode': True}))]
         import copy
         original = copy.deepcopy(self.cfg)
         for name, mutate in cases:
@@ -305,23 +303,43 @@ class TestMonthlyLedger(unittest.TestCase):
         self.assertEqual(self.provider.calls[0][0], '/isp/orders/ord_1/extend')
         self.assertEqual(self.pool.spent_today('USD'), 9)
         self.assertFalse(self.cfg['money']['buy_enabled'])
-        with self.assertRaises(money.SpendDenied):
-            self.execute(request_id='blocked-new-purchase')
-        self.assertEqual(len(self.provider.calls), 1)
+        self.assertEqual(self.cfg['money'], {'buy_enabled': False})
 
-    def test_renewal_keeps_usd_permission_price_daily_and_reserve_limits(self):
+    def test_renewal_does_not_require_a_purchase_budget(self):
         import copy
         original = copy.deepcopy(self.cfg)
         cases = [dict(enabled=False), dict(max_price_per_buy=8),
                  dict(max_spend_per_day=8), dict(min_balance_reserve=92)]
-        for change in cases:
+        for index, change in enumerate(cases):
             with self.subTest(change=change):
                 self.cfg = copy.deepcopy(original)
                 self.cfg['proxywing_money'].update(change)
+                result = self.execute(kind='prolong', order_id='ord_1', months=3, max_total=9,
+                                      request_id='renew-no-budget-%d' % index)
+                self.assertTrue(result['ok'])
+        self.cfg.pop('proxywing_money')
+        self.assertTrue(self.execute(kind='prolong', order_id='ord_1', months=3, max_total=9)['ok'])
+
+    def test_explicit_manual_purchase_and_renewal_do_not_require_budget_switches(self):
+        self.cfg.pop('proxywing_money')
+        self.cfg['money']['buy_enabled'] = False
+        result = self.execute(kind='prolong', order_id='ord_1', months=3, max_total=9)
+        self.assertTrue(result['ok'])
+        self.assertEqual(len(self.provider.calls), 1)
+        self.assertNotIn('proxywing_money', self.cfg)
+        self.assertTrue(self.execute(request_id='explicit-new-purchase')['ok'])
+        self.assertEqual(len(self.provider.calls), 2)
+        self.assertFalse(self.cfg['money']['buy_enabled'])
+        self.assertNotIn('proxywing_money', self.cfg)
+
+    def test_renewal_still_checks_price_balance_and_currency_without_budget(self):
+        self.cfg.pop('proxywing_money')
+        for balance, currency, ceiling in [(8, 'USD', 9), (100, 'RUB', 9), (100, 'USD', 8)]:
+            with self.subTest(balance=balance, currency=currency, ceiling=ceiling):
+                self.provider.usd_balance, self.provider.currency = balance, currency
                 with self.assertRaises(money.SpendDenied):
-                    self.execute(kind='prolong', order_id='ord_1', months=3, max_total=9)
+                    self.execute(kind='prolong', order_id='ord_1', months=3, max_total=ceiling)
                 self.assertFalse(self.provider.calls)
-                self.assertEqual(self.pool.spent_today('USD'), 0)
 
     def test_safe_mode_blocks_new_and_uncertain_renewal_sends(self):
         self.cfg['_config_meta'] = {'safe_mode': True}
@@ -402,7 +420,7 @@ class TestPanelMonthly(unittest.TestCase):
         self.assertIsNone(self.pool.get('proxywing:isp|ord_other|prx_2'))
 
     def test_preflight_rejection_allows_fixing_request(self):
-        self.cfg['proxywing_money']['enabled'] = False
+        self.provider.usd_balance = 2
         status, result = self.server.Handler._api_post(self.handler(self.body), '/api/proxywing/spend')
         self.assertEqual(status, 409)
         self.assertTrue(result['replace_request'])
@@ -417,17 +435,17 @@ class TestPanelMonthly(unittest.TestCase):
         self.assertEqual(status, 502)
         self.assertIn('месячные', result['error'])
 
-    def test_renewal_preflight_returns_budget_without_loading_purchase_catalog(self):
+    def test_renewal_preflight_does_not_require_purchase_budget_or_catalog(self):
         from providers.proxywing import norm_proxywing
         fixture = _ctx.fixture('proxywing_proxies.json')['orders'][0]['proxies'][0]
         uid = self.pool.upsert_proxy(norm_proxywing(fixture, {'id': 'ord_1'}, 'isp'))
         self.cfg['money']['buy_enabled'] = False
-        self.cfg['proxywing_money']['enabled'] = False
+        self.cfg.pop('proxywing_money')
         with mock.patch.object(self.provider, 'catalog') as catalog:
             status, result = self.server.Handler._api_get(
                 self.handler({}), '/api/proxywing/renewal', {'uid': [uid]})
         self.assertEqual(status, 200, result)
-        self.assertEqual(result['budget'], self.cfg['proxywing_money'])
+        self.assertNotIn('budget', result)
         self.assertEqual(result['spent_today'], 0)
         self.assertEqual(result['affected_count'], 1)
         catalog.assert_not_called()
@@ -448,6 +466,41 @@ class TestPanelMonthly(unittest.TestCase):
         self.assertEqual(status, 409, result)
         self.assertIn('error', result)
         self.assertFalse(self.provider.calls)
+
+    def test_renewal_preflight_exposes_exact_pending_retry_without_credentials(self):
+        from providers.proxywing import norm_proxywing
+        fixture = _ctx.fixture('proxywing_proxies.json')['orders'][0]['proxies'][0]
+        uid = self.pool.upsert_proxy(norm_proxywing(fixture, {'id': 'ord_1'}, 'isp'))
+        body = dict(self.body, kind='prolong', order_id='ord_1', months=3, max_total=9)
+        self.provider.lose_once = True
+        with self.assertRaises(ProviderError):
+            orders.execute(self.pool, self.provider, self.cfg, body)
+        status, result = self.server.Handler._api_get(
+            self.handler({}), '/api/proxywing/renewal', {'uid': [uid]})
+        self.assertEqual(status, 200)
+        self.assertEqual(result['pending'], dict(kind='prolong', family='isp', order_id='ord_1',
+                         months=3, max_total=9, request_id=body['request_id']))
+        self.assertNotIn('credential_identity', json.dumps(result))
+
+    def test_renewal_preflight_can_acknowledge_recovered_payment_in_a_new_browser(self):
+        from providers.proxywing import norm_proxywing
+        fixture = _ctx.fixture('proxywing_proxies.json')['orders'][0]['proxies'][0]
+        uid = self.pool.upsert_proxy(norm_proxywing(fixture, {'id': 'ord_1'}, 'isp'))
+        body = dict(self.body, kind='prolong', order_id='ord_1', months=3, max_total=9)
+        with mock.patch.object(orders, 'finish', side_effect=OSError('commit interrupted')):
+            with self.assertRaises(OSError):
+                orders.execute(self.pool, self.provider, self.cfg, body)
+        money.reconcile_pending_spend(self.pool, {'proxywing': self.provider})
+        self.cfg['_config_meta'] = {'safe_mode': True}
+        with mock.patch.object(self.provider, 'renewal_options', side_effect=ProviderError('offline')):
+            status, result = self.server.Handler._api_get(
+                self.handler({}), '/api/proxywing/renewal', {'uid': [uid]})
+        self.assertEqual(status, 200)
+        self.assertEqual(result['pending']['request_id'], body['request_id'])
+        paid = orders.execute(self.pool, self.provider, self.cfg, result['pending'])
+        self.assertTrue(paid['ok'])
+        self.assertEqual(len(self.provider.calls), 1)
+        self.assertFalse(self.pool.unacknowledged_spend_operations())
 
     def test_safe_mode_budget_save_does_not_write_or_enable_spending(self):
         import os

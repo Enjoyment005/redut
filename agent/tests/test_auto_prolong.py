@@ -77,10 +77,13 @@ class Base(unittest.TestCase):
                 "INSERT INTO proxy(uid,provider,ext_id,host,role,gone,date_end,probe_ok,country)"
                 " VALUES(?,?,?,?,?,0,?,?,?)",
                 (uid, "proxy6", uid.split(":")[1], host, role, _in(days), ok, "lv"))
+        self.pool.conn.execute("UPDATE proxy SET port_socks5=1080")
         self.pool.conn.commit()
         # current_upstream читает конфиг sing-box — подменяем на «боевой = 1.1.1.1»
         self._orig = states_mod.apply_mod.current_upstream, states_mod.apply_mod.load_json
-        states_mod.apply_mod.load_json = lambda p: {}
+        self.current = '1.1.1.1'
+        states_mod.apply_mod.load_json = lambda p: {'outbounds': [{'tag':'socks-out',
+            'type':'socks', 'server':self.current, 'server_port':1080}]}
         states_mod.apply_mod.current_upstream = lambda sb: "1.1.1.1"
 
     def tearDown(self):
@@ -124,7 +127,10 @@ class TestProviderMatch(Base):
             "INSERT INTO proxy(uid,provider,ext_id,host,role,gone,date_end,probe_ok,country)"
             " VALUES('proxyline:7','proxyline','7','3.3.3.3','auto',0,?,1,'de')", (_in(2),))
         self.pool.conn.commit()
-        states_mod.apply_mod.current_upstream = lambda sb: "3.3.3.3"
+        self.pool.conn.execute("UPDATE proxy SET port_socks5=1080 WHERE uid='proxyline:7'")
+        self.pool.conn.commit()
+        self.current = "3.3.3.3"
+        states_mod.apply_mod.current_upstream = lambda sb: self.current
 
     def test_no_adapter_for_battle_alerts_not_silent(self):
         # боевой от proxyline, ключ есть только у proxy6: НЕ зовём proxy6.prolong
@@ -139,7 +145,7 @@ class TestProviderMatch(Base):
             "SELECT result FROM event WHERE action='auto-prolong'").fetchone()
         self.assertEqual(ev["result"], "no-provider")
 
-    def test_proxyline_adapter_is_not_called_without_trusted_quote(self):
+    def test_legacy_proxyline_adapter_is_not_called_without_new_payment_contract(self):
         self.make_battle_proxyline()
         pl = FakeProv(name="proxyline")
         states_mod.auto_prolong(self.cfg, {"proxy6": self.prov, "proxyline": pl},
@@ -269,9 +275,9 @@ class TestIdempotency(Base):
 
 
 class TestGatesAndAlerts(Base):
-    def test_denied_by_limit_alerts_owner(self):
+    def test_insufficient_balance_alerts_owner(self):
         """Гейт не пустил — молчать нельзя: иначе якорь тихо истечёт."""
-        self.cfg["money"]["max_price_per_buy"] = 10    # 30 дн = 120 ₽ > 10
+        self.prov.getprice = lambda *args: {"price":120,"balance":10,"currency":"RUB"}
         r = self.run_it()
         self.assertEqual(self.prov.calls, [])
         self.assertEqual(r["prolonged"], [])
@@ -285,11 +291,11 @@ class TestGatesAndAlerts(Base):
         self.assertEqual([(r["op"], r["uid"], r["price"]) for r in rows],
                          [("prolong", "proxy6:1", 120.0)])
 
-    def test_toggle_off_blocks_spending(self):
+    def test_purchase_toggle_does_not_block_renewal(self):
         self.cfg["money"]["buy_enabled"] = False
         self.run_it()
-        self.assertEqual(self.prov.calls, [])
-        self.assertEqual(self.alerter.sent[0][0], "failed")
+        self.assertEqual(self.prov.calls, [("1", 30)])
+        self.assertEqual(self.alerter.sent[0][0], "prolonged")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@
 Нормализованный прокси — dict с ключами:
     provider, ext_id, ip, host, port_http, port_socks5, user, password,
     country, ip_version, kind (dedicated|shared), date_end (ISO), descr
+    order_id is optional provider metadata used to hold newly purchased orders.
 uid = f"{provider}:{ext_id}" собирает pool.py.
 """
 import json

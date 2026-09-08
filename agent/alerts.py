@@ -155,14 +155,17 @@ class Alerter:
 
     def bought(self, *, uid, price, currency, balance_after, country, period,
                egress=None, cc=None, recovered=False):
+        term = '%s дн' % period if isinstance(period, (int, float)) else str(period)
+        price = 'сумма в кабинете провайдера' if price is None else price
+        balance_after = 'не подтверждён' if balance_after is None else balance_after
         body = (
             "Докуплен прокси взамен кончившегося пула (§8 REPLENISH).\n\n"
-            "  прокси:  %s\n  страна:  %s,  период %s дн\n"
+            "  прокси:  %s\n  страна:  %s,  период %s\n"
             "  цена:    %s %s\n  баланс:  %s %s (после покупки)\n"
             "  выход:   %s  страна=%s\n%s"
-            % (uid, country, period, price, currency, balance_after, currency,
+            % (uid, country, term, price, currency, balance_after, currency,
                egress or "проба идёт", cc or "?",
-               "  ВНИМАНИЕ: покупка ВОССТАНОВЛЕНА по descr после обрыва сети.\n" if recovered else ""))
+               "  Покупка восстановлена по сохранённому подтверждению провайдера.\n" if recovered else ""))
         return self._send("Покупка прокси: %s %s (%s)" % (price, currency, country), body)
 
     def prolonged(self, *, uid, days, price, currency, balance_after, date_end, cc=None):

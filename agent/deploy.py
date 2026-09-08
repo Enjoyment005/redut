@@ -149,8 +149,8 @@ OPT = "/opt/vpn-panel"
 AGENT_FILES = ["update.py", "config_store.py", "config_schema.py", "health.py", "learning.py",
                "metrics.py", "replay.py",
                "dns_probe.py", "dns_evidence.py", "dns_runtime.py", "dns_rescue.py",
-               "agent.py", "pool.py", "probe.py", "apply.py", "money.py", "proxywing_orders.py",
-               "states.py", "alerts.py", "country.py",
+               "agent.py", "pool.py", "probe.py", "apply.py", "money.py", "proxywing_orders.py", "proxyline_orders.py",
+               "auto_purchase.py", "states.py", "alerts.py", "country.py",
                "providers/__init__.py", "providers/base.py",
                "providers/proxyline.py", "providers/proxy6.py", "providers/proxywing.py"]
 # sysinfo.py — ДО server.py: тот его импортирует, окно между копиями на живом
