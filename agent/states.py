@@ -2125,6 +2125,7 @@ def postbuy_check(cfg, pool, providers, bought, actor, log):
 # reserve и умер вместе с ней (П9, роли v2): ролей две — auto|off.
 DEFAULT_AUTO_PROLONG = {
     "proxywing_months": 1,
+    "proxywing_provider_auto_renew": False,
     "enabled": True,        # тумблер: выключить — и продлевать будем только руками
     "days_before": 3,       # продлевать, когда до конца осталось не больше стольких дней
     "period_days": 30,      # на сколько продлевать за раз (у PROXY6 цена линейна: 4 ₽/сутки)
@@ -2167,6 +2168,30 @@ def notify_vanished(pool, alerter, log=print, actor="auto"):
     return {"notified": len(paid), "seen": len(items)}
 
 
+def sync_provider_auto_renew(cfg, providers, pool, log=print, actor="auto", _locked=False):
+    """Reconcile opt-in provider billing without turning a toggle into a paid receipt."""
+    requested = ((cfg.get('auto_prolong') or {}).get('proxywing_provider_auto_renew') is True)
+    try:
+        get_setting = getattr(pool, 'get_setting', None)
+        owned = get_setting('proxywing_autopay:v1') if callable(get_setting) else None
+        if not requested and not owned and not cfg.get('_source'):
+            return None
+        import proxywing_autopay
+        return proxywing_autopay.reconcile(cfg, providers, pool, log=log, actor=actor, _locked=_locked)
+    except Exception as error:
+        reason = 'проверка автоплатежа ProxyWing отложена: ' + type(error).__name__
+        try:
+            log(reason)
+        except Exception:
+            pass
+        try:
+            pool.log_event('provider-auto-renew', actor=actor, result='deferred', detail=reason)
+        except Exception:
+            pass
+        return {'ok': False, 'managed': requested, 'mode': 'deferred', 'reason': reason,
+                'pending_cleanup': True}
+
+
 def auto_prolong(cfg, providers, pool, alerter, log=print, actor="auto"):
     """Продлить рабочий боевой прокси ДО того, как он истечёт (решение владельца 15.08).
 
@@ -2181,8 +2206,11 @@ def auto_prolong(cfg, providers, pool, alerter, log=print, actor="auto"):
     """
     pool.observe_provider_errors(providers, actor=actor)
     ap = auto_prolong_cfg(cfg)
+    provider_renew = sync_provider_auto_renew(cfg, providers, pool, log=log, actor=actor)
     if not ap.get("enabled"):
-        return {"ok": True, "skipped": "автопродление выключено тумблером"}
+        return {"ok": not provider_renew or provider_renew.get('ok', False),
+                "skipped": "автопродление выключено тумблером",
+                "provider_auto_renew": provider_renew}
 
     _retire_obsolete_proxywing_renewals(cfg, pool)
 
@@ -2209,6 +2237,15 @@ def auto_prolong(cfg, providers, pool, alerter, log=print, actor="auto"):
                 done.append(result)
             continue
         if row['provider'] == 'proxywing':
+            if (ap.get('proxywing_provider_auto_renew') is True
+                    or (provider_renew and (provider_renew.get('managed')
+                                           or provider_renew.get('pending_cleanup')))):
+                if provider_renew and not provider_renew.get('ok'):
+                    reason = provider_renew.get('reason') or 'автоплатёж ProxyWing не подтверждён'
+                    errors.append({'uid': row['uid'], 'reason': reason})
+                    alerter.prolong_failed(uid=row['uid'], days_left=None, reason=reason)
+                # A remote setting is not a paid renewal. Never send a second extend.
+                continue
             result = _auto_prolong_proxywing(cfg, providers, pool, alerter, row, ap, log, actor, errors=errors)
             if result:
                 done.append(result)
@@ -2295,7 +2332,7 @@ def auto_prolong(cfg, providers, pool, alerter, log=print, actor="auto"):
             errors.append({"uid":uid,"reason":"продление не выполнено; см. событие auto-prolong"})
             alerter.prolong_failed(uid=uid, days_left=round(days, 1) if days is not None else None, reason=str(e))
     return {"ok": not errors, "prolonged": done, "errors": errors,
-            "checked": [r["uid"] for r in targets]}
+            "checked": [r["uid"] for r in targets], "provider_auto_renew": provider_renew}
 
 
 def _current_proxy_uid(pool, sb):

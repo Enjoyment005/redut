@@ -4,11 +4,12 @@
 Месячные заказы имеют отдельный явный контракт; дневные buy/prolong ядра
 не включаются, чтобы автоматические 7 дней не превратились в месяц.
 """
+import datetime
 import ipaddress
 import math
 import re
 
-from .base import Provider, ProviderError, capabilities, http_get_json, http_post_json
+from .base import Provider, ProviderError, capabilities, http_get_json, http_post_json, http_put_json
 
 API_BASE = "https://api.proxywing.com/v1"
 HOST_LABEL = "api.proxywing.com"
@@ -36,6 +37,28 @@ def order_identity(ext_id):
         raise ProviderError('ProxyWing: некорректный ID прокси')
     identifier(parts[2])
     return family_name(parts[0]), identifier(parts[1])
+
+
+def billing_date(value):
+    """Parse a provider date (UTC midnight) or an explicitly zoned ISO timestamp.
+
+    Naive timestamps, malformed dates and local proxy expiry never prove the
+    provider billing deadline. Return an aware UTC datetime for comparisons.
+    """
+    try:
+        if not isinstance(value, str):
+            raise ValueError()
+        if re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+            date = datetime.date.fromisoformat(value)
+            return datetime.datetime.combine(date, datetime.time(), datetime.timezone.utc)
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2}T.+', value):
+            raise ValueError()
+        date = datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if date.tzinfo is None:
+            raise ValueError()
+        return date.astimezone(datetime.timezone.utc)
+    except (ValueError, TypeError, OverflowError):
+        raise ProviderError('ProxyWing: дата оплаты услуги не подтверждена') from None
 
 
 def amount(value):
@@ -131,6 +154,81 @@ class ProxyWing(Provider):
             return http_post_json(API_BASE + path, body,
                 headers={'Authorization': 'Bearer ' + self.api_key, 'Idempotency-Key': request_id},
                 host_label=HOST_LABEL, mutating=True)
+        return self._guarded(path, request)
+
+    def order_service(self, family, order_id):
+        """Resolve an exact singleton order/service through service_id, never IP.
+
+        Read both proxy families to exclude other orders sharing the service;
+        require one proxy, one matching active monthly account service and a real
+        billing deadline. Account services[].family is a product group label
+        (e.g. "Proxy UK"), NOT the datacenter/isp API family enum.
+        """
+        family_name(family)
+        identifier(order_id)
+        data = self._api('/%s/proxies' % family)
+        if (not isinstance(data, dict) or not isinstance(data.get('orders'), list)
+                or any(not isinstance(r, dict) for r in data['orders'])):
+            raise ProviderError('ProxyWing: неполный список заказов')
+        orders = [r for r in data['orders'] if r.get('id') == order_id]
+        if len(orders) != 1:
+            raise ProviderError('ProxyWing: заказ не определён однозначно')
+        proxies = orders[0].get('proxies')
+        if (not isinstance(proxies, list) or len(proxies) != 1
+                or not isinstance(proxies[0], dict)):
+            raise ProviderError('ProxyWing: автоплатёж разрешён только для услуги с одним боевым прокси', code='auto-renew-scope')
+        proxy_id = identifier(proxies[0].get('id'))
+        service_id = identifier(orders[0].get('service_id'))
+        if sum(r.get('service_id') == service_id for r in data['orders']) != 1:
+            raise ProviderError('ProxyWing: связь заказа и услуги неоднозначна', code='auto-renew-scope')
+        other_family = next(name for name in FAMILIES if name != family)
+        other = self._api('/%s/proxies' % other_family)
+        if (not isinstance(other, dict) or not isinstance(other.get('orders'), list)
+                or any(not isinstance(r, dict) for r in other['orders'])
+                or any(r.get('service_id') == service_id for r in other['orders'])):
+            raise ProviderError('ProxyWing: не доказана единственная связь услуги с боевым заказом', code='auto-renew-scope')
+        data = self._api('/account/services')
+        if (not isinstance(data, dict) or not isinstance(data.get('services'), list)
+                or any(not isinstance(r, dict) for r in data['services'])):
+            raise ProviderError('ProxyWing: неполный список услуг')
+        services = [r for r in data['services'] if r.get('id') == service_id]
+        if len(services) != 1:
+            raise ProviderError('ProxyWing: услуга не определена однозначно')
+        if services[0].get('status') != 'active' or services[0].get('billing_cycle') != 'monthly':
+            raise ProviderError('ProxyWing: нужна активная месячная услуга')
+        billing_date(services[0].get('next_due_date'))
+        return dict(services[0], service_id=service_id, order_id=order_id, family=family,
+                    proxy_id=proxy_id, proxy_count=1)
+
+    def get_auto_renew(self, service_id):
+        """Read the exact service-scoped switch; it is not a payment receipt."""
+        service_id = identifier(service_id)
+        data = self._api('/account/services/%s/auto-renew' % service_id)
+        return self._auto_renew_response(data, service_id)
+
+    @staticmethod
+    def _auto_renew_response(data, service_id):
+        if (not isinstance(data, dict) or data.get('service_id') != service_id
+                or type(data.get('enabled')) is not bool):
+            raise ProviderError('ProxyWing: настройка автоплатежа не подтверждена')
+        return {'service_id': service_id, 'enabled': data['enabled']}
+
+    def set_auto_renew(self, service_id, enabled, on_submit=None):
+        """Set one boolean only; caller journals ownership and verifies with a fresh GET."""
+        service_id = identifier(service_id)
+        if type(enabled) is not bool:
+            raise ProviderError('ProxyWing: enabled должен быть bool')
+        path = '/account/services/%s/auto-renew' % service_id
+        def request():
+            if on_submit is not None:
+                on_submit()
+            data = http_put_json(API_BASE + path, {'enabled': enabled},
+                headers={'Authorization': 'Bearer ' + self.api_key},
+                host_label=HOST_LABEL, mutating=True)
+            result = self._auto_renew_response(data, service_id)
+            if result['enabled'] is not enabled:
+                raise ProviderError('ProxyWing: API подтвердил другую настройку автоплатежа')
+            return result
         return self._guarded(path, request)
 
     def catalog(self, family=None):

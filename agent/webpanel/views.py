@@ -563,6 +563,26 @@ _DASH_HTML = """
     </div>
   </div>
 
+  <div class="card fold folded" id="card_settings">
+    <h2 onclick="foldClick(event,'settings')">Настройки автоплатежа<span class="sub" id="sum_settings"></span><span class="r"><span class="arr" id="fa_settings">▸</span></span></h2>
+    <div class="fold-body">
+      <h3 style="font-size:14px">Автоплатёж ProxyWing для боевого прокси</h3>
+      <div class="sub warn" style="margin:9px 0 12px">ProxyWing сам оплачивает продление по своему billing cycle
+        из баланса ProxyWing — <b>без локальных лимитов Редута</b> на цену и дневные траты.
+        Переключатель <b>не оплачивает текущий invoice</b>; уже выставленный счёт проверяй в кабинете провайдера.<br>
+        Редут управляет только нужной услугой здорового боевого прокси.
+        Чужой включённый автоплатёж не присваивается Редуту и не выключается.
+        Общие услуги с несколькими прокси не включаются.
+        Нужны активная месячная услуга и <code>proxywing_months=1</code>;
+        настройка 3/6/12 запрещает новое включение, но не мешает отключению.
+        Собственный автоплатёж Редут отключает при смене боевого прокси;
+        если отключение ещё не подтверждено, это видно ниже.</div>
+      <button class="btn s" id="pw_autopay_toggle" role="switch" aria-checked="false" disabled
+        onclick="toggleProviderAutoRenew(this)">Загрузка настройки…</button>
+      <div class="sub" id="pw_autopay_status" aria-live="polite" style="margin-top:10px"></div>
+    </div>
+  </div>
+
   <div class="card fold folded" id="card_strategy">
     <h2 onclick="foldClick(event,'strategy')">Стратегия выбора стран<span class="r"><span class="sub" id="stnow"></span><span class="arr" id="fa_strategy">▸</span></span></h2>
     <div class="fold-body">
@@ -727,12 +747,13 @@ const FOLDS={
   money:{def:1,load:()=>loadMoney()},
   pool:{def:1,load:()=>loadPool()},
   clients:{def:1,always:1,load:()=>loadClients()},
+  settings:{def:1,load:()=>loadProviderAutoRenew()},
   strategy:{def:1,load:()=>loadStrategy()},
   keys:{def:1,load:()=>loadKeys()},
   upd:{def:1,load:()=>loadUpd()},
   events:{def:1,load:()=>loadEvents()},
   metrics:{def:1,load:()=>loadMetrics()}};
-const FOLD_ORDER=['status','money','pool','clients','strategy','keys','upd','events','metrics'];
+const FOLD_ORDER=['status','money','pool','clients','settings','strategy','keys','upd','events','metrics'];
 const FOLD_MEM={}; /* фолбэк на сессию, когда localStorage запрещён — иначе разделы не развернуть вовсе */
 function isFolded(id){try{const v=localStorage.getItem('vpnpanel-fold-'+id);
   if(v==='0')return false;if(v==='1')return true}catch(e){}
@@ -1498,6 +1519,34 @@ async function del(btn,uid){if(!confirm('Удалить прокси '+uid+' Н�
   btn.disabled=true;toast('Удаляю '+uid+'…');try{const r=await api('/api/proxy/'+encodeURIComponent(uid)+'/delete',{method:'POST'});
     toast('Удалено: '+r.deleted+' ('+uid+')','ok');await reloadAll()}catch(e){toast('удаление: '+e.message,'bad')}btn.disabled=false}
 
+let __providerAutoRenew=null;
+function renderProviderAutoRenew(r){__providerAutoRenew=r;
+  const b=document.getElementById('pw_autopay_toggle'),s=r.state||{};
+  b.disabled=false;b.setAttribute('aria-checked',r.enabled?'true':'false');
+  b.textContent=r.enabled?'Выключить управление автоплатежом':'Включить управление автоплатежом';
+  sum('settings',r.enabled?'разрешено':'выключено');
+  let text=r.enabled?'Управление разрешено. Это не подтверждение оплаты счёта.':'Управление выключено.';
+  if(!r.auto_prolong_enabled)text+=' Автопродление Редута выключено; новые автоплатежи не включаются.';
+  if(s.pending_cleanup)text+=' Отключение собственного автоплатежа ещё не подтверждено; нужна повторная проверка.';
+  if(s.ownership==='external-enabled')text+=' Автоплатёж включён не Редутом; он не будет присвоен или выключен.';
+  if((s.owned||[]).length)text+=' Услуг в журнале управления Редута: '+s.owned.length+'.';
+  if(s.reason)text+=' '+s.reason;
+  document.getElementById('pw_autopay_status').textContent=text;
+  document.getElementById('pw_autopay_status').className=s.pending_cleanup||s.ok===false?'sub warn':'sub'}
+async function loadProviderAutoRenew(){try{renderProviderAutoRenew(await api('/api/provider-auto-renew'))}
+  catch(e){__providerAutoRenew=null;document.getElementById('pw_autopay_toggle').disabled=true;
+    document.getElementById('pw_autopay_status').textContent=e.message}}
+async function toggleProviderAutoRenew(btn){if(btn.disabled||!__providerAutoRenew)return;
+  const enabled=!__providerAutoRenew.enabled;
+  if(enabled&&!confirm('Разрешить автоплатёж ProxyWing только для услуги боевого прокси? '+
+    'Провайдер списывает свой баланс по billing cycle без локальных лимитов Редута. '+
+    'Переключатель не оплачивает текущий invoice.'))return;
+  btn.disabled=true;
+  try{const r=await api('/api/provider-auto-renew',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({enabled})});renderProviderAutoRenew(r)}
+  catch(e){toast(e.message,'bad');await loadProviderAutoRenew()}
+  finally{btn.disabled=!__providerAutoRenew}}
+
 /* ── стратегия выбора стран: правило «страна против замеров» ──
    Тексты стратегий приходят с сервера (country.STRATEGIES) — там же, где сама логика,
    чтобы описание в панели не разошлось с поведением. */
@@ -1979,10 +2028,10 @@ function esc(s){return (s==null?'':''+s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':
 function toast(t,cls){const d=document.createElement('div');d.className='msg '+(cls||'');d.textContent=t;
   document.getElementById('toast').appendChild(d);setTimeout(()=>d.remove(),9000)}
 let SETUP='';
-async function claimSetup(){const secret=document.getElementById('bootstrap').value.trim();
-  if(!secret)return toast('вставь bootstrap-код из SSH-консоли','bad');
+async function claimSetup(){const code=document.getElementById('bootstrap').value.trim();
+  if(!code)return toast('вставь bootstrap-код из SSH-консоли','bad');
   try{const r=await fetch('/api/setup/claim',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({secret:secret})});const t=await r.text();let j;try{j=JSON.parse(t)}catch(e){j={error:t}}
+    body:JSON.stringify({secret:code})});const t=await r.text();let j;try{j=JSON.parse(t)}catch(e){j={error:t}}
     if(!r.ok)throw new Error(j.error||('HTTP '+r.status));SETUP=j.setup_token;
     document.getElementById('bootstrap').value='';document.getElementById('s0').style.display='none';
     document.getElementById('s1').style.display='block';document.getElementById('stepper').style.display='block';

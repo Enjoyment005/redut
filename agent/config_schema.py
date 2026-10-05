@@ -410,6 +410,14 @@ def normalize(raw, defaults=None, source=""):
         1, 3650, integer=True)
     if prolong_invalid or len(issues) > start or safe_mode:
         prolong["enabled"] = False
+    provider_auto_renew = prolong.get("proxywing_provider_auto_renew", False)
+    if not isinstance(provider_auto_renew, bool):
+        _issue(issues, "auto_prolong.proxywing_provider_auto_renew",
+               "ожидался boolean", "disabled")
+        provider_auto_renew = False
+    prolong["proxywing_provider_auto_renew"] = provider_auto_renew
+    if safe_mode:
+        prolong["proxywing_provider_auto_renew"] = False
     cfg["auto_prolong"] = prolong
 
     update_defaults = defaults.get("update") or {
@@ -733,7 +741,8 @@ def normalize(raw, defaults=None, source=""):
             sources[path] = "derived"
     if safe_mode:
         for path in ("money.buy_enabled", "money.delete_enabled",
-                     "auto_prolong.enabled", "update.auto",
+                     "auto_prolong.enabled", "auto_prolong.proxywing_provider_auto_renew",
+                     "update.auto",
                      "learning.owner_approved", "dns_rescue.mode",
                      "dns_rescue.automatic_ready", "dns_rescue.active_probes"):
             sources[path] = "safe-default"

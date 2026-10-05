@@ -131,6 +131,7 @@ MONEY_CONFIG = {
     # оплаты. Поэтому здоровый боевой адрес держим, а ротация — аварийная мера.
     "auto_prolong": {
         "enabled": True,
+        "proxywing_provider_auto_renew": False,
         "days_before": 3,      # продлеваем за 3 дня до конца, не в последний час
         "period_days": 30,     # 120 ₽ — влезает в лимит max_price_per_buy=150
     },
@@ -149,10 +150,11 @@ OPT = "/opt/vpn-panel"
 AGENT_FILES = ["update.py", "config_store.py", "config_schema.py", "health.py", "learning.py",
                "metrics.py", "replay.py",
                "dns_probe.py", "dns_evidence.py", "dns_runtime.py", "dns_rescue.py",
+               "providers/base.py", "providers/proxywing.py", "proxywing_autopay.py",
                "agent.py", "pool.py", "probe.py", "apply.py", "money.py", "proxywing_orders.py", "proxyline_orders.py",
                "auto_purchase.py", "states.py", "alerts.py", "country.py",
-               "providers/__init__.py", "providers/base.py",
-               "providers/proxyline.py", "providers/proxy6.py", "providers/proxywing.py"]
+               "providers/__init__.py",
+               "providers/proxyline.py", "providers/proxy6.py"]
 # sysinfo.py — ДО server.py: тот его импортирует, окно между копиями на живом
 # узле не должно ловить ImportError при рестарте панели (случай node1 19.08)
 PANEL_FILES = ["webpanel/__init__.py", "webpanel/auth.py", "webpanel/sysinfo.py",

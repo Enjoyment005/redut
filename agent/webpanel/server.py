@@ -24,6 +24,9 @@
   --- настройки (§12; лимиты трат по-прежнему только по SSH) ---
   GET  /api/strategy                три стратегии выбора стран + предпросмотр на живых данных
   POST /api/strategy                {strategy} — сменить правило (config.json, без рестарта)
+  GET  /api/provider-auto-renew     сохранённое разрешение + локальный журнал владения (без сети)
+  POST /api/provider-auto-renew     {enabled: bool} — CLI сохраняет разрешение и сверяет услугу;
+                                   это не оплата текущего invoice и не лимиты трат Редута
   --- ключи провайдеров (§12; сам ключ обратно не отдаётся никогда) ---
   GET  /api/key/status              по провайдеру: задан ли ключ, хвост, баланс, живых в пуле
   POST /api/key                     {provider, key, force?} — сменить/добавить/убрать ключ
@@ -75,6 +78,7 @@ import health as health_mod        # noqa: E402
 import metrics as metrics_mod      # noqa: E402
 import money as money_mod          # noqa: E402
 import proxywing_orders as proxywing_orders_mod  # noqa: E402
+import proxywing_autopay as proxywing_autopay_mod  # noqa: E402
 import proxyline_orders as proxyline_orders_mod  # noqa: E402
 import pool as pool_mod            # noqa: E402
 import probe as probe_mod          # noqa: E402
@@ -163,7 +167,8 @@ def load_config():
                              "exploration_enabled": False, "exploration_rate": 0.05,
                              "exploration_max_per_day": 1,
                              "exploration_purchase_budget_per_day": 0.0},
-                "auto_prolong": {"enabled": True, "days_before": 3, "period_days": 30, "proxywing_months": 1},
+                "auto_prolong": {"enabled": True, "days_before": 3, "period_days": 30,
+                                 "proxywing_months": 1, "proxywing_provider_auto_renew": False},
                 "update": {"auto": True, "window": "04:00-06:00",
                            "repo": "Enjoyment005/redut"},
             }
@@ -812,6 +817,8 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, "not found", "text/plain; charset=utf-8")
 
     def _api_get(self, path, qs):
+        if path == "/api/provider-auto-renew":
+            return self._json(200, Handler._provider_auto_renew_status(self))
         if path == "/api/status":
             return self._json(200, self._status())
         if path == "/api/config/diagnostics":
@@ -1100,6 +1107,18 @@ class Handler(BaseHTTPRequestHandler):
                 'replace_request': bool(getattr(error, 'replace_request', False) or not bound)})
 
     def _api_post(self, path):
+        if path == "/api/provider-auto-renew":
+            body = Handler._json_object_body(self)
+            if not isinstance(body.get("enabled"), bool):
+                return self._json(400, {"error": "ожидаю {enabled: true|false}"})
+            rc, _output = _run_agent([
+                "provider-auto-renew", "--enable" if body["enabled"] else "--disable"])
+            public = Handler._provider_auto_renew_status(self)
+            public["ok"] = (rc == 0 and public["enabled"] is body["enabled"]
+                            and public["state"].get("ok") is not False)
+            if not public["ok"]:
+                public["error"] = "Автоплатёж: сохранение настройки или проверка провайдера не подтверждены"
+            return self._json(200 if public["ok"] else 409, public)
         if path == '/api/proxyline/spend':
             return Handler._do_proxyline_spend(self, Handler._json_object_body(self))
         if path.startswith('/api/proxywing/'):
@@ -1514,6 +1533,19 @@ class Handler(BaseHTTPRequestHandler):
                       "switch_error": switch_error, "target": pick,
                       "persist_error": requested["persist_error"]})
         return self._json(200, state)
+
+    def _provider_auto_renew_status(self):
+        """Reload only the billing policy saved by the isolated CLI process."""
+        with _CONFIG_LOCK:
+            latest = load_config()
+            APP.cfg["auto_prolong"] = latest["auto_prolong"]
+            APP.cfg["_config_meta"] = latest["_config_meta"]
+            enabled = APP.cfg["auto_prolong"].get("proxywing_provider_auto_renew") is True
+            auto_prolong_enabled = APP.cfg["auto_prolong"].get("enabled") is True
+        with _DB_LOCK:
+            state = proxywing_autopay_mod.status(APP.pool)
+        return {"enabled": enabled, "auto_prolong_enabled": auto_prolong_enabled,
+                "state": state}
 
     # ------------------------------------------------ обновления (UPDATE-PLAN)
     def _update_status(self):
@@ -2079,10 +2111,10 @@ class Handler(BaseHTTPRequestHandler):
         except RequestBodyError as error:
             return self._json(error.status, {"error": error.message})
         if path == "/api/setup/claim":
-            token = APP.claim_setup(str(body.get("secret") or ""))
-            if not token:
+            claim = APP.claim_setup(str(body.get("secret") or ""))
+            if not claim:
                 return self._json(403, {"error": "bootstrap-код неверен или просрочен"})
-            return self._json(200, {"ok": True, "setup_token": token,
+            return self._json(200, {"ok": True, "setup_token": claim,
                                     "expires_in": SETUP_CLAIM_TTL})
         tok = self.headers.get("X-Setup-Token")
         if not APP.setup_claim_valid(tok):

@@ -377,7 +377,7 @@ def _urlopen_json(req, host_label, timeout, follow_redirects=True):
 _CURL_UNSENT = {6, 7, 35}
 
 
-def _curl_json(url, headers, form_fields, host_label, timeout, json_body=None):
+def _curl_json(url, headers, form_fields, host_label, timeout, json_body=None, method=None):
     """Тот же запрос через СОБСТВЕННЫЙ канал узла: curl --interface tun0 (sing-box -> upstream)."""
     cmd = ["curl", "-sS", "--interface", "tun0", "-m", str(int(timeout)), "-A", USER_AGENT,
            "-D", "-",
@@ -385,7 +385,7 @@ def _curl_json(url, headers, form_fields, host_label, timeout, json_body=None):
     for k, v in (headers or {}).items():
         cmd += ["-H", "%s: %s" % (k, v)]
     if json_body is not None:
-        cmd += ["-X", "POST", "-H", "Content-Type: application/json", "--data-binary", "@-"]
+        cmd += ["-X", method or "POST", "-H", "Content-Type: application/json", "--data-binary", "@-"]
     elif form_fields is not None:
         cmd += ["-X", "POST"]
         for k, v in urllib.parse.parse_qsl(urllib.parse.urlencode(form_fields or {}, doseq=True)):
@@ -428,7 +428,7 @@ def _curl_json(url, headers, form_fields, host_label, timeout, json_body=None):
         status = int(code.strip() or 0)
     except ValueError:
         status = 0
-    if status >= 400:
+    if status >= 400 or (method == "PUT" and 300 <= status < 400):
         raise _http_error(host_label, status, body, response_headers)
     if status == 0:
         raise ProviderError("Нет связи с %s через канал узла (нет ответа)" % (host_label or "API"), network=True)
@@ -439,7 +439,7 @@ def _curl_json(url, headers, form_fields, host_label, timeout, json_body=None):
                             kind=ProviderErrorKind.PROTOCOL) from None
 
 
-def _request_json(url, headers, form_fields, timeout, host_label, mutating, json_body=None):
+def _request_json(url, headers, form_fields, timeout, host_label, mutating, json_body=None, method=None):
     """Запрос предпочтительным транспортом; при «нет связи» — другим, если это безопасно.
 
     direct -> tun0: если tun0 жив; для mutating — только при unsent (запрос не доставлен).
@@ -455,7 +455,7 @@ def _request_json(url, headers, form_fields, timeout, host_label, mutating, json
             if tr == "direct":
                 if json_body is not None:
                     req = urllib.request.Request(
-                        url, data=json.dumps(json_body, allow_nan=False).encode('utf-8'), method='POST',
+                        url, data=json.dumps(json_body, allow_nan=False).encode('utf-8'), method=method or 'POST',
                         headers={"User-Agent": USER_AGENT, "Content-Type": "application/json",
                                  **(headers or {})})
                 elif form_fields is None:
@@ -474,6 +474,8 @@ def _request_json(url, headers, form_fields, timeout, host_label, mutating, json
                     req, host_label, timeout, follow_redirects=not mutating)
             else:
                 extra = {"json_body": json_body} if json_body is not None else {}
+                if method is not None:
+                    extra["method"] = method
                 data = _curl_json(url, headers, form_fields, host_label, timeout, **extra)
         except ProviderError as e:
             if not e.network:
@@ -509,6 +511,16 @@ def http_post_json(url, body, headers=None, timeout=HTTP_TIMEOUT, host_label="",
     if not isinstance(body, dict):
         raise ValueError('JSON request body must be an object')
     return _request_json(url, headers, None, timeout, host_label, mutating, json_body=body)
+
+
+def http_put_json(url, body, headers=None, timeout=HTTP_TIMEOUT, host_label="", mutating=True):
+    """PUT a JSON object; reject redirects and ambiguous mutation retries."""
+    if mutating is not True:
+        raise ValueError('PUT requires the mutation safety policy')
+    if not isinstance(body, dict):
+        raise ValueError('JSON request body must be an object')
+    return _request_json(url, headers, None, timeout, host_label, mutating,
+                         json_body=body, method='PUT')
 
 
 def build_query(params):

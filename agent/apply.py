@@ -487,6 +487,45 @@ def _operation_error(pool, operation_id, error):
         pass
 
 
+def release_provider_billing_before_switch(server_cfg, pool, live, target, log=print):
+    """Best-effort release before an endpoint switch; billing failure must not kill VPN."""
+    if pool is None:
+        return None
+    try:
+        if outbound_fingerprint(live.get('outbounds', [])) == outbound_fingerprint(target.get('outbounds', [])):
+            return None
+        getter = getattr(pool, 'get_setting', None)
+        owned = getter('proxywing_autopay:v1') if callable(getter) else None
+        if not isinstance(owned, str) or not owned:
+            return None
+        import proxywing_autopay
+        from providers import make_providers
+        paths = [os.environ.get('VPN_PANEL_SECRETS'), '/etc/vpn-panel/secrets.json',
+                 os.path.join(os.path.dirname(__file__), '.secrets.local.json')]
+        secrets = {}
+        for path in paths:
+            if path and os.path.isfile(path):
+                with open(path, encoding='utf-8') as handle:
+                    secrets = json.load(handle)
+                break
+        result = proxywing_autopay.release_owned(
+            server_cfg, make_providers(secrets), pool, log=log, actor='switch', _locked=True)
+        if not result.get('ok'):
+            log('  автоплатёж старой услуги не отключён; сохранён для повторной проверки')
+        return result
+    except Exception as error:
+        reason = 'отключение автоплатежа перед сменой отложено: ' + type(error).__name__
+        try:
+            log('  ' + reason)
+        except Exception:
+            pass
+        try:
+            pool.log_event('provider-auto-renew', actor='switch', result='deferred', detail=reason)
+        except Exception:
+            pass
+        return {'ok': False, 'mode': 'deferred', 'pending_cleanup': True}
+
+
 def apply_candidate(server_cfg, proxy_row, probe_res, log=print, _locked=False,
                     pool=None, requested_by="auto", idempotency_key=None,
                     selection_source="auto"):
@@ -573,6 +612,7 @@ def apply_candidate(server_cfg, proxy_row, probe_res, log=print, _locked=False,
             backup = backup_ring(cfg_path, ring_dir)
             log("  бэкап: %s (кольцо из 10)" % backup)
 
+            release_provider_billing_before_switch(server_cfg, pool, live, new_cfg, log=log)
             mutation_may_have_started = True
             os.replace(stage, cfg_path)
             if pool is not None:
@@ -697,6 +737,8 @@ def rollback_from_ring(server_cfg, backup_path=None, log=print, _locked=False,
             # обратимой даже если target backup не поднимет sing-box.
             before_backup = backup_ring(cfg_path, ring_dir, keep=1000)
             log("  страховочный бэкап до rollback: %s" % before_backup)
+            release_provider_billing_before_switch(
+                server_cfg, pool, load_json(cfg_path), load_json(backup), log=log)
             mutation_may_have_started = True
             atomic_copy_replace(backup, cfg_path)
             if pool is not None:

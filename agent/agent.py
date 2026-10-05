@@ -78,7 +78,8 @@ def load_config(path=None):
                             "exploration_enabled": False, "exploration_rate": 0.05,
                             "exploration_max_per_day": 1,
                             "exploration_purchase_budget_per_day": 0.0}
-    defaults["auto_prolong"] = {"enabled": True, "days_before": 3, "period_days": 30, "proxywing_months": 1}
+    defaults["auto_prolong"] = {"enabled": True, "days_before": 3, "period_days": 30,
+                                "proxywing_months": 1, "proxywing_provider_auto_renew": False}
     defaults["update"] = {"auto": True, "window": "04:00-06:00",
                           "repo": "Enjoyment005/redut"}
     src = "dev-дефолты"
@@ -389,6 +390,11 @@ def cmd_egress_mark(cfg, args):
         p.set_setting("battle_mark_at", pool_mod.now_iso())
     print("egress-mark: ip=%s cc=%s -> %s"
           % (v["egress_ip"] or "—", v["exit_cc"] or "??", "ok" if v["ok"] else v["why"]))
+    requested = (cfg.get('auto_prolong') or {}).get('proxywing_provider_auto_renew') is True
+    owned = p.get_setting('proxywing_autopay:v1')
+    if requested or (isinstance(owned, str) and owned):
+        secrets, _ = load_secrets()
+        states_mod.sync_provider_auto_renew(cfg, make_providers(secrets), p, log=print, actor='cron')
     p.close()
     return 0
 
@@ -1033,6 +1039,41 @@ def cmd_rotate(cfg, args):
     return 0 if r["state"] in (states_mod.OK, states_mod.FROZEN, states_mod.FROZEN_NET) else 1
 
 
+def cmd_provider_auto_renew(cfg, args):
+    """Explicit opt-in to provider billing; no claim that any invoice was paid."""
+    import config_store
+    import proxywing_autopay
+    p = open_pool(cfg)
+    try:
+        if getattr(args, 'status', False):
+            result = proxywing_autopay.status(p)
+        else:
+            with apply_mod.Flock(cfg.get('lock') or '/run/vpn-agent.lock'):
+                enabled = getattr(args, 'enable', False)
+                disabled = getattr(args, 'disable', False)
+                if enabled and (cfg.get('_config_meta') or {}).get('safe_mode'):
+                    print('Автоплатёж не включён: конфигурация в безопасном режиме.')
+                    return 1
+                if enabled or disabled:
+                    def change(data):
+                        if not isinstance(data.get('auto_prolong'), dict):
+                            data['auto_prolong'] = {}
+                        data['auto_prolong']['proxywing_provider_auto_renew'] = bool(enabled)
+                    latest = config_store.update(cfg, change)
+                    # Keep config metadata and runtime paths; only normalized policy changes.
+                    cfg['auto_prolong'] = config_schema.normalize(latest)['auto_prolong']
+                secrets, _ = load_secrets()
+                result = proxywing_autopay.reconcile(
+                    cfg, make_providers(secrets), p, log=lambda *_: None, actor='user', _locked=True)
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0 if result.get('ok') else 1
+    except Exception as error:
+        print('Автоплатёж не подтверждён: ' + type(error).__name__)
+        return 1
+    finally:
+        p.close()
+
+
 def cmd_auto_prolong(cfg, args):
     """Продлить боевой прокси до истечения (§6.3). Крон раз в сутки."""
     secrets, _ = load_secrets()
@@ -1048,6 +1089,11 @@ def cmd_auto_prolong(cfg, args):
         print("  пропуск: %s" % r["skipped"])
     elif r.get("errors") or not r.get("ok"):
         print("  автопродление не выполнено: %s" % (r.get("reason") or r.get("errors")))
+    elif r.get('provider_auto_renew') and r['provider_auto_renew'].get('managed'):
+        billing = r['provider_auto_renew']
+        print('  автоплатёж провайдера: %s; оплата счёта этим запуском не подтверждается' % billing.get('mode'))
+        if billing.get('reason'):
+            print('  ' + billing['reason'])
     elif not r.get("prolonged"):
         print("  продлений нет: проверены срок и состояние текущего канала")
     p.close()
@@ -1351,6 +1397,11 @@ def main(argv=None):
     sp.add_argument("--days", type=int, default=90,
                     help="окно истории 1..3650 дней (по умолчанию 90)")
     sub.add_parser("auto-prolong", help="⚠️ продлить боевой прокси до истечения (§6.3, деньги; крон раз в сутки)")
+    sp = sub.add_parser('provider-auto-renew', help='автоплатёж ProxyWing только для боевой услуги')
+    flags = sp.add_mutually_exclusive_group()
+    flags.add_argument('--enable', action='store_true', help='разрешить автоматические платежи провайдера')
+    flags.add_argument('--disable', action='store_true', help='отключить только автоплатёж, включённый Редутом')
+    flags.add_argument('--status', action='store_true', help='сохранённое состояние без запросов к провайдеру')
     sp = sub.add_parser("self-update", help="обновления с GitHub (UPDATE-PLAN): проверить маяк / применить")
     sp.add_argument("--check", action="store_true", help="только сверить версии (поведение по умолчанию)")
     sp.add_argument("--apply", dest="apply_now", action="store_true",
@@ -1376,7 +1427,7 @@ def main(argv=None):
                 "dns-rescue": cmd_dns_rescue,
                 "switch-provider": cmd_switch_provider,
                 "heartbeat-check": cmd_heartbeat_check, "learning-replay": cmd_learning_replay,
-                "auto-prolong": cmd_auto_prolong,
+                "auto-prolong": cmd_auto_prolong, "provider-auto-renew": cmd_provider_auto_renew,
                 "self-update": cmd_self_update, "egress-mark": cmd_egress_mark}
     try:
         return handlers[args.cmd](cfg, args)
