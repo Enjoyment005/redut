@@ -672,6 +672,29 @@ def apply_candidate(server_cfg, proxy_row, probe_res, log=print, _locked=False,
             raise
 
 
+def compatible_backup(server_cfg, backup):
+    """Stage a 1.14 copy of a legacy ring entry, preserving the original."""
+    from singbox_config import migrate
+    live = load_json(server_cfg["singbox_config"])
+    # Agent-only deployment on a legacy node must not feed it a 1.14 config.
+    if not any(s.get("type") for s in live.get("dns", {}).get("servers", [])):
+        return backup
+    original = load_json(backup)
+    candidate = migrate(original)
+    if candidate == original:
+        return backup
+    encoded = json.dumps(candidate, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    parent = os.path.join(server_cfg["ring"], "compatible")
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    path = os.path.join(parent, hashlib.sha256(encoded).hexdigest() + ".json")
+    if os.path.exists(path):
+        if load_json(path) != candidate:
+            raise ApplyError("compatible backup checksum conflict")
+    else:
+        dump_json_replace(candidate, path)
+    return path
+
+
 def rollback_from_ring(server_cfg, backup_path=None, log=print, _locked=False,
                        pool=None, requested_by="user", idempotency_key=None,
                        selection_source="manual"):
@@ -691,6 +714,7 @@ def rollback_from_ring(server_cfg, backup_path=None, log=print, _locked=False,
     mutation_may_have_started = False
     with _maybe_lock(server_cfg, _locked):
         try:
+            backup = compatible_backup(server_cfg, backup)
             bad_ip = current_upstream(load_json(cfg_path))
             good_ip = current_upstream(load_json(backup))
             target_checksum = file_checksum(backup)

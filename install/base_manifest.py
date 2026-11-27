@@ -3,6 +3,7 @@
 import sys
 
 BASE_CONTRACT_MARKER = "# REDUT_BASE_CONTRACT=2"
+CORE_BINARY_SHA256 = "c90cb751197910feabc43026491e451b8ed1800ef7d493d1e31cd32a0b6a4383"
 BASE_RUNTIME_FILES = (
     "/usr/local/bin/singbox-watchdog.sh",
     "/usr/local/bin/singbox-post.sh",
@@ -86,6 +87,10 @@ print("REDUT_DNS_PREFLIGHT_OK")
 def remote_check_command():
     checks = ["grep -Fqx %s %s" % (_quote(BASE_CONTRACT_MARKER), _quote(path))
               for path in BASE_RUNTIME_FILES]
+    # Agent-only deployment must not install the typed DNS Rescue generator
+    # onto a core which cannot read it. The full installer upgrades both.
+    checks.append("echo '%s  /usr/local/bin/sing-box' | sha256sum --check --status"
+                  % CORE_BINARY_SHA256)
     return " && ".join(checks) + " && echo REDUT_BASE_CONTRACT_OK"
 
 

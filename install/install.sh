@@ -2,7 +2,7 @@
 # install.sh — ИДЕМПОТЕНТНЫЙ серверный установщик базы VPN-узла (схема node1).
 #
 # Ставит с голого Debian 13 всё, КРОМЕ веб-панели/агента (их накатывает bootstrap.py
-# через panel/deploy.py): пакеты, sing-box 1.11.7 (бинарь с GitHub), WireGuard
+# через panel/deploy.py): пакеты, sing-box 1.14.5 (бинарь с GitHub), WireGuard
 # (сервер+клиенты), sing-box config, self-heal, vpn-boot-setup (с §11 RETURN и
 # фолбэком подъёма wg0), microsocks, iptables/маршруты, кроны.
 #
@@ -98,11 +98,53 @@ sysctl -q -p /etc/sysctl.d/99-vpn.conf 2>/dev/null || sysctl -q net.ipv4.ip_forw
 log "2/12 sing-box $SINGBOX_VERSION"
 cur=""
 [ -x /usr/local/bin/sing-box ] && cur="$(/usr/local/bin/sing-box version 2>/dev/null | awk '/version/{print $NF; exit}')"
+[ "$(uname -m)" = "x86_64" ] || die "поддерживается только linux-amd64"
 arch="linux-amd64"
+candidate_bin=/usr/local/bin/sing-box
+core_backup=""
+core_activated=0
+core_was_active=0
+core_had_binary=0
+core_had_config=0
+core_had_boot=0
+core_finished(){
+    rc=$?
+    trap - EXIT
+    if [ "$rc" != "0" ] && [ "$core_activated" = "1" ]; then
+        log "возвращаю прежние ядро и конфигурацию"
+        systemctl stop sing-box >/dev/null 2>&1 || true
+        restored=1
+        if [ "$core_had_binary" = "1" ]; then
+            cp -p "$core_backup/sing-box" /usr/local/bin/sing-box.restore &&
+                mv /usr/local/bin/sing-box.restore /usr/local/bin/sing-box || restored=0
+        else
+            rm -f /usr/local/bin/sing-box || restored=0
+        fi
+        if [ "$core_had_config" = "1" ]; then
+            cp -p "$core_backup/config.json" /etc/sing-box/config.json.restore &&
+                mv /etc/sing-box/config.json.restore /etc/sing-box/config.json || restored=0
+        else
+            rm -f /etc/sing-box/config.json || restored=0
+        fi
+        if [ "$core_had_boot" = "1" ]; then
+            cp -p "$core_backup/boot.sh" /usr/local/bin/vpn-boot-setup.sh || restored=0
+        fi
+        if [ "$restored" = "1" ] && [ "$core_was_active" = "1" ]; then
+            systemctl restart sing-box &&
+                bash /usr/local/bin/vpn-boot-setup.sh || restored=0
+        fi
+        [ "$restored" = "1" ] || log "ОШИБКА восстановления; резервная копия: $core_backup"
+    fi
+    rm -f /usr/local/bin/sing-box.new /etc/sing-box/config.json.candidate
+    exit "$rc"
+}
+trap core_finished EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 case "$SINGBOX_VERSION:$arch" in
-    1.11.7:linux-amd64)
-        expected_sha="30420c7e1a0e4b9c7ee2ff3992c53257be85dec2bdc93074594c8b92d19d4d71"
-        expected_bin_sha="87be1d6db6d28896b13cb868c02d217c817fec1a820baf999a2f76f1564a32a7"
+    1.14.5:linux-amd64)
+        expected_sha="ca57e405be6b7dc79a0efa91823a0cc4d81138cbe4a9aacbfd749c65e6fca3b2"
+        expected_bin_sha="c90cb751197910feabc43026491e451b8ed1800ef7d493d1e31cd32a0b6a4383"
         ;;
     *) die "нет доверенного SHA256 для sing-box $SINGBOX_VERSION/$arch" ;;
 esac
@@ -126,16 +168,12 @@ if [ "$cur" != "$SINGBOX_VERSION" ] || [ "$installed_sha" != "$expected_bin_sha"
     cand_ver="$("$candidate" version 2>/dev/null | awk '/version/{print $NF; exit}')"
     [ "$cand_ver" = "$SINGBOX_VERSION" ] || { rm -r -- "$tmp"; die "версия кандидата sing-box неверна"; }
     install -m 0755 "$candidate" /usr/local/bin/sing-box.new || { rm -r -- "$tmp"; die "stage sing-box"; }
-    [ ! -x /usr/local/bin/sing-box ] || cp -a /usr/local/bin/sing-box /usr/local/bin/sing-box.previous
-    mv /usr/local/bin/sing-box.new /usr/local/bin/sing-box || {
-        [ ! -x /usr/local/bin/sing-box.previous ] || mv /usr/local/bin/sing-box.previous /usr/local/bin/sing-box
-        rm -r -- "$tmp"; die "activate sing-box";
-    }
+    candidate_bin=/usr/local/bin/sing-box.new
     rm -r -- "$tmp"
 fi
-got="$(/usr/local/bin/sing-box version 2>/dev/null | awk '/version/{print $NF; exit}')"
+got="$("$candidate_bin" version 2>/dev/null | awk '/version/{print $NF; exit}')"
 [ "$got" = "$SINGBOX_VERSION" ] || die "sing-box версия '$got' != '$SINGBOX_VERSION'"
-got_sha="$(sha256sum /usr/local/bin/sing-box | awk '{print $1}')"
+got_sha="$(sha256sum "$candidate_bin" | awk '{print $1}')"
 [ "$got_sha" = "$expected_bin_sha" ] || die "sing-box установленный бинарник не прошёл SHA256"
 log "  sing-box $got OK"
 
@@ -238,57 +276,60 @@ EOF
 # ── 5. sing-box config из шаблона с подстановкой upstream ────────────────
 log "5/12 sing-box config"
 mkdir -p /etc/sing-box
-python3 - "$TPL/sing-box.config.json" /etc/sing-box/config.json.candidate /etc/sing-box/config.json <<'PY' || die "сборка sing-box config"
+# bootstrap carries the same module beside install.sh; the canonical developer
+# layout keeps its single source in panel/.
+PYTHONPATH="$HERE:$HERE/../panel:$HERE/../agent" python3 - "$TPL/sing-box.config.json" /etc/sing-box/config.json.candidate /etc/sing-box/config.json <<'PY' || die "сборка sing-box config"
 import json, os, sys
-src, dst, live_path = sys.argv[1], sys.argv[2], sys.argv[3]
-with open(src, encoding="utf-8") as f:
-    c = json.load(f)
-host = os.environ["UP_HOST"]; user = os.environ["UP_USER"]; pw = os.environ["UP_PASS"]
-socks = int(os.environ["UP_SOCKS"] or 0); http = int(os.environ["UP_HTTP"] or 0)
-
-# ИСПРАВЛЕНО 2026-08-15: сохраняем ЖИВОЙ исходящий канал при повторной установке.
-# Раньше конфиг всегда пересобирался по params.sh, и переустановка откатывала канал,
-# выбранный панелью/автоматикой, на дефолт из профиля: узел «обновили» — и выход
-# внезапно поехал через старый адрес. Явно заданный канал (UP_FORCE=1) имеет приоритет.
-#
-# УТОЧНЕНО 15.08 (снос №4): переносим ЖИВЫЕ outbounds и route ЦЕЛИКОМ, а не только адрес/порты.
-# Раньше типы outbound'ов брались из шаблона (socks-out=socks, http-tg=http), а порты — из
-# живого конфига. Если агент перевёл канал в HTTP-режим (RETUNE §7.3: оба outbound'а http +
-# правило reject UDP443), переустановка ставила тип socks на http-порт — канал ломался
-# ровно на «обновлении». Теперь секции, которыми владеет агент (outbounds, route), не
-# пересобираются: из шаблона идут только inbounds/dns/log; результат проверяет sing-box check.
+from singbox_config import migrate
+src, dst, live_path = sys.argv[1:]
+with open(src, encoding="utf-8") as source:
+    config = json.load(source)
 kept = False
-if os.environ.get("UP_FORCE") != "1" and os.path.isfile(live_path):
-    try:
-        with open(live_path, encoding="utf-8") as f:
-            live = json.load(f)
-        cur = {o.get("tag"): o for o in live.get("outbounds", [])}
-        so = cur.get("socks-out") or {}
-        if so.get("server") and isinstance(live.get("route"), dict):
-            c["outbounds"] = live["outbounds"]
-            c["route"] = live["route"]
-            kept = True
-            print("[install]   сохраняю текущий исходящий канал %s (переустановка его не меняет; "
-                  "outbounds/route — из живого конфига)" % so["server"])
-    except (ValueError, OSError, TypeError):
-        pass          # битый конфиг — соберём заново из параметров
-
+if os.environ.get("UP_FORCE") != "1" and os.path.exists(live_path):
+    with open(live_path, encoding="utf-8") as source:
+        live = json.load(source)
+    upstream = next((out for out in live.get("outbounds", [])
+                     if out.get("tag") == "socks-out"), {})
+    if upstream.get("server") and isinstance(live.get("route"), dict):
+        config = live
+        kept = True
+        print("[install]   сохраняю текущий канал и правила; обновляю формат ядра")
 if not kept:
-    for o in c.get("outbounds", []):
-        if o.get("tag") == "socks-out":
-            o.update(server=host, server_port=socks, username=user, password=pw)
-        elif o.get("tag") == "http-tg":
-            o.update(server=host, server_port=http, username=user, password=pw)
-with open(dst, "w", encoding="utf-8") as f:
-    json.dump(c, f, ensure_ascii=False, indent=2)
+    for outbound in config.get("outbounds", []):
+        if outbound.get("tag") in ("socks-out", "http-tg"):
+            port = "UP_SOCKS" if outbound["tag"] == "socks-out" else "UP_HTTP"
+            outbound.update(server=os.environ["UP_HOST"],
+                            server_port=int(os.environ[port] or 0),
+                            username=os.environ["UP_USER"], password=os.environ["UP_PASS"])
+candidate = migrate(config)
+fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as target:
+    json.dump(candidate, target, ensure_ascii=False, indent=2)
+    target.flush()
+    os.fsync(target.fileno())
 PY
-/usr/local/bin/sing-box check -c /etc/sing-box/config.json.candidate || {
-    rm -f /etc/sing-box/config.json.candidate
-    die "sing-box check не прошёл"
-}
-[ ! -f /etc/sing-box/config.json ] || cp -a /etc/sing-box/config.json /etc/sing-box/config.json.previous
-chmod 600 /etc/sing-box/config.json.candidate
-mv /etc/sing-box/config.json.candidate /etc/sing-box/config.json || die "не активировать sing-box config"
+"$candidate_bin" check -c /etc/sing-box/config.json.candidate || die "sing-box check не прошёл"
+core_backup="$(mktemp -d /etc/sing-box/.core-before.XXXXXXXX)" || die "backup ядра"
+if [ -f /usr/local/bin/sing-box ]; then
+    cp -p /usr/local/bin/sing-box "$core_backup/sing-box" || die "backup binary"
+    core_had_binary=1
+fi
+if [ -f /etc/sing-box/config.json ]; then
+    cp -p /etc/sing-box/config.json "$core_backup/config.json" || die "backup config"
+    core_had_config=1
+fi
+if [ -f /usr/local/bin/vpn-boot-setup.sh ]; then
+    cp -p /usr/local/bin/vpn-boot-setup.sh "$core_backup/boot.sh" || die "backup boot"
+    core_had_boot=1
+fi
+systemctl is-active --quiet sing-box && core_was_active=1
+core_activated=1
+# Stop automatic restarts while changing the executable/config pair.
+systemctl stop sing-box || { [ "$core_had_binary" = "0" ] || die "stop sing-box"; }
+if [ "$candidate_bin" != /usr/local/bin/sing-box ]; then
+    mv "$candidate_bin" /usr/local/bin/sing-box || die "activate sing-box"
+fi
+mv /etc/sing-box/config.json.candidate /etc/sing-box/config.json || die "activate config"
 # Действующий upstream (сохранённый живой или из params.sh; в публичной сборке при первой
 # установке — ПУСТО: канал появится после мастера). Именно он идёт в boot-скрипт и verify.
 UP_HOST_EFF="$(python3 -c 'import json,sys
@@ -511,7 +552,9 @@ else
     systemctl start wg-quick@wg0 || die "wg-quick@wg0 не поднялся"
 fi
 systemctl restart microsocks || true
-systemctl restart sing-box; sleep 3
+systemctl restart sing-box || die "sing-box не поднялся"
+sleep 3
+systemctl is-active --quiet sing-box || die "sing-box завершился после запуска"
 if ! bash /usr/local/bin/vpn-boot-setup.sh; then
     die "vpn-boot-setup.sh не применил обязательные firewall/route правила"
 fi

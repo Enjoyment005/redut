@@ -33,6 +33,7 @@ class TestCleanInstallAndReinstall(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.installer = load_installer()
+        self.installer.require_core = lambda: None
         self.installer.OPT = os.path.join(self.tmp.name, "opt", "vpn-panel")
         self.installer.ETC = os.path.join(self.tmp.name, "etc", "vpn-panel")
         self.installer.VAR = os.path.join(self.tmp.name, "var", "lib", "vpn-panel")

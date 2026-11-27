@@ -25,7 +25,7 @@ PROFILES = {
         "subnet": "10.8.0.0/24",          # клиентская сеть wg0
         "wg_ip": "10.8.0.1",              # адрес сервера в wg0
         "wg_port": 51820,
-        "singbox_version": "1.11.7",      # статический бинарь с GitHub SagerNet/sing-box
+        "singbox_version": "1.14.5",      # статический бинарь с GitHub SagerNet/sing-box
         "upstream": {                      # апстрим-прокси (зарубежный трафик уходит сюда)
             # Исходящий канал. Пусто -> узел выпускает трафик сам, своим адресом.
             "host": "", "socks": 0, "http": 0, "user": "", "pass": "",

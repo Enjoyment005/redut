@@ -7,7 +7,7 @@
 Оркестратор с dev-машины (paramiko, как panel/deploy.py). Делает:
   1. SSH root+пароль, автоопределение gw/wan/внешнего IP (ip route show default);
   2. заливка templates/ + install.sh + params.sh в /opt/vpn-install/;
-  3. запуск install.sh (идемпотентная база: пакеты, sing-box 1.11.7, wg, sing-box
+  3. запуск install.sh (идемпотентная база: пакеты, sing-box 1.14.5, wg, sing-box
      config, self-heal, vpn-boot-setup с §11 RETURN, microsocks, iptables, кроны);
   4. забор клиентских .conf в vpn/install/clients/<name>/;
   5. панель/агент — через panel/deploy.py <name> --with-panel (переиспользуем, не дублируем);
@@ -227,6 +227,10 @@ def upload(c, p, net):
     sftp_put_text(sftp, os.path.join(HERE, "install.sh"), "%s/install.sh" % REMOTE, 0o755)
     sftp_put_text(sftp, os.path.join(HERE, "base_manifest.py"),
                   "%s/base_manifest.py" % REMOTE, 0o644)
+    migration = os.path.join(HERE, "singbox_config.py")
+    if not os.path.isfile(migration):
+        migration = os.path.join(REPO, "panel", "singbox_config.py")
+    sftp_put_text(sftp, migration, "%s/singbox_config.py" % REMOTE, 0o644)
     params_path = "%s/params.sh" % REMOTE
     params_stage = "%s/.params.sh.bootstrap-%s" % (REMOTE, secrets.token_hex(16))
     try:

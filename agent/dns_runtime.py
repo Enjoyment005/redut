@@ -196,8 +196,7 @@ def build_gateway_config(cfg, slot, main_config=None):
     if str(slot.get("sni") or "").strip() != endpoint_host:
         raise DNSRuntimeError("resolver TLS identity must equal the literal endpoint IP")
     via = "rescue-direct"
-    outbounds = [{"type": "direct", "tag": "rescue-direct"},
-                 {"type": "dns", "tag": "rescue-dns"}]
+    outbounds = [{"type": "direct", "tag": "rescue-direct"}]
     if slot.get("transport") == "proxy":
         proxy = _proxy_outbound(main_config or {})
         outbounds.insert(1, proxy)
@@ -206,15 +205,15 @@ def build_gateway_config(cfg, slot, main_config=None):
         raise DNSRuntimeError("invalid rescue transport")
     return {
         "log": {"level": "warn", "timestamp": True},
-        "dns": {"servers": [{"tag": "rescue-upstream", "address": endpoint,
-                              "detour": via}],
-                "final": "rescue-upstream", "strategy": "ipv4_only",
-                "independent_cache": True},
+        "dns": {"servers": [{"type": "https", "tag": "rescue-upstream",
+                              "server": endpoint_host, "server_port": 443,
+                              "path": urlparse(endpoint).path, "detour": via}],
+                "final": "rescue-upstream", "strategy": "ipv4_only"},
         "inbounds": [{"type": "direct", "tag": "rescue-in", "listen": listen,
-                      "listen_port": int(dns_cfg["listen_port"]), "sniff": True}],
+                      "listen_port": int(dns_cfg["listen_port"])}],
         "outbounds": outbounds,
-        "route": {"rules": [{"inbound": ["rescue-in"], "protocol": "dns",
-                              "outbound": "rescue-dns"}], "final": via},
+        "route": {"rules": [{"inbound": ["rescue-in"], "action": "hijack-dns"}],
+                  "final": via},
     }
 
 

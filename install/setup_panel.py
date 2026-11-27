@@ -32,6 +32,8 @@ except ImportError:  # imported by Windows-only installer tests; execution is Li
     fcntl = None
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from base_manifest import CORE_BINARY_SHA256
 
 OPT = "/opt/vpn-panel"
 ETC = "/etc/vpn-panel"
@@ -41,7 +43,7 @@ BOOTSTRAP_TTL = 24 * 3600
 
 # update.py — ПЕРВЫМ: agent.py его импортирует, и на живом узле между копиями
 # файлов есть окно, где тик крона (pool-refresh/heartbeat) поймал бы ImportError.
-AGENT_FILES = ["update.py", "config_store.py", "config_schema.py", "health.py", "learning.py",
+AGENT_FILES = ["singbox_config.py", "update.py", "config_store.py", "config_schema.py", "health.py", "learning.py",
                "metrics.py", "replay.py",
                "dns_probe.py", "dns_evidence.py", "dns_runtime.py", "dns_rescue.py",
                "providers/base.py", "providers/proxywing.py", "proxywing_autopay.py",
@@ -402,6 +404,19 @@ def install_crons():
         print("  ⚠️ кроны не установлены: %s" % (p.stderr or "").strip())
 
 
+def require_core(path="/usr/local/bin/sing-box"):
+    """Do not deploy a DNS generator incompatible with the installed core."""
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as binary:
+            for chunk in iter(lambda: binary.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        sys.exit("ядро sing-box недоступно; сначала выполни полный UPDATE=1 setup.sh")
+    if digest.hexdigest() != CORE_BINARY_SHA256:
+        sys.exit("ядро sing-box несовместимо; сначала выполни полный UPDATE=1 setup.sh")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -438,6 +453,7 @@ def main():
         except BlockingIOError:
             sys.exit("vpn-agent занят; установка панели отложена")
     with_panel = not a.no_panel
+    require_core()
 
     # Agent-only upgrade must not revive a running pre-lock panel.  Refuse
     # before touching installation paths; rerun with the panel payload so both

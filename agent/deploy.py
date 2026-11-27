@@ -147,7 +147,7 @@ MONEY_CONFIG = {
 OPT = "/opt/vpn-panel"
 # update.py — ПЕРВЫМ: agent.py его импортирует, и на живом узле между заливкой
 # файлов есть окно, где тик крона (pool-refresh/heartbeat) поймал бы ImportError.
-AGENT_FILES = ["update.py", "config_store.py", "config_schema.py", "health.py", "learning.py",
+AGENT_FILES = ["singbox_config.py", "update.py", "config_store.py", "config_schema.py", "health.py", "learning.py",
                "metrics.py", "replay.py",
                "dns_probe.py", "dns_evidence.py", "dns_runtime.py", "dns_rescue.py",
                "providers/base.py", "providers/proxywing.py", "proxywing_autopay.py",
@@ -497,7 +497,7 @@ def require_remote_base_contract(c):
     rc, output = run_result(c, remote_check_command(), t=30)
     if rc != 0 or output.strip().splitlines()[-1:] != ["REDUT_BASE_CONTRACT_OK"]:
         raise SystemExit(
-            "базовые watchdog/post/boot/cleanup несовместимы; "
+            "ядро sing-box или базовые watchdog/post/boot/cleanup несовместимы; "
             "сначала выполни полный UPDATE=1 setup.sh")
     return True
 
