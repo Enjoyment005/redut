@@ -256,7 +256,7 @@ class TestVerifyWhyKind(unittest.TestCase):
         try:
             apply_mod.run_cmd = fake_run
             probe.geo_country = lambda ip: geo_first
-            probe.geo_country_consensus = lambda ip: geo_consensus
+            probe.geo_country_consensus = lambda ip, **kwargs: geo_consensus
             return apply_mod.verify_egress()
         finally:
             apply_mod.run_cmd, probe.geo_country, probe.geo_country_consensus = orig

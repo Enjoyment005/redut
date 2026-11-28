@@ -68,10 +68,14 @@ from urllib.parse import urlparse, parse_qs, unquote
 PANEL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PANEL_DIR)
 
+import atomicmail
 import alerts as alerts_mod        # noqa: E402
 import apply as apply_mod          # noqa: E402
 import config_store                # noqa: E402
+import contours
+from webpanel import contour_ui
 import config_schema               # noqa: E402
+import dns_policy
 import dns_rescue as dns_rescue_mod  # noqa: E402
 import country as country_mod      # noqa: E402
 import health as health_mod        # noqa: E402
@@ -138,7 +142,7 @@ def pool_view_order(rows, cfg, cur=None):
     rating is None) — в конец, стабильно по uid."""
     ranked = states_mod.rank_candidates(rows, cfg)
     order = {r["uid"]: i for i, r in enumerate(ranked)}
-    return sorted(rows, key=lambda r: (not (cur and r["host"] == cur),
+    return sorted(rows, key=lambda r: (not (cur and apply_mod.matches_current(r, cur, APP.cfg)),
                                        r["uid"] not in order,
                                        order.get(r["uid"], 0), str(r["uid"])))
 
@@ -199,6 +203,10 @@ def load_secrets():
             with open(cand, encoding="utf-8") as f:
                 return json.load(f), cand
     return {}, None
+
+
+def _domain_agent():
+    return ["/usr/local/bin/vpn-agent"] + (["--contour", "2"] if contours.secondary(APP.cfg) else [])
 
 
 def _agent_cmd():
@@ -310,7 +318,7 @@ def _switch_provider_kick(name):
             name="key-switch", daemon=True).start()
         return True, ""
     rc, out = apply_mod.run_cmd(["systemd-run", "--collect", "-p", "RuntimeMaxSec=900",
-                                 "--unit", "redut-switch", "/usr/local/bin/vpn-agent",
+                                 "--unit", "redut-switch" + ("-c2" if contours.secondary(APP.cfg) else ""), *_domain_agent(),
                                  "switch-provider", "--from", name, "--reason", "key-removed"])
     if rc == 0 or "already" in (out or "").lower():
         return True, ""
@@ -335,7 +343,7 @@ def _strategy_switch_kick(uid):
     unit = "redut-strategy-%x" % time.time_ns()
     rc, out = apply_mod.run_cmd(["systemd-run", "--collect", "-p", "RuntimeMaxSec=900",
                                  "--unit", unit,
-                                 "/usr/local/bin/vpn-agent", "strategy-apply",
+                                 *_domain_agent(), "strategy-apply",
                                  "--wait-lock", "840"])
     if rc == 0:
         return True, ""
@@ -434,6 +442,33 @@ def _make_mask(secrets):
     return mask
 
 
+def channel_summary(row):
+    """Public identity of a selected channel, without connection credentials."""
+    if row is None:
+        return None
+    return {"uid": row["uid"], "provider": row["provider"], "host": row["host"],
+            "country": row.get("country"),
+            "label": row.get("descr") if row.get("protocol") == "vless" else ""}
+
+
+def selected_channel(rows, sb):
+    """Resolve catalog identity from the actual connection, never just its IP."""
+    actual = next((ob for ob in sb.get("outbounds", []) if ob.get("tag") == "socks-out"), {})
+    matches = []
+    for row in rows:
+        if row.get("protocol") == "vless":
+            matched = apply_mod.matches_current(row, actual.get("server"), sb=sb)
+        else:
+            port = {"socks": "port_socks5", "http": "port_http"}.get(actual.get("type"))
+            matched = bool(port and row.get("host") == actual.get("server")
+                           and row.get(port) == actual.get("server_port")
+                           and (row.get("user") or "") == (actual.get("username") or "")
+                           and (row.get("password") or "") == (actual.get("password") or ""))
+        if matched:
+            matches.append(row)
+    return channel_summary(matches[0]) if len(matches) == 1 else None
+
+
 class _LockedPoolView:
     """Saga-view общего Pool: каждый DB-вызов соблюдает HTTP `_DB_LOCK`."""
     def __init__(self, pool):
@@ -453,10 +488,12 @@ class _LockedPoolView:
 class App:
     """Разделяемое состояние: конфиг, соединение с БД, пул, провайдеры, admin."""
 
-    def __init__(self):
-        self.cfg = load_config()
+    def __init__(self, cfg=None, primary=None):
+        self.primary = primary
+        self.db_lock = _DB_LOCK
+        self.cfg = cfg if cfg is not None else load_config()
         self.pool = pool_mod.Pool(self.cfg["db"], server=self.cfg.get("server") or "panel")
-        if os.name == "posix" and self.pool.unfinished_operations():
+        if primary is None and os.name == "posix" and self.pool.unfinished_operations():
             try:
                 apply_mod.recover_unfinished_operations(
                     self.cfg, self.pool, log=lambda m: None,
@@ -466,7 +503,7 @@ class App:
                 self.pool.log_event("operation-recovery", actor="auto",
                                     result="deferred", detail=str(e))
         self.saga_pool = _LockedPoolView(self.pool)
-        self.store = auth.AuthStore(self.pool.conn)
+        self.store = primary.store if primary is not None else auth.AuthStore(self.pool.conn)
         # мастер первого входа (чистая установка): пока нет admin — режим онбординга.
         self.setup = {}                       # незаписанные шаги мастера (в памяти)
         self.setup_claim_token = None
@@ -485,15 +522,17 @@ class App:
             self.admin_epoch = self.store.credential_epoch()
         self.admin = self.secrets.get("admin")
         self.provisioned = bool(self.admin)   # admin есть -> панель настроена
-        self.providers = make_providers(self.secrets)
+        self.providers = contours.allowed_providers(self.cfg, make_providers(self.secrets), self.secrets)
         self.pool.observe_provider_errors(self.providers, actor="panel")
         try:
-            money_mod.reconcile_pending_spend(self.pool, self.providers, actor="recovery")
+            if not contours.secondary(self.cfg):
+                money_mod.reconcile_pending_spend(self.pool, self.providers, actor="recovery")
         except money_mod.SpendDenied as error:
             self.pool.log_event("spend-recovery", actor="auto",
                                 result="deferred", detail=str(error))
         self.alerter = alerts_mod.make_alerter(self.secrets, self.cfg,
-                                               log=lambda m: None, mask=_make_mask(self.secrets))
+                                               log=lambda m: None, mask=_make_mask(self.secrets),
+                                               secrets_path=self.secrets_path)
 
     def reload_secrets(self):
         """Перечитать secrets.json на лету (после мастера/смены ключей) — без рестарта."""
@@ -601,7 +640,7 @@ class App:
         cb = (lambda: prov.check(row["ext_id"])) if prov and prov.caps.get("check") else None
         # сеть (curl) — вне лока (долго); запись в БД — под общим локом
         res = probe_mod.probe(row, provider_check=cb)
-        is_cur = row["host"] == self.current_host()
+        is_cur = apply_mod.matches_current(row, self.current_host(), self.cfg)
         res["score"] = probe_mod.score(row, res, is_current=is_cur, cfg=self.cfg)
         classification = health_mod.classify_probe_result(res, cfg=self.cfg)
         res["persistence_outcome"] = classification["outcome"]
@@ -798,7 +837,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, "ok", "text/plain; charset=utf-8")
         if not APP.provisioned:                     # чистая установка -> мастер первого входа
             if path == "/setup":
-                return self._send(200, views.setup_page())
+                return self._send(200, views.setup_page(APP.cfg.get("mail_transport", "smtp")))
             return self._redirect("/setup")
         if path == "/setup":
             return self._redirect("/login")         # уже настроено — мастер закрыт
@@ -816,19 +855,28 @@ class Handler(BaseHTTPRequestHandler):
             return self._api_get(path, parse_qs(u.query))
         self._send(404, "not found", "text/plain; charset=utf-8")
 
+    @contour_ui.scope_handler
     def _api_get(self, path, qs):
+        if path == "/api/contours":
+            return contour_ui.api_get(self, path, APP)
         if path == "/api/provider-auto-renew":
             return self._json(200, Handler._provider_auto_renew_status(self))
         if path == "/api/status":
             return self._json(200, self._status())
         if path == "/api/config/diagnostics":
             return self._json(200, config_schema.diagnostics(APP.cfg))
+        if path == "/api/dns-policy":
+            with _DB_LOCK:
+                return self._json(200, dns_policy.status(APP.cfg, APP.pool))
         if path == "/api/dns-rescue":
             with _DB_LOCK:
                 return self._json(200, dns_rescue_mod.status(APP.cfg, APP.pool))
         if path == "/api/pool":
             with _DB_LOCK:
                 rows = APP.pool.list(include_gone=True)
+            allowed = contours.allowed_providers(
+                APP.cfg, {r["provider"]: True for r in rows}, APP.secrets)
+            rows = [r for r in rows if r["provider"] in allowed]
             cur = APP.current_host()
             # П3: боевой первым, дальше порядок перебора ротации при текущей стратегии
             # (чек-лист приёмки: «порядок совпадает с превью „выбрало бы“»)
@@ -922,7 +970,10 @@ class Handler(BaseHTTPRequestHandler):
                                                        "currency", "balance_after"), r)) for r in rows]})
         if path == "/api/clients":
             try:
-                return self._json(200, clients_mod.client_inventory(APP.cfg))
+                primary = contour_ui.main_app(APP)
+                inventory = clients_mod.client_inventory(primary.cfg, contour=contours.CURRENT.get())
+                inventory["contours"] = contours.public(primary.cfg)["contours"]
+                return self._json(200, inventory)
             except clients_mod.ClientError as e:
                 return self._json(500, {"error": str(e)})
         if path == "/api/key/status":
@@ -937,7 +988,8 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "clients"]:
             name = unquote(parts[2])
             try:
-                conf = clients_mod.client_conf_text(name)
+                conf = clients_mod.client_conf_text(
+                    name, cfg=contour_ui.main_app(APP).cfg, contour=contours.CURRENT.get())
             except clients_mod.ClientError as e:
                 return self._json(404, {"error": str(e)})
             if parts[3] == "config":
@@ -1106,7 +1158,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(409, {'error': str(error),
                 'replace_request': bool(getattr(error, 'replace_request', False) or not bound)})
 
+    @contour_ui.scope_handler
     def _api_post(self, path):
+        if path in ("/api/contours", "/api/contours/assign", "/api/contours/delete"):
+            return contour_ui.api_post(self, path, Handler._json_object_body(self), APP)
+        if contours.CURRENT.get() == "2" and (path.startswith("/api/update/") or path in (
+                "/api/buy", "/api/provider-auto-renew", "/api/dns-rescue")):
+            return self._json(409, {"error": "Настройка относится к основному контуру или всему узлу"})
         if path == "/api/provider-auto-renew":
             body = Handler._json_object_body(self)
             if not isinstance(body.get("enabled"), bool):
@@ -1176,10 +1234,10 @@ class Handler(BaseHTTPRequestHandler):
                 # active по ключам на диске (🔴 C2): осиротевшие провайдеры удаляются
                 # из пула (П7-2), кроме строки боевого канала — её держим до переключения
                 summary = APP.pool.refresh(APP.providers, actor="user",
-                                           active=provider_keys(APP.secrets),
+                                           active=provider_keys(contours.scoped_secrets(APP.cfg, APP.secrets)),
                                            keep_hosts={cur} if cur else None)
                 for name, prov in APP.providers.items():
-                    if name in summary["errors"]:
+                    if name in summary["errors"] or not prov.caps.get("balance"):
                         continue
                     try:
                         money_mod.store_balance(APP.pool, name, prov.balance())
@@ -1193,7 +1251,7 @@ class Handler(BaseHTTPRequestHandler):
                     APP.pool, APP.alerter)["notified"]
             return self._json(200, summary)
         if path == "/api/egress":
-            v = apply_mod.verify_egress()
+            v = apply_mod.verify_for(APP.cfg)
             with _DB_LOCK:
                 APP.pool.set_egress(v)      # чтобы дашборд знал состояние и после перезагрузки
             return self._json(200, {"egress": v["egress_ip"], "egress_cc": v["exit_cc"],
@@ -1205,7 +1263,7 @@ class Handler(BaseHTTPRequestHandler):
             post_error = None
             with _DB_LOCK:
                 row = next((x for x in APP.pool.list(include_gone=True)
-                            if x["host"] == r["good_ip"]), None) if r.get("ok") else None
+                            if apply_mod.matches_current(x, r["good_ip"], APP.cfg)), None) if r.get("ok") else None
                 if r.get("ok"):
                     post = states_mod.finish_explicit_apply(
                         APP.cfg, APP.pool, (row or {}).get("uid") or ("live:%s" % r["good_ip"]),
@@ -1242,8 +1300,8 @@ class Handler(BaseHTTPRequestHandler):
             # = «ротация уже идёт» (бесплатный дедуп повторных кликов); в argv юнита —
             # только константы, никаких данных из тела запроса. UI поллит /api/status.
             rc, out = apply_mod.run_cmd(["systemd-run", "--collect", "-p", "RuntimeMaxSec=900",
-                                         "--unit", "redut-rotate",
-                                         "/usr/local/bin/vpn-agent", "rotate", "--reason", "panel"])
+                                         "--unit", "redut-rotate" + ("-c2" if contours.secondary(APP.cfg) else ""),
+                                         *_domain_agent(), "rotate", "--reason", "panel"])
             busy = rc != 0 and "already" in (out or "").lower()
             with _DB_LOCK:
                 APP.pool.log_event("panel-rotate", actor="user",
@@ -1276,6 +1334,23 @@ class Handler(BaseHTTPRequestHandler):
                 APP.pool.log_event("panel-emergency", actor="user",
                                    result="on" if on else "off", src_ip=self._client_ip())
             return self._json(200, {"ok": rc == 0, "state": st, "on": on, "output": (out or "")[-600:]})
+        if path == "/api/dns-policy":
+            body = Handler._json_object_body(self)
+            if body.get("mode") not in dns_policy.MODES:
+                return self._json(400, {"error": "Неизвестный режим DNS"})
+            if body["mode"] == "provider_strict" and not contours.secondary(APP.cfg):
+                return self._json(400, {"error": "Строгий режим доступен только во 2 контуре"})
+            rc, output = _run_agent(["dns-policy", "set", "--mode", body["mode"]], timeout=240)
+            with _DB_LOCK:
+                public = dns_policy.status(APP.cfg, APP.pool)
+            public["ok"] = rc == 0 and public["mode"] == body["mode"] and not public["pending"]
+            if not public["ok"]:
+                try:
+                    message = json.loads(output).get("error")
+                except (ValueError, AttributeError):
+                    message = None
+                public["error"] = message or "DNS не применён; предыдущий режим восстанавливается"
+            return self._json(200 if public["ok"] else 409, public)
         if path == "/api/dns-rescue":
             body = Handler._json_object_body(self)
             action = body.get("action")
@@ -1311,6 +1386,9 @@ class Handler(BaseHTTPRequestHandler):
             uid, action = unquote(parts[2]), parts[3]
             with _DB_LOCK:
                 row = APP.pool.get(uid)
+            if row and row["provider"] not in contours.allowed_providers(
+                    APP.cfg, {row["provider"]: True}, APP.secrets):
+                return self._json(404, {"error": "uid не найден в этом контуре"})
             if action == "prolong":
                 return self._do_prolong(
                     row, uid, Handler._json_object_body(self))
@@ -1335,9 +1413,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/clients":
             body = Handler._json_object_body(self)
             try:
+                primary = contour_ui.main_app(APP)
                 r = clients_mod.add_client(
-                    APP.cfg, (body.get("name") or "").strip(),
-                    dns_pool=APP.saga_pool)
+                    primary.cfg, (body.get("name") or "").strip(),
+                    dns_pool=primary.saga_pool, contour=contours.CURRENT.get())
             except clients_mod.ClientError as e:
                 return self._json(400, {"error": str(e)})
             with _DB_LOCK:
@@ -1348,9 +1427,10 @@ class Handler(BaseHTTPRequestHandler):
             name = unquote(parts[2])
             body = Handler._json_object_body(self)
             try:
+                primary = contour_ui.main_app(APP)
                 r = clients_mod.delete_client(
-                    APP.cfg, name, pubkey=body.get("pubkey"),
-                    dns_pool=APP.saga_pool)
+                    primary.cfg, name, pubkey=body.get("pubkey"),
+                    dns_pool=primary.saga_pool, contour=contours.CURRENT.get())
             except clients_mod.ClientError as e:
                 return self._json(400, {"error": str(e)})
             with _DB_LOCK:
@@ -1444,6 +1524,7 @@ class Handler(BaseHTTPRequestHandler):
             rows = APP.pool.rotation_candidates()
             selection = states_mod.selection_state(APP.pool, APP.cfg, cur_host)
             revision = states_mod.selection_revision_state(APP.pool, APP.cfg)
+            attempt = states_mod.selection_attempt_state(APP.pool, revision)
         rows = [r for r in rows if r["provider"] in APP.providers]   # только активные (П7)
         pool_cc = []
         for r in rows:
@@ -1463,7 +1544,7 @@ class Handler(BaseHTTPRequestHandler):
                 buy = list(dict.fromkeys(c for values in buy_by_provider.values() for c in values))
             pick = self._brief(top[0]) if top else None
             if pick is not None:
-                pick["is_current"] = bool(cur_host and pick["host"] == cur_host)
+                pick["is_current"] = bool(cur_host and apply_mod.matches_current(pick, cur_host, APP.cfg))
             # авто-гейт покупки над странами ИМЕЮЩЕГОСЯ пула: наглядно, чем стратегии
             # отличаются друг от друга на живых данных (а не только за кромкой топ-8)
             pool_pass = [c for c in pool_cc if country_mod.auto_allowed(c, True, cfg)]
@@ -1484,7 +1565,7 @@ class Handler(BaseHTTPRequestHandler):
                 "fallback_strategy": states_mod.MANUAL_FALLBACK_STRATEGY,
                 "strategies": out,
                 "blacklist": sorted(country_mod.blacklist(APP.cfg)),
-                "pool_size": len(rows), "revision": revision}
+                "pool_size": len(rows), "revision": revision, "attempt": attempt}
 
     @staticmethod
     def _brief(row):
@@ -1612,14 +1693,14 @@ class Handler(BaseHTTPRequestHandler):
                     and age < probe_mod.INTEL_TTL_S
                     and (data["intel"] or {}).get("v") == probe_mod.INTEL_VERSION):
                 return {"ok": True, "ip": ip, "cached_at": data.get("at"),
-                        "intel": data["intel"]}
+                        "intel": probe_mod.refresh_ip_intel(ip, data["intel"])}
         # пинг до боевого прокси — из последнего замера пула (ничего не меряем)
         ping = None
         cur = APP.current_host()
         if cur:
             with _DB_LOCK:
                 for r in APP.pool.list(include_gone=True):
-                    if r["host"] == cur and _has(r, "latency_ms"):
+                    if apply_mod.matches_current(r, cur, APP.cfg) and _has(r, "latency_ms"):
                         ping = r["latency_ms"]
                         break
         # риск-источники по ключам (не обязательны): secrets.json -> "ipintel"
@@ -1646,9 +1727,12 @@ class Handler(BaseHTTPRequestHandler):
                         APP.pool.conn.execute("SELECT key,value FROM setting WHERE key LIKE 'balance:%'")}
         out = []
         for name in PROVIDER_CLASSES:
-            key = ((APP.secrets or {}).get(name) or {}).get("api_key")
+            if contours.secondary(APP.cfg) and name != "zenxnet":
+                continue
+            key = (contours.scoped_secrets(APP.cfg, APP.secrets).get(name) or {}).get("api_key")
             # без ключа не показываем ни «живых», ни баланс — панель их не видит (П7)
-            out.append({"provider": name, "set": bool(key), "masked": mask_key(key),
+            out.append({"provider": name, "set": bool(key), "masked": ("••••••••" if name == "zenxnet" and key else mask_key(key)),
+                        "subscription": json.loads(APP.pool.get_setting("subscription:zenxnet") or "{}") if name == "zenxnet" and key else None,
                         "balance": (balances.get(name) or "") if key else "",
                         "alive": len([r for r in rows if r["provider"] == name and not r["gone"]])
                                  if key else 0})
@@ -1666,6 +1750,10 @@ class Handler(BaseHTTPRequestHandler):
         name = str(body.get("provider") or "").strip()
         if name not in PROVIDER_CLASSES:
             return self._json(400, {"error": "неизвестный провайдер"})
+        if contours.CURRENT.get() == "2" and name != "zenxnet":
+            return self._json(409, {"error": "Этот провайдер управляется в основном контуре"})
+        if name == "zenxnet" and str(body.get("key") or "").strip():
+            return self._json(200, contour_ui.save_subscription(APP, body["key"]))
         raw = body.get("key")
         if raw is None or not str(raw).strip():
             return self._do_key_delete(name)
@@ -1689,7 +1777,7 @@ class Handler(BaseHTTPRequestHandler):
         # кабинет сменился — список прокси в кэше уже не про него
         threading.Thread(target=_pool_refresh_kick, name="key-pool-refresh", daemon=True).start()
         return self._json(200, {"ok": True, "saved": True, "verified": bool(ok),
-                                "provider": name, "masked": mask_key(key),
+                                "provider": name, "masked": ("••••••••" if name == "zenxnet" and key else mask_key(key)),
                                 "balance": info.get("balance"), "currency": info.get("currency"),
                                 "error": "" if ok else info["error"]})
 
@@ -1704,10 +1792,12 @@ class Handler(BaseHTTPRequestHandler):
         # проверка «последнего ключа» и запись — под ОДНИМ локом по данным с диска
         # (ревью 1.3.0): два одновременных удаления разных провайдеров иначе оба
         # проходили проверку и оставляли панель слепой
+        if name == "zenxnet" and contours.read(contour_ui.main_app(APP).cfg)["secondary"]:
+            return self._json(409, {"error": "Подписка используется вторым контуром; сначала удалите его"})
         def remove_key(data):
             if not ((data or {}).get(name) or {}).get("api_key"):
                 raise ValueError("у %s и так нет ключа" % name)
-            if provider_keys(data) <= {name}:
+            if provider_keys(contours.scoped_secrets(APP.cfg, data)) <= {name}:
                 raise ValueError("это последний ключ: без него панель не увидит пул, "
                                  "не купит замену и не продлит боевой прокси. "
                                  "Сначала впиши рабочий ключ другого провайдера")
@@ -1763,9 +1853,13 @@ class Handler(BaseHTTPRequestHandler):
         name = str(body.get("provider") or "").strip()
         if name not in PROVIDER_CLASSES:
             return self._json(400, {"error": "неизвестный провайдер"})
+        if contours.CURRENT.get() == "2" and name != "zenxnet":
+            return self._json(409, {"error": "Этот провайдер управляется в основном контуре"})
         key = ((APP.secrets or {}).get(name) or {}).get("api_key")
         if not key:
             return self._json(400, {"error": "у %s не задан ключ" % name})
+        if name == "zenxnet":
+            return self._json(200, contour_ui.save_subscription(APP, key, check_only=True))
         ok, info = check_key(name, key)
         with _DB_LOCK:
             if ok:
@@ -2009,7 +2103,16 @@ class Handler(BaseHTTPRequestHandler):
                 APP.pool.log_event("apply", actor="user", to_uid=row["uid"], result="fail",
                                    detail="disqualified: %s" % (res["disqualified"] or "проба"),
                                    src_ip=self._client_ip())
-            return self._json(409, {"error": "кандидат дисквалифицирован: %s" % (res["disqualified"] or "проба не прошла")})
+            reason = str(res["disqualified"] or "probe-failed")
+            if "no-combo" in reason:
+                message = "Не удалось проверить интернет через выбранный сервер. Попробуйте другой сервер или повторите позже."
+            elif reason.startswith("blocked-cc"):
+                message = "Проверка обнаружила выход в запрещённой стране. Выберите другой сервер."
+            elif reason == "vless-probe-unavailable":
+                message = "Не удалось запустить проверку VLESS. Повторите проверку или выберите другой сервер."
+            else:
+                message = "Выбранный сервер не прошёл проверку. Попробуйте другой сервер."
+            return self._json(409, {"error": message + " Переключение отменено.", "reason": reason})
         r = apply_mod.apply_candidate(APP.cfg, row, res, log=lambda m: None,
                                       pool=APP.saga_pool, requested_by="user",
                                       selection_source="manual")
@@ -2042,7 +2145,8 @@ class Handler(BaseHTTPRequestHandler):
                                 "egress": r["verify"]["egress_ip"],
                                 "egress_cc": r["verify"]["exit_cc"],
                                 "selection_mode": selection["mode"],
-                                "fallback_strategy": states_mod.MANUAL_FALLBACK_STRATEGY})
+                                "fallback_strategy": states_mod.MANUAL_FALLBACK_STRATEGY,
+                                "selected": channel_summary(row)})
 
     # ------------------------------------------------ логин
     def _do_login(self):
@@ -2133,9 +2237,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self._setup_totp_verify(body)
                 if path == "/api/setup/provider":
                     return self._setup_provider(body)
-                if path == "/api/setup/smtp/test":
+                if path == "/api/setup/mail/prepare":
+                    return self._setup_mail_prepare()
+                if path in ("/api/setup/mail/test", "/api/setup/smtp/test"):
                     return self._setup_smtp_test(body)
-                if path == "/api/setup/smtp":
+                if path in ("/api/setup/mail", "/api/setup/smtp"):
                     return self._setup_smtp(body)
                 if path == "/api/setup/finish":
                     return self._setup_finish()
@@ -2248,8 +2354,85 @@ class Handler(BaseHTTPRequestHandler):
                           "need_from": True}
         return smtp, None
 
+    def _setup_mail_prepare(self):
+        """Retry optional automatic mail preparation after installer network errors."""
+        if APP.cfg.get("mail_transport", "smtp") != "atomicmail":
+            return self._json(200, {"ready": True, "transport": "smtp"})
+        path = APP.secrets_path or ETC_SECRETS
+        try:
+            state = atomicmail.status(path)
+            if not state.get("ready"):
+                state = atomicmail.ensure_ready(path)
+            return self._json(200, state)
+        except atomicmail.AtomicMailError as error:
+            return self._json(503, {"error": str(error), "ready": False})
+        except Exception:
+            return self._json(503, {"error": "Не удалось подготовить AtomicMail. Повторите позже или пропустите почту.", "ready": False})
+
+    def _setup_atomicmail_test(self, body):
+        """Send one PIN; persist only a verified recipient when onboarding finishes."""
+        import hashlib
+        import secrets as random_secrets
+        recipient = str(body.get("to") or "").strip()
+        if len(recipient) > 254 or not alerts_mod._valid_email(recipient):
+            return self._json(400, {"error": "Введите ваш e-mail, например you@example.com"})
+        now = time.time()
+        if now - APP.setup.get("mail_last_sent", 0) < 60:
+            return self._json(429, {"error": "Подождите минуту перед повторной отправкой кода."})
+        path = APP.secrets_path or ETC_SECRETS
+        try:
+            if not atomicmail.status(path).get("ready"):
+                return self._json(400, {"error": "Сначала дождитесь подготовки AtomicMail или повторите её.", "need_prepare": True})
+        except Exception:
+            return self._json(503, {"error": "Не удалось проверить готовность AtomicMail."})
+        code = "%06d" % random_secrets.randbelow(1000000)
+        APP.setup.pop("mail_to", None)
+        APP.setup.pop("smtp_done", None)
+        APP.setup["mail_last_sent"] = now
+        APP.setup["mail_pending"] = {"to": recipient, "hash": hashlib.sha256(code.encode()).hexdigest(),
+                                      "tries": 0, "at": now}
+        try:
+            atomicmail.send(path, recipient, "РЕДУТ — код подтверждения почты",
+                            "Код проверки: %s\n\nВведите его в мастере настройки РЕДУТа. "
+                            "Код действует 20 минут. Если вы не настраивали РЕДУТ, удалите письмо." % code)
+        except atomicmail.AtomicMailError as error:
+            if error.unknown:
+                return self._json(202, {"sent": False, "to": recipient,
+                    "warning": "Сервис не подтвердил отправку. Если письмо придёт, введите код; автоматической повторной отправки нет."})
+            APP.setup.pop("mail_pending", None)
+            return self._json(503, {"error": str(error)})
+        except Exception:
+            APP.setup.pop("mail_pending", None)
+            return self._json(503, {"error": "Не удалось отправить код через AtomicMail. Повторите позже."})
+        return self._json(200, {"sent": True, "to": recipient})
+
+    def _setup_atomicmail(self, body):
+        import hashlib
+        if body.get("skip"):
+            APP.setup.pop("mail_pending", None)
+            APP.setup.pop("mail_to", None)
+            APP.setup["smtp_done"] = True
+            return self._json(200, {"skipped": True})
+        pending = APP.setup.get("mail_pending")
+        if not pending or time.time() - pending["at"] > self.CODE_TTL_S or pending["tries"] >= self.CODE_TRIES:
+            APP.setup.pop("mail_pending", None)
+            return self._json(400, {"error": "Запросите новый код подтверждения.", "need_test": True})
+        if str(body.get("to") or "").strip() != pending["to"]:
+            APP.setup.pop("mail_pending", None)
+            return self._json(400, {"error": "Адрес изменился — отправьте код заново.", "need_test": True})
+        code = str(body.get("code") or "").strip()
+        if not auth.hmac.compare_digest(hashlib.sha256(code.encode()).hexdigest(), pending["hash"]):
+            pending["tries"] += 1
+            return self._json(400, {"error": "Код не совпал. Осталось попыток: %d." % (self.CODE_TRIES - pending["tries"])})
+        APP.setup["mail_to"] = pending["to"]
+        APP.setup["smtp_done"] = True
+        APP.setup.pop("mail_pending", None)
+        return self._json(200, {"ok": True})
+
     def _setup_smtp_test(self, body):
         """Отправить код на указанный ящик. Ничего не сохраняем — только запоминаем ожидание."""
+        if APP.cfg.get("mail_transport", "smtp") == "atomicmail":
+            return self._setup_atomicmail_test(body)
         import secrets as _s
         smtp, err = self._smtp_fields(body)
         if err:
@@ -2269,6 +2452,8 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(200, {"sent": True, "to": smtp["to"]})
 
     def _setup_smtp(self, body):
+        if APP.cfg.get("mail_transport", "smtp") == "atomicmail":
+            return self._setup_atomicmail(body)
         if body.get("skip"):
             APP.setup.pop("smtp", None)
             APP.setup.pop("smtp_pending", None)
@@ -2276,7 +2461,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"skipped": True})
         pend = APP.setup.get("smtp_pending")
         if not pend:
-            return self._json(400, {"error": "сначала нажмите «Проверить связь» — узел пришлёт "
+            return self._json(400, {"error": "сначала нажмите «Отправить PIN-код» — узел пришлёт "
                                              "код на этот ящик", "need_test": True})
         if time.time() - pend["at"] > self.CODE_TTL_S:
             APP.setup.pop("smtp_pending", None)
@@ -2316,16 +2501,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "2FA не подтверждена"})
         if not st.get("providers"):
             return self._json(400, {"error": "нет ключа провайдера"})
+        if APP.cfg.get("mail_transport", "smtp") == "atomicmail" and not st.get("smtp_done"):
+            return self._json(400, {"error": "Подтвердите почту кодом или явно пропустите этот шаг."})
         data = {"admin": {"pw": auth.hash_password(st["pw"]), "totp": st["totp"],
                           "recovery": st.get("recovery", [])}}
         for name, key in st["providers"].items():
             data[name] = {"api_key": key}
         if st.get("smtp"):
             data["smtp"] = st["smtp"]
+        if APP.cfg.get("mail_transport", "smtp") == "atomicmail":
+            data["mail"] = {"to": st["mail_to"]} if st.get("mail_to") else {}
         with _DB_LOCK:
             auth.write_admin_credentials_atomic(
                 APP.secrets_path or ETC_SECRETS, data, APP.store,
-                force=False, replace_all=True)
+                force=False, replace_all=True, preserve_keys=("atomicmail",))
         APP.reload_secrets()
         try:
             auth.consume_bootstrap_secret(APP.bootstrap_path)
@@ -2338,8 +2527,8 @@ class Handler(BaseHTTPRequestHandler):
                                    src_ip=self._client_ip())
         with _DB_LOCK:
             APP.pool.log_event("setup", actor="user", result="ok",
-                               detail="онбординг: провайдеры=%s smtp=%s"
-                               % (",".join(st["providers"]), bool(st.get("smtp"))),
+                               detail="онбординг: провайдеры=%s почта=%s"
+                               % (",".join(st["providers"]), bool(st.get("smtp") or st.get("mail_to"))),
                                src_ip=self._client_ip())
         APP.setup = {}
         APP.setup_claim_token = None
@@ -2376,13 +2565,13 @@ class Handler(BaseHTTPRequestHandler):
                 out["upstream"]["http_tg"] = "%s:%s %s" % (o.get("server"), o.get("server_port"), o.get("type"))
         out["rotate_busy"] = False
         if os.name == "posix":
-            rc, act = apply_mod.run_cmd(["systemctl", "is-active", "sing-box"])
+            rc, act = apply_mod.run_cmd(["systemctl", "is-active", contours.SERVICE if contours.secondary(APP.cfg) else "sing-box"])
             out["singbox"] = act or "?"
             # F6: ротация из панели идёт транзиентным юнитом — фронт поллит её ход
-            rc, ract = apply_mod.run_cmd(["systemctl", "is-active", "redut-rotate"])
+            rc, ract = apply_mod.run_cmd(["systemctl", "is-active", "redut-rotate-c2" if contours.secondary(APP.cfg) else "redut-rotate"])
             out["rotate_busy"] = (ract or "").strip() in ("active", "activating")
             # П7-2: плановое переключение с провайдера без ключа — тоже юнит
-            rc, sact = apply_mod.run_cmd(["systemctl", "is-active", "redut-switch"])
+            rc, sact = apply_mod.run_cmd(["systemctl", "is-active", "redut-switch-c2" if contours.secondary(APP.cfg) else "redut-switch"])
             out["switch_busy"] = (sact or "").strip() in ("active", "activating")
         with _DB_LOCK:
             rows = APP.pool.list(include_gone=True)
@@ -2396,7 +2585,8 @@ class Handler(BaseHTTPRequestHandler):
             for r in rows:
                 if r["gone"] or r["provider"] not in APP.providers:
                     continue
-                c = (r["exit_cc"] if _has(r, "exit_cc") and r["exit_cc"] else r["country"]) or ""
+                geo_row = probe_mod.cached_geo_row(r)
+                c = geo_row.get("exit_cc") or r["country"] or ""
                 c = c.strip().lower()
                 if c and c not in bl:
                     ccs.add(c)
@@ -2411,11 +2601,18 @@ class Handler(BaseHTTPRequestHandler):
             out["heartbeat"] = APP.pool.last_heartbeat()
             out["dns_rescue"] = dns_rescue_mod.status(APP.cfg, APP.pool)
             selection = states_mod.selection_state(APP.pool, APP.cfg, cur_host)
+            out["selected_channel"] = selected_channel(rows, sb)
+            out["selection_revision"] = states_mod.selection_revision_state(APP.pool, APP.cfg)
+            out["selection_attempt"] = states_mod.selection_attempt_state(APP.pool, out["selection_revision"])
             # последняя проба выхода: сам статус её не делает (curl через tun0 — до 15 с
             # на каждый опрос), отдаём то, что записали панель или агент §8.
             eg = APP.pool.get_egress()
         if eg:
             out.update(eg)
+            geo = probe_mod.geoip.cached(out.get("egress"))
+            if geo["cc"]:
+                out["egress_cc"] = geo["cc"]
+            out["geo_status"] = geo["status"]
         # оценка страны текущего выхода — панель объясняет её человеку
         out["cc_tier"] = country_mod.tier(out.get("egress_cc"), True, APP.cfg)
         out["cc_hint"] = country_mod.explain(out.get("egress_cc"), True, APP.cfg)
@@ -2436,6 +2633,7 @@ class Handler(BaseHTTPRequestHandler):
         return out
 
     def _pool_row(self, r, cur):
+        r = probe_mod.cached_geo_row(r)
         days = probe_mod.days_left(r["date_end"])
         cc = r["exit_cc"] if _has(r, "exit_cc") and r["exit_cc"] else r["country"]
         agree = True if not _has(r, "geo_agree") or r["geo_agree"] is None else bool(r["geo_agree"])
@@ -2447,7 +2645,7 @@ class Handler(BaseHTTPRequestHandler):
             r["exit_cc"] if _has(r, "exit_cc") else None,
             r["exit_cc_alt"] if _has(r, "exit_cc_alt") else None,
             r["country"]))
-        is_cur = bool(cur and r["host"] == cur)
+        is_cur = bool(cur and apply_mod.matches_current(r, cur, APP.cfg))
         # П3: оценка на лету под текущую стратегию (колонка score в БД — лишь
         # последний замер той стратегии, что была активна в момент пробы)
         live_score, _ = probe_mod.score_from_row(r, APP.cfg, is_current=is_cur)
@@ -2460,7 +2658,10 @@ class Handler(BaseHTTPRequestHandler):
             cc_mode = "rated"      # репутация/баланс — обычный бейдж по рейтингу
         return {"uid": r["uid"], "provider": r["provider"], "country": r["country"],
                 "provider_active": r["provider"] in APP.providers,
-                "host": r["host"], "port_socks5": r["port_socks5"], "port_http": r["port_http"],
+                "host": r["host"], "protocol": r.get("protocol") or "proxy",
+                "endpoint_port": r.get("endpoint_port"), "probe_ok": r.get("probe_ok"),
+                "label": r.get("descr") if r.get("protocol") == "vless" else "",
+                "port_socks5": r["port_socks5"], "port_http": r["port_http"],
                 "role": r["role"], "score": live_score, "gone": r["gone"], "blocked": blocked,
                 "cc_mode": cc_mode,
                 "latency": r["latency_ms"] if _has(r, "latency_ms") else None,
@@ -2580,7 +2781,7 @@ class PanelHTTPSServer(ThreadingHTTPServer):
 
 def main():
     global APP
-    APP = App()
+    APP = contour_ui.Apps(App(), App)
     _reconcile_selection_on_startup()
     port = int(APP.cfg.get("panel_port") or 8443)
     if not APP.provisioned:

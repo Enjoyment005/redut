@@ -10,6 +10,7 @@
 назад» фронт считает сам.
 """
 import json
+import math
 import os
 import time
 
@@ -59,16 +60,19 @@ def whitelist_stat(has_dnsmasq, conf=WHITELIST_CONF, net_file=NET_IPSET_FILE):
 
 def _cleanup_run(run):
     """Один запуск из нового dict-формата или старого [timestamp, bytes]."""
+    # The first redut-owned collector omitted truncated log bytes. Its totals
+    # remain a lower bound until those records leave the rolling window.
     precise = isinstance(run, dict) and (
-        "journal" in run or run.get("scope") == "redut-owned")
+        "journal" in run or (run.get("scope") == "redut-owned"
+                             and run.get("accounting_version") == 2))
     if isinstance(run, list) and len(run) == 2:
         run = {"at": run[0], "freed": run[1]}
     if not isinstance(run, dict):
         return None
     at, freed = run.get("at"), run.get("freed")
-    if not isinstance(at, (int, float)) or not isinstance(freed, (int, float)):
+    if type(at) not in (int, float) or type(freed) not in (int, float):
         return None
-    if at < 0 or freed < 0:
+    if not math.isfinite(at) or not math.isfinite(freed) or at < 0 or freed < 0:
         return None
     return at, int(freed), precise
 

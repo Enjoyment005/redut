@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """Паспорт IP для карты выхода (probe.ip_intel + GET /api/ipinfo, 19.08).
 
-Сеть в тестах не трогаем — _http_json подменяется. Проверяем разбор обеих баз
-(ip-api.com и фолбэк ipinfo.io), порядок фолбэка, кэш в setting (повторное
-открытие дашборда в сеть не ходит), протухание кэша и то, что эндпоинт отвечает
+Сеть в тестах не трогаем. Проверяем кэш риск-разведки в setting,
+обновление геолокации независимо от него и то, что эндпоинт отвечает
 только про ТЕКУЩИЙ egress (общим geoip-сервисом панель не становится).
 """
 import json
@@ -17,89 +16,25 @@ from test_panel_api import _AppHarness
 import server
 
 
-IPAPI_OK = {
-    "status": "success", "countryCode": "LV", "regionName": "Riga", "city": "Riga",
-    "timezone": "Europe/Riga", "isp": "DataClub S.A.", "org": "MivoCloud SRL",
-    "as": "AS52048 DataClub S.A.", "asname": "DATACLUB", "reverse": "host.dataclub.eu",
-    "mobile": False, "proxy": True, "hosting": True, "lat": 56.95, "lon": 24.1,
-}
+from test_geoip import PRIMARY, SECONDARY
+import geoip
 
-IPINFO_OK = {
-    "ip": "1.2.3.4", "hostname": "srv.example.net", "city": "Helsinki",
-    "region": "Uusimaa", "country": "FI", "loc": "60.1699,24.9384",
-    "org": "AS24940 Hetzner Online GmbH", "timezone": "Europe/Helsinki",
-}
-
-IPAPI_OK_PARSED = probe._intel_from_ipapi(IPAPI_OK)
+IP2LOCATION_OK = dict(PRIMARY, country_code="LV", city_name="Riga", region_name="Riga", asn="52048", **{"as": "DataClub S.A."})
+IP2LOCATION_PARSED = geoip.parse("ip2location", IP2LOCATION_OK, "1.2.3.4")
 
 
-class TestParsers(unittest.TestCase):
-    def test_ipapi_success(self):
-        d = probe._intel_from_ipapi(IPAPI_OK)
-        self.assertEqual(d["cc"], "lv")
-        self.assertEqual(d["asn"], "AS52048")
-        self.assertEqual(d["asname"], "DATACLUB")
-        self.assertEqual(d["ptr"], "host.dataclub.eu")
-        self.assertIs(d["hosting"], True)
-        self.assertIs(d["proxy"], True)
-        self.assertIs(d["mobile"], False)
-        self.assertEqual(d["city"], "Riga")
-        self.assertEqual(d["src"], "ip-api")
-
-    def test_ipapi_fail_status_is_none(self):
-        self.assertIsNone(probe._intel_from_ipapi({"status": "fail", "message": "private range"}))
-        self.assertIsNone(probe._intel_from_ipapi(None))
-        self.assertIsNone(probe._intel_from_ipapi("мусор"))
-
-    def test_ipapi_asname_falls_back_to_as_tail(self):
-        d = probe._intel_from_ipapi(dict(IPAPI_OK, asname=""))
-        self.assertEqual(d["asname"], "DataClub S.A.")
-
-    def test_ipinfo_success(self):
-        d = probe._intel_from_ipinfo(IPINFO_OK)
-        self.assertEqual(d["cc"], "fi")
-        self.assertEqual(d["asn"], "AS24940")
-        self.assertEqual(d["asname"], "Hetzner Online GmbH")
-        self.assertEqual(d["ptr"], "srv.example.net")
-        self.assertEqual((d["lat"], d["lon"]), (60.1699, 24.9384))
-        # бесплатный ipinfo не отдаёт эти флаги — None, а не False (фронт различает)
-        self.assertIsNone(d["hosting"])
-        self.assertEqual(d["src"], "ipinfo")
-
-    def test_ipinfo_empty_is_none(self):
-        self.assertIsNone(probe._intel_from_ipinfo({}))
-        self.assertIsNone(probe._intel_from_ipinfo(None))
-
-
-class TestIpIntelFallback(unittest.TestCase):
-    def test_primary_wins(self):
-        with mock.patch.object(probe, "_http_json", return_value=IPAPI_OK) as m:
-            d = probe.ip_intel("1.2.3.4")
-        self.assertEqual(d["src"], "ip-api")
-        self.assertEqual(m.call_count, 1)
-
-    def test_falls_back_to_ipinfo(self):
-        def ask(url, timeout=probe.GEO_TIMEOUT):
-            return None if "ip-api" in url else IPINFO_OK
-        with mock.patch.object(probe, "_http_json", side_effect=ask):
-            d = probe.ip_intel("1.2.3.4")
-        self.assertEqual(d["src"], "ipinfo")
-
-    def test_both_silent_is_none(self):
-        with mock.patch.object(probe, "_http_json", return_value=None):
-            self.assertIsNone(probe.ip_intel("1.2.3.4"))
-
-    def test_empty_ip_is_none_without_network(self):
-        with mock.patch.object(probe, "_http_json") as m:
-            self.assertIsNone(probe.ip_intel(""))
-        m.assert_not_called()
-
-
-FULL_OK = dict(IPAPI_OK_PARSED, v=probe.INTEL_VERSION, quality=79,
+FULL_OK = dict(IP2LOCATION_PARSED, v=probe.INTEL_VERSION, quality=79,
                dnsbl={"checked": 3, "listed": []})
 
 
 class TestIpinfoEndpoint(_AppHarness):
+    def setUp(self):
+        super().setUp()
+        patches = [mock.patch.object(geoip, "CACHE_PATH", str(__import__('pathlib').Path(self.tmp.name)/'geo.sqlite3')),
+                   mock.patch.object(geoip, "_request", return_value=(dict(IP2LOCATION_PARSED), "ok", 0))]
+        for patch in patches:
+            patch.start(); self.addCleanup(patch.stop)
+
     def _egress(self, ip):
         self.app.pool.set_egress({"egress_ip": ip, "exit_cc": "lv", "ok": True,
                                   "tg_code": "200", "why": ""})
@@ -175,6 +110,47 @@ class TestIpinfoEndpoint(_AppHarness):
             r = self.call()
         m.assert_called_once()
         self.assertEqual(r["intel"]["asn"], "AS52048")
+
+
+    def test_weekly_risk_cache_never_overrides_fresh_geography(self):
+        self._egress("1.2.3.4")
+        self.app.pool.set_setting("ipintel:1.2.3.4", json.dumps(
+            {"at": pool_now(), "intel": dict(FULL_OK, cc="fi", city="Helsinki", pc_risk=13)}))
+        with mock.patch.object(probe, "ip_intel", return_value={"cc":"cn", "city":"Beijing", "src":"ip2location"}), \
+             mock.patch.object(probe, "ip_intel_full") as risk:
+            result = self.call()
+        self.assertEqual((result["intel"]["cc"], result["intel"]["city"]), ("cn", "Beijing"))
+        self.assertEqual(result["intel"]["pc_risk"], 13)
+        risk.assert_not_called()
+
+    def test_status_map_and_pool_use_same_fresh_country_as_passport(self):
+        self._egress("1.2.3.4")
+        uid = self.put_proxy("geo-beijing", country="cn", exit_cc="fi", exit_cc_alt="fi")
+        self.app.pool.conn.execute("UPDATE proxy SET exit_ip=? WHERE uid=?", ("1.2.3.4", uid))
+        self.app.pool.conn.commit()
+        data = geoip.parse("ip2location", PRIMARY, "1.2.3.4")
+        with mock.patch.object(geoip, "_request", return_value=(data, "ok", 0)):
+            self.assertEqual(probe.ip_intel("1.2.3.4")["city"], "Beijing")
+        with mock.patch.object(geoip, "_request") as network:
+            status = server.Handler._status(None)
+            row = self.pool_row(uid)
+        self.assertEqual(status["egress_cc"], "cn")
+        self.assertIn("cn", status["pool_cc"])
+        self.assertNotIn("fi", status["pool_cc"])
+        self.assertEqual(row["exit_cc"], "cn")
+        self.assertIsNone(row["exit_cc_alt"])
+        network.assert_not_called()
+
+    def test_unavailable_geography_clears_old_city_but_preserves_risk(self):
+        self._egress("1.2.3.4")
+        self.app.pool.set_setting("ipintel:1.2.3.4", json.dumps(
+            {"at": pool_now(), "intel": dict(FULL_OK, cc="fi", city="Helsinki", pc_risk=13)}))
+        with mock.patch.object(probe, "ip_intel", return_value=None):
+            result = self.call()
+        self.assertEqual(result["intel"]["geo_status"], "unavailable")
+        self.assertNotIn("city", result["intel"])
+        self.assertNotIn("cc", result["intel"])
+        self.assertEqual(result["intel"]["pc_risk"], 13)
 
 
 def pool_now():
@@ -277,14 +253,14 @@ class TestQuality(unittest.TestCase):
 
 
 class TestIpIntelFull(unittest.TestCase):
-    def _http(self, ipapi=IPAPI_OK, pc=PROXYCHECK_OK):
+    def setUp(self):
+        patch = mock.patch.object(probe, "ip_intel", return_value=dict(IP2LOCATION_PARSED))
+        self.base = patch.start(); self.addCleanup(patch.stop)
+
+    def _http(self, pc=PROXYCHECK_OK):
         def ask(url, timeout=probe.GEO_TIMEOUT):
-            if "ip-api" in url:
-                return ipapi
             if "proxycheck" in url:
                 return pc
-            if "ipinfo" in url:
-                return None
             if "ipqualityscore" in url:
                 return IPQS_OK
             return None
@@ -297,7 +273,7 @@ class TestIpIntelFull(unittest.TestCase):
                                return_value={"checked": 3, "listed": []}):
             d = probe.ip_intel_full("1.2.3.4", ping_ms=142)
         hdr.assert_not_called()                       # AbuseIPDB без ключа не дёргается
-        self.assertEqual(d["asn"], "AS52048")         # паспорт ip-api
+        self.assertEqual(d["asn"], "AS52048")         # паспорт IP2Location
         self.assertEqual(d["pc_risk"], 13)            # proxycheck
         self.assertNotIn("ipqs_fraud", d)             # IPQS без ключа не дёргается
         self.assertEqual(d["ping_ms"], 142)
@@ -317,17 +293,20 @@ class TestIpIntelFull(unittest.TestCase):
         self.assertEqual(d["abuse_score"], 7)
         self.assertEqual(d["ipqs_fraud"], 45)
 
-    def test_geo_silent_but_proxycheck_fills_gaps(self):
+    def test_geo_silent_risk_sources_do_not_invent_a_country(self):
+        self.base.return_value = None
         with mock.patch.object(probe, "_http_json",
-                               side_effect=self._http(ipapi=None)), \
+                               side_effect=self._http()), \
              mock.patch.object(probe, "dnsbl_check",
                                return_value={"checked": 0, "listed": []}):
             d = probe.ip_intel_full("1.2.3.4")
-        self.assertEqual(d["cc"], "lv")               # дыры паспорта закрыл proxycheck
-        self.assertEqual(d["asn"], "AS52048")
-        self.assertEqual(d["org"], "DataClub S.A.")
+        self.assertNotIn("cc", d)
+        self.assertNotIn("city", d)
+        self.assertEqual(d["geo_status"], "unavailable")
+        self.assertEqual(d["pc_risk"], 13)
 
     def test_everything_silent_is_none(self):
+        self.base.return_value = None
         with mock.patch.object(probe, "_http_json", return_value=None):
             self.assertIsNone(probe.ip_intel_full("1.2.3.4"))
 

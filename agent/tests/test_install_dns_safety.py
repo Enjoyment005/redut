@@ -240,7 +240,7 @@ class TestBootOwnership(unittest.TestCase):
             self.assertNotIn("route replace default", read(name))
 
     def test_base_manifest_covers_every_legacy_writer_and_skip_base_checks_it(self):
-        marker = "# REDUT_BASE_CONTRACT=2"
+        marker = "# REDUT_BASE_CONTRACT=3"
         for relative in ("install/templates/singbox-watchdog.sh",
                          "install/templates/singbox-post.sh",
                          "install/templates/vpn-boot-setup.sh",

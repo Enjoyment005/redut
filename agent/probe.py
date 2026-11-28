@@ -19,6 +19,7 @@ import subprocess
 import urllib.request
 
 import country
+import geoip
 import health as health_mod
 
 # ЧЁРНЫЙ СПИСОК СТРАН (§6.1) — предохранитель в коде, из панели/настроек НЕ редактируется.
@@ -170,46 +171,13 @@ def _posix():
 
 
 def geo_country(ip):
-    """Страна exit-IP (двухбуквенный код, lower) или None.
-
-    Запрос идёт НАПРЯМУЮ с сервера (не через кандидата): ip-api.com,
-    фолбэк ipinfo.io. Не смогли узнать — None (неизвестность не равна блоку).
-    """
-    if not ip:
-        return None
-    for url in (_GEO_PRIMARY, _GEO_SECONDARY):
-        cc = _geo_ask(url % ip)
-        if cc:
-            return cc
-    return None
+    """Country from the shared HTTPS GeoIP cache, or None when unavailable."""
+    return geoip.lookup(ip)["cc"]
 
 
-_GEO_PRIMARY = "http://ip-api.com/line/%s?fields=countryCode"
-_GEO_SECONDARY = "https://ipinfo.io/%s/country"
-
-
-def _geo_ask(url):
-    try:
-        with urllib.request.urlopen(url, timeout=GEO_TIMEOUT) as r:
-            cc = r.read().decode("ascii", "replace").strip().lower()
-    except Exception:
-        return None
-    return cc if re.fullmatch(r"[a-z]{2}", cc or "") else None
-
-
-# ── технический паспорт IP для карты выхода (19.08) ──────────────────────────
-# Те же публичные базы, что у geo_country (ip-api.com, фолбэк ipinfo.io) — новых
-# зависимостей и хостов узел не получает. Ответ кэшируется панелью (setting) по IP:
-# паспорт адреса меняется редко, TTL недели хватает.
+# Risk intelligence has its own weekly cache; geography is always refreshed
+# from the shared six-hour cache before serving the passport.
 INTEL_TTL_S = 7 * 24 * 3600
-
-_INTEL_PRIMARY = ("http://ip-api.com/json/%s?fields=status,countryCode,regionName,city,"
-                  "timezone,isp,org,as,asname,reverse,mobile,proxy,hosting,lat,lon")
-_INTEL_SECONDARY = "https://ipinfo.io/%s/json"
-
-
-# proxycheck.io отвечает 403 на дефолтный UA «Python-urllib/…» (анти-бот);
-# честный узнаваемый UA пропускают все наши источники (живой случай node1 19.08)
 _HTTP_UA = "Mozilla/5.0 (compatible; redut-panel)"
 
 
@@ -222,66 +190,32 @@ def _http_json(url, timeout=GEO_TIMEOUT):
         return None
 
 
-def _intel_from_ipapi(d):
-    """Разбор ответа ip-api.com/json -> общий словарь паспорта или None."""
-    if not isinstance(d, dict) or d.get("status") != "success":
-        return None
-    asn = (d.get("as") or "").split(" ")[0] or None
-    as_rest = (d.get("as") or "").split(" ", 1)
-    return {
-        "cc": (d.get("countryCode") or "").lower() or None,
-        "region": d.get("regionName") or None,
-        "city": d.get("city") or None,
-        "tz": d.get("timezone") or None,
-        "isp": d.get("isp") or None,
-        "org": d.get("org") or None,
-        "asn": asn,
-        "asname": d.get("asname") or (as_rest[1] if len(as_rest) > 1 else None),
-        "ptr": d.get("reverse") or None,
-        "mobile": bool(d.get("mobile")) if "mobile" in d else None,
-        "proxy": bool(d.get("proxy")) if "proxy" in d else None,
-        "hosting": bool(d.get("hosting")) if "hosting" in d else None,
-        "lat": d.get("lat"), "lon": d.get("lon"),
-        "src": "ip-api",
-    }
-
-
-def _intel_from_ipinfo(d):
-    """Разбор ответа ipinfo.io/json (фолбэк): полей меньше — mobile/proxy/hosting
-    эта база бесплатно не отдаёт, оставляем None (фронт различает None и False)."""
-    if not isinstance(d, dict) or not (d.get("org") or d.get("city") or d.get("hostname")):
-        return None
-    org = (d.get("org") or "").strip()
-    asn = org.split(" ")[0] if org.startswith("AS") else None
-    name = (org.split(" ", 1)[1] if asn and " " in org else org) or None
-    lat = lon = None
-    loc = (d.get("loc") or "").split(",")
-    if len(loc) == 2:
-        try:
-            lat, lon = float(loc[0]), float(loc[1])
-        except ValueError:
-            pass
-    return {"cc": (d.get("country") or "").lower() or None,
-            "region": d.get("region") or None, "city": d.get("city") or None,
-            "tz": d.get("timezone") or None,
-            "isp": name, "org": name, "asn": asn, "asname": name,
-            "ptr": d.get("hostname") or None,
-            "mobile": None, "proxy": None, "hosting": None,
-            "lat": lat, "lon": lon, "src": "ipinfo"}
-
-
 def ip_intel(ip):
-    """Технический паспорт exit-IP (ASN, оператор, город, пояс, PTR, датацентр…).
+    """Country, city and network belong to one source and one cached observation."""
+    return geoip.lookup(ip)["intel"]
 
-    Для оверлея на карте выхода: панель показывает человеку, ЧТО за адрес видят
-    сайты. Запрос идёт напрямую с сервера (как geo_country); обе базы молчат ->
-    None (кэшировать нечего, панель попробует позже)."""
-    if not ip:
-        return None
-    intel = _intel_from_ipapi(_http_json(_INTEL_PRIMARY % ip))
-    if intel is None:
-        intel = _intel_from_ipinfo(_http_json(_INTEL_SECONDARY % ip))
-    return intel
+
+def cached_geo_row(row):
+    """Overlay current metadata without hiding an unrefuted blocked alternate."""
+    result = geoip.cached(row.get("exit_ip"))
+    if not result["cc"]:
+        return row
+    out = dict(row, exit_cc=result["cc"], exit_cc_alt=result["alt"], geo_agree=result["agree"])
+    if result["alt"] is None:
+        blocked = next((row.get(k) for k in ("exit_cc", "exit_cc_alt") if row.get(k) in HARD_BLOCK_CC), None)
+        if blocked:
+            out["exit_cc_alt"] = blocked
+            out["geo_agree"] = out["exit_cc"] == blocked
+    return out
+
+
+def refresh_ip_intel(ip, intel):
+    """Refresh only geography; retain the independently cached risk observations."""
+    out = {k: v for k, v in (intel or {}).items() if k not in geoip.FIELDS}
+    base = ip_intel(ip)
+    out.update(base or {"geo_status": "unavailable"})
+    out["quality"] = ip_quality(out)
+    return out
 
 
 # ── риск-разведка exit-IP (19.08): чем адрес светится в антифрод-базах ────────
@@ -292,7 +226,7 @@ def ip_intel(ip):
 # бесплатные тарифы, вписывает владелец; появился ключ — источник сам включится
 # при следующем протухании кэша. Любой источник молчит — его поля None, оценка
 # считается по тому, что есть: неизвестность не карается.
-INTEL_VERSION = 2          # формат кэша ipintel:*; старые записи перечитываются
+INTEL_VERSION = 3          # формат кэша ipintel:*; старые записи перечитываются
 
 _PROXYCHECK_URL = "https://proxycheck.io/v2/%s?vpn=3&asn=1&risk=1"
 _ABUSEIPDB_URL = "https://api.abuseipdb.com/api/v2/check?ipAddress=%s&maxAgeInDays=90"
@@ -411,7 +345,7 @@ def ip_quality(d):
 def ip_intel_full(ip, keys=None, ping_ms=None):
     """Полный паспорт + риск-разведка одним словарём (кэшируется панелью).
 
-    Паспорт (ip-api/ipinfo) + proxycheck (без ключа) + AbuseIPDB/IPQS (по ключам)
+    Паспорт (IP2Location/ipwho.is) + proxycheck (без ключа) + AbuseIPDB/IPQS (по ключам)
     + DNSBL + пинг до прокси (замер последней пробы пула, приходит снаружи).
     Совсем никто не ответил -> None (кэшировать нечего)."""
     if not ip:
@@ -424,12 +358,9 @@ def ip_intel_full(ip, keys=None, ping_ms=None):
     pc = _intel_from_proxycheck(_http_json(url), ip)
     if base is None and pc is None:
         return None
-    out = dict(base or {})
+    out = dict(base or {"geo_status": "unavailable"})
     if pc:
-        # запасные geo-поля proxycheck — только в дыры паспорта
-        for src, dst in (("_pc_cc", "cc"), ("_pc_asn", "asn"), ("_pc_org", "org")):
-            if not out.get(dst) and pc.get(src):
-                out[dst] = pc[src]
+        # Risk providers do not override the country/city from the GeoIP cache.
         out.update({k: v for k, v in pc.items() if not k.startswith("_")})
     if keys.get("abuseipdb"):
         ab = _intel_from_abuseipdb(_http_json_hdr(
@@ -448,24 +379,14 @@ def ip_intel_full(ip, keys=None, ping_ms=None):
     return out
 
 
-def geo_country_consensus(ip):
-    """Страна exit-IP по ДВУМ независимым базам сразу -> {cc, alt, agree}.
+def geo_country_consensus(ip, refresh=False):
+    """Two-source check; missing data is unknown, not a country disagreement.
 
-    Зачем спрашивать обе: у перепроданных диапазонов базы расходятся. Реальный
-    случай 2026-08-15 — `203.0.113.77`: ip-api видит Нигерию, ipinfo Нью-Йорк.
-    Сайты пользуются разными базами, поэтому для них «страна скачет» — типовая
-    реакция антифрода: капчи и отказы оплаты. Расхождение (agree=False) не
-    дисквалифицирует прокси, но снижает его оценку (см. country.rating).
-
-    Обе базы молчат -> {cc: None, alt: None, agree: True}: незнание страны — это
-    не расхождение, штрафовать не за что.
+    refresh=True is used to confirm a blocked country without counting the
+    initial cached observation as a second independent measurement.
     """
-    if not ip:
-        return {"cc": None, "alt": None, "agree": True}
-    cc = _geo_ask(_GEO_PRIMARY % ip)
-    alt = _geo_ask(_GEO_SECONDARY % ip)
-    agree = not (cc and alt and cc != alt)
-    return {"cc": cc or alt, "alt": alt, "agree": agree}
+    result = geoip.lookup(ip, consensus=True, refresh=refresh)
+    return {key: result[key] for key in ("cc", "alt", "agree")}
 
 
 def probe_matrix(host, ports, user, password):
@@ -487,6 +408,9 @@ def probe(proxy, provider_check=None, latency_runs=3):
     proxy: нужны host, port_socks5, port_http, user, password.
     provider_check: callable()->bool — дешёвый check?ids= у PROXY6 до матрицы.
     """
+    if proxy.get("protocol") == "vless":
+        import vless
+        return vless.probe(proxy, latency_runs=latency_runs)
     host = proxy.get("host") or proxy.get("ip")
     user, password = proxy.get("user") or "", proxy.get("password") or ""
     res = {

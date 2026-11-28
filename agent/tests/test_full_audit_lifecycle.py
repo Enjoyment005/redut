@@ -61,6 +61,8 @@ class TestDeployLocalPreflight(unittest.TestCase):
 
     @staticmethod
     def _remote(_connection, command, **_kwargs):
+        if "REDUT_MAIL_SKIPPED" in command:
+            return 0, "REDUT_MAIL_SKIPPED"
         if "REDUT_DNS_IDENTITY_OK" in command:
             return 0, "REDUT_DNS_IDENTITY_OK"
         if "cat /etc/vpn-panel/secrets.json" in command:
@@ -167,6 +169,77 @@ class TestDeployLocalPreflight(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 deploy.main(["audit", "--clean"])
         self.connect.assert_not_called()
+
+    def test_new_clean_deploy_selects_atomicmail_but_existing_node_keeps_transport(self):
+        for exists in (False, True):
+            self.config_write.reset_mock()
+            with self.subTest(exists=exists), \
+                    mock.patch.object(deploy, "remote_config_present", return_value=exists), \
+                    mock.patch.object(deploy, "prepare_remote_mail", return_value=False) as prepare:
+                self.assertEqual(deploy.main(["audit", "--with-panel", "--clean"]), 0)
+                incoming = json.loads(self.config_write.call_args.args[3])
+                if exists:
+                    self.assertNotIn("mail_transport", incoming)
+                else:
+                    self.assertEqual(incoming["mail_transport"], "atomicmail")
+                self.assertIn("mail_transport", self.config_write.call_args.args[4])
+                prepare.assert_called_once_with(self.connection)
+
+    def test_explicit_deploy_transport_overrides_only_when_requested(self):
+        for mode in ("smtp", "atomicmail"):
+            self.config_write.reset_mock()
+            with self.subTest(mode=mode), \
+                    mock.patch.object(deploy, "remote_config_present") as presence, \
+                    mock.patch.object(deploy, "prepare_remote_mail", return_value=False):
+                self.assertEqual(deploy.main(["audit", "--clean", "--with-panel",
+                                              "--mail-transport", mode]), 0)
+                self.assertEqual(json.loads(self.config_write.call_args.args[3])["mail_transport"], mode)
+                self.assertNotIn("mail_transport", self.config_write.call_args.args[4])
+                presence.assert_not_called()
+
+    def test_keep_config_rejects_explicit_mail_transport_before_ssh(self):
+        for mode in ("smtp", "atomicmail"):
+            with self.subTest(mode=mode), contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as caught:
+                deploy.main(["audit", "--clean", "--keep-config", "--mail-transport", mode])
+            self.assertEqual(caught.exception.code, 2)
+        self.connect.assert_not_called()
+
+    def test_remote_mail_preparation_is_nonfatal_and_sanitizes_errors(self):
+        for result, ready in (((0, "REDUT_MAIL_READY"), True),
+                              ((0, "REDUT_MAIL_SKIPPED"), False),
+                              ((0, "REDUT_MAIL_DEFERRED"), False),
+                              ((1, "synthetic-provider-secret"), False),
+                              (RuntimeError("synthetic-provider-secret"), False)):
+            kwargs = {"side_effect": result} if isinstance(result, Exception) else {"return_value": result}
+            with mock.patch.object(deploy, "run_result", **kwargs):
+                self.assertEqual(deploy.prepare_remote_mail(self.connection), ready)
+        self.assertNotIn("synthetic-provider-secret", self.output.getvalue())
+
+    def test_remote_config_presence_error_is_not_new_node(self):
+        for code in (0, 1, 2):
+            with self.subTest(code=code), mock.patch.object(deploy, "run_result", return_value=(code, "")):
+                if code == 2:
+                    with self.assertRaises(SystemExit):
+                        deploy.remote_config_present(self.connection)
+                else:
+                    self.assertEqual(deploy.remote_config_present(self.connection), code == 0)
+
+    def test_bootstrap_smtp_is_forwarded_and_seed_defaults_remain_legacy(self):
+        profile = {"name": "audit", "host": "192.0.2.10", "root_pw": "SYNTHETIC-SSH",
+                   "role": "vpn-audit", "subnet": "10.8.0.0/24", "wg_port": 51820,
+                   "wg_ip": "10.8.0.1", "panel_port": 8443}
+        net = {"gw": "192.0.2.1", "wan": "eth0", "server_ip": "192.0.2.10"}
+        for seeded, smtp in ((False, False), (False, True), (True, False)):
+            args = types.SimpleNamespace(seed_secrets=seeded, regen_cert=False, smtp=smtp)
+            with mock.patch.object(bootstrap, "PANEL_DIR", str(self.panel)), \
+                    mock.patch.object(deploy, "main", return_value=0) as launch:
+                self.assertTrue(bootstrap.deploy_panel(profile, net, args))
+            argv = launch.call_args.args[0]
+            self.assertEqual("--clean" in argv, not seeded)
+            self.assertEqual("--mail-transport" in argv, smtp)
+            if smtp:
+                self.assertEqual(argv[argv.index("--mail-transport") + 1], "smtp")
 
     def test_bootstrap_seed_secrets_uses_normal_deploy(self):
         profile = {"name": "audit", "host": "192.0.2.10", "root_pw": "SYNTHETIC-SSH",

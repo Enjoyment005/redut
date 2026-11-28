@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""alerts.py — письма-алерты агента (§8/§10, §20 п.7). Только stdlib (smtplib).
+"""alerts.py — письма-алерты агента (§8/§10, §20 п.7). SMTP или AtomicMail через HTTPS (stdlib).
 
 Настройки SMTP — в secrets.json, блок "smtp" (0600 на сервере, §13):
     {"smtp": {"host": "mail.example.com", "port": 587,
@@ -18,6 +18,8 @@ port 465 -> SMTPS (SSL), иначе STARTTLS (обычно 587).
 Секреты (ключи провайдеров) в теле письма маскируются переданным mask-callable —
 у PROXY6 ключ лежит в пути URL, светить его в почте нельзя (§15).
 """
+import json
+import os
 import re
 import smtplib
 import ssl
@@ -40,8 +42,17 @@ def _stderr(msg):
 class Alerter:
     """Отправитель писем. Все typed-методы возвращают bool (отправлено/нет)."""
 
-    def __init__(self, smtp=None, server="srv", log=None, mask=None, timeout=20):
+    def __init__(self, smtp=None, server="srv", log=None, mask=None, timeout=20,
+                 *, transport="smtp", atomicmail=None, secrets_path=None):
         self.smtp = smtp or {}
+        self.transport = transport
+        self.atomicmail = atomicmail if isinstance(atomicmail, dict) else {}
+        self.secrets_path = secrets_path or os.environ.get("VPN_PANEL_SECRETS")
+        if not self.secrets_path:
+            candidates = ("/etc/vpn-panel/secrets.json",
+                          os.path.join(os.path.dirname(__file__), ".secrets.local.json"))
+            self.secrets_path = next((path for path in candidates if os.path.isfile(path)),
+                                     candidates[0])
         self.server = server or "srv"
         self.log = log or _stderr
         self.mask = mask or (lambda s: s)
@@ -55,6 +66,12 @@ class Alerter:
         пустой «from» молча выключал ВСЕ алерты, хотя ящик настроен и письма ушли бы:
         поймано на node2 18.08 (мастер сохранил from="" -> «SMTP не настроен»).
         Условие теперь совпадает с тем, что _send реально умеет отправить."""
+        if self.transport == "atomicmail":
+            s = self.atomicmail
+            return bool(s.get("status") == "ready" and s.get("api_key")
+                        and _valid_email(s.get("address")) and _valid_email(s.get("to")))
+        if self.transport != "smtp":
+            return False
         s = self.smtp
         return bool(s and s.get("host") and s.get("to")
                     and (_valid_email(s.get("from")) or _valid_email(s.get("user"))))
@@ -63,6 +80,12 @@ class Alerter:
     def _send(self, subject, body):
         """Собрать и отправить письмо. Любой сбой -> False (не бросаем)."""
         self.last_error = ""
+        if self.transport == "atomicmail":
+            return self._send_atomicmail(subject, body)
+        if self.transport != "smtp":
+            self.last_error = "Не удалось определить способ отправки почты; отправка остановлена"
+            self.log(self.last_error)
+            return False
         if not self.configured:
             self.last_error = "почта не настроена"
             self.log("SMTP не настроен — письмо «%s» не отправлено (это не ошибка)" % subject)
@@ -116,6 +139,35 @@ class Alerter:
             self.last_error = self.mask(str(e))
             self.log("НЕ удалось отправить письмо «%s»: %s" % (subject, self.last_error))
             return False
+
+    def _send_atomicmail(self, subject, body):
+        """Use the prepared mailbox; registration never runs in an alert path."""
+        if not self.configured:
+            self.last_error = "AtomicMail не настроен или адрес получателя не подтверждён"
+            self.log(self.last_error)
+            return False
+        try:
+            import atomicmail as transport_module
+            # Even a caller without a mask must not send the mailbox access key.
+            key = str(self.atomicmail.get("api_key") or "")
+            def clean(value):
+                text = self.mask(value)
+                return text.replace(key, "****") if key else text
+            transport_module.send(
+                self.secrets_path, self.atomicmail["to"],
+                clean("[vpn-agent %s] %s" % (self.server, subject)), clean(body))
+        except Exception as exc:
+            # HTTP/provider exception text may contain Authorization or a body.
+            # Only our fixed messages may reach logs or the setup UI.
+            unknown = bool(getattr(exc, "unknown", False))
+            self.last_error = (
+                "Результат отправки AtomicMail не подтверждён; повторная отправка остановлена"
+                if unknown else
+                "AtomicMail временно недоступен; отправка письма не подтверждена")
+            self.log(self.last_error)
+            return False
+        self.log("письмо принято AtomicMail")
+        return True
 
     def send(self, subject, body):
         """Низкоуровневая отправка (для нестандартных случаев)."""
@@ -308,7 +360,34 @@ class Alerter:
         return self._send("Агент молчит >%.0f ч — проверь пульс" % hours, body)
 
 
-def make_alerter(secrets, cfg, log=None, mask=None):
-    """Собрать Alerter из secrets['smtp'] + метки сервера из cfg."""
-    smtp = (secrets or {}).get("smtp") or {}
-    return Alerter(smtp=smtp, server=(cfg or {}).get("server") or "srv", log=log, mask=mask)
+def _mail_transport(cfg):
+    """Mail belongs to the node; a saved secondary config may be out of date."""
+    if str(cfg.get("contour_id") or "1") != "2":
+        return cfg.get("mail_transport", "smtp")
+    try:
+        path = cfg.get("main_config")
+        if not isinstance(path, str) or not path:
+            return None
+        with open(path, encoding="utf-8") as source:
+            main = json.load(source)
+        if not isinstance(main, dict):
+            return None
+        return main.get("mail_transport", "smtp")
+    except (OSError, ValueError, RecursionError):
+        # Reading settings must not run config migrations or silently select
+        # another transport when the shared configuration is unavailable.
+        return None
+
+
+def make_alerter(secrets, cfg, log=None, mask=None, *, secrets_path=None):
+    """Choose the configured transport; existing installations keep SMTP."""
+    secrets = secrets or {}
+    cfg = cfg or {}
+    mailbox = secrets.get("atomicmail")
+    mailbox = dict(mailbox) if isinstance(mailbox, dict) else {}
+    recipient = secrets.get("mail")
+    mailbox["to"] = recipient.get("to") if isinstance(recipient, dict) else None
+    return Alerter(smtp=secrets.get("smtp") or {},
+                   server=cfg.get("server") or "srv", log=log, mask=mask,
+                   transport=_mail_transport(cfg),
+                   atomicmail=mailbox, secrets_path=secrets_path)

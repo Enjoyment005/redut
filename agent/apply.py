@@ -49,6 +49,10 @@ class ApplyError(Exception):
 
 
 # ---------------------------------------------------------------- flock (§9.1)
+class LockBusy(ApplyError):
+    """Another writer owns the node-wide network lock."""
+
+
 class Flock:
     def __init__(self, path):
         self.path = path
@@ -60,9 +64,12 @@ class Flock:
         self.fh = open(self.path, "w")
         try:
             fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except OSError as error:
             self.fh.close()
-            raise ApplyError("Другой процесс агента уже меняет конфиг (flock %s занят)" % self.path)
+            import errno
+            if error.errno in (errno.EAGAIN, errno.EACCES):
+                raise LockBusy("Другой процесс агента уже меняет конфиг (flock %s занят)" % self.path) from None
+            raise ApplyError("Общий lock недоступен") from None
         return self
 
     def __exit__(self, *exc):
@@ -84,9 +91,13 @@ def _maybe_lock(server_cfg, held):
     на весь цикл диагностики и передаёт _locked=True — тогда apply/rollback не
     берут его повторно (LOCK_NB на второй fd в том же процессе конфликтует)."""
     if held:
+        import contours
+        contours.ensure_ready(server_cfg)
         yield
     else:
         with Flock(server_cfg.get("lock") or "/run/vpn-agent.lock"):
+            import contours
+            contours.ensure_ready(server_cfg)
             yield
 
 
@@ -115,6 +126,24 @@ def choose_outbounds(host, user, password, socks_port, http_port):
                build_outbound("socks", "http-tg", host, socks_port, user, password))
     reject_quic = socks_out["type"] == "http"
     return socks_out, http_tg, reject_quic
+
+
+def candidate_outbounds(row, result, server_cfg=None):
+    if row.get("protocol") == "vless":
+        import vless
+        if not result.get("ok") or result.get("connection_digest") != row.get("connection_digest"):
+            raise ApplyError("VLESS: параметры изменились или нет успешной проверки")
+        try:
+            outbounds = vless.outbounds(row)
+            for ob in outbounds[:2]:
+                ob["domain_resolver"] = "redut-bootstrap"
+                if (server_cfg or {}).get("wan"):
+                    ob["bind_interface"] = server_cfg["wan"]
+            return outbounds
+        except ValueError:
+            raise ApplyError("VLESS: некорректные параметры подключения") from None
+    return choose_outbounds(row.get("host") or row.get("ip"), row.get("user") or "",
+                            row.get("password") or "", result.get("socks_port"), result.get("http_port"))
 
 
 def outbound_fingerprint(outbounds):
@@ -170,6 +199,26 @@ def current_upstream(cfg):
         if o.get("tag") == "socks-out":
             return o.get("server") or ""
     return ""
+
+
+def matches_current(row, host, cfg=None, sb=None):
+    """VLESS identity includes transport credentials; an address alone is ambiguous."""
+    if not host or row.get("host") != host:
+        return False
+    if row.get("protocol") != "vless":
+        return True
+    if sb is None:
+        try:
+            sb = load_json(cfg["singbox_config"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+    import vless
+    try:
+        expected = vless.outbound(row)
+    except ValueError:
+        return False
+    actual = next((o for o in sb.get("outbounds", []) if o.get("tag") == "socks-out"), {})
+    return expected == {k: v for k, v in actual.items() if k not in ("domain_resolver", "bind_interface")}
 
 
 # ------------------------------------------------------------- работа с диском
@@ -302,8 +351,23 @@ def wait_tun0(timeout=30):
     return False
 
 
-def antiloop_replace(new_ip, old_ip, gw, wan):
+def antiloop_replace(new_ip, old_ip, gw, wan, server_cfg=None):
     """ip route replace <new>/32 via gw dev wan; маршрут старого убрать (§9.5)."""
+    if server_cfg:
+        import contours
+        main = contours.main_config(server_cfg)
+        try:
+            other = main if contours.secondary(server_cfg) else contours.config(main)
+            if old_ip == current_upstream(load_json(other["singbox_config"])):
+                old_ip = None
+        except (OSError, ValueError):
+            pass
+    if new_ip and not probe_mod.is_ipv4(new_ip):
+        from providers.zenxnet import public_addresses
+        addresses = public_addresses(new_ip)
+        for address in addresses:
+            antiloop_replace(address, None, gw, wan)
+        return "anti-loop: адреса сервера проверены"
     if not (gw and wan):
         return "нет gw/wan в конфиге — anti-loop пропущен"
     rc, out = run_cmd(["ip", "route", "replace", "%s/32" % new_ip,
@@ -356,7 +420,7 @@ def patch_boot_script(path, old_ip, new_ip):
     return True
 
 
-def verify_egress(expect_host=None):
+def verify_egress(expect_host=None, interface="tun0"):
     """§9.8: IP через tun0 есть, страна не в жёстком блоке, TG отвечает через tun0.
 
     why_kind (F1, 1.3.0) — машинный признак причины провала для машины состояний:
@@ -366,7 +430,7 @@ def verify_egress(expect_host=None):
                      states не имеет права ломать его ротацией, DEGRADED).
     """
     rc, ip = run_cmd(["curl", "-s", "--max-time", str(VERIFY_TIMEOUT),
-                      "--interface", "tun0", probe_mod.IPIFY_URL], timeout=VERIFY_TIMEOUT + 10)
+                      "--interface", interface, probe_mod.IPIFY_URL], timeout=VERIFY_TIMEOUT + 10)
     ip = ip.strip()
     ip_ok = rc == 0 and probe_mod.looks_like_ip(ip)
     out = {"egress_ip": ip if ip_ok else None,
@@ -385,14 +449,17 @@ def verify_egress(expect_host=None):
         # F1: не карать по одиночному вердикту одной базы — повторный запрос ОБЕИХ;
         # блок при подтверждении ЛЮБОЙ из них на повторе (строгость probe сохранена:
         # он тоже блочит по любой из баз — ослабления «до консенсуса» нет).
-        geo2 = probe_mod.geo_country_consensus(out["egress_ip"])
+        geo2 = probe_mod.geo_country_consensus(out["egress_ip"], refresh=True)
         if (geo2["cc"] in probe_mod.HARD_BLOCK_CC
-                or (geo2["alt"] or "") in probe_mod.HARD_BLOCK_CC):
+                or (geo2["alt"] or "") in probe_mod.HARD_BLOCK_CC
+                or not geo2["cc"] or not geo2["alt"]):
+            # A timeout/quota is not evidence that an already known ban was
+            # wrong. Refuting it requires two available, non-blocked answers.
             out["why"] = "страна выхода %s в жёстком блоке" % out["exit_cc"]
             out["why_kind"] = "blocked-cc"
             return out
         out["exit_cc"] = geo2["cc"] or out["exit_cc"]   # ложняк одной базы — едем дальше
-    rc, code = run_cmd(["curl", "-s", "--max-time", str(VERIFY_TIMEOUT), "--interface", "tun0",
+    rc, code = run_cmd(["curl", "-s", "--max-time", str(VERIFY_TIMEOUT), "--interface", interface,
                         "-o", "/dev/null", "-w", "%{http_code}", probe_mod.TG_URL],
                        timeout=VERIFY_TIMEOUT + 10)
     out["tg_code"] = code if rc == 0 else "000"
@@ -418,6 +485,69 @@ def restart_singbox():
     return rc == 0 and act.strip() == "active"
 
 
+def restart_for(cfg):
+    import contours
+    import dns_policy
+    if not contours.secondary(cfg):
+        if cfg.get("singbox_config"):
+            conf, _ = dns_policy._primary_paths(cfg)
+            if os.path.exists(conf):
+                rc, _ = run_cmd(["systemctl", "stop", dns_policy.PRIMARY_SERVICE], timeout=30)
+                if rc:
+                    return False
+        ok = restart_singbox()
+        if ok and cfg.get("singbox_config"):
+            dns_policy.reconcile(cfg, _locked=True, restart=True)
+        return ok
+    # No gateway may combine the old ipset rules with the new FakeIP policy,
+    # or the old FakeIP policy with newly added domain bypass rules.
+    rc, _ = run_cmd(["systemctl", "stop", contours.DNS_SERVICE], timeout=30)
+    if rc:
+        return False
+    rc, _ = run_cmd(["systemctl", "restart", contours.SERVICE], timeout=60)
+    if rc:
+        return False
+    if cfg.get("singbox_config"):
+        contours.sync_dns(contours.main_config(cfg), restart=False)
+    rc, _ = run_cmd(["systemctl", "start", contours.DNS_SERVICE], timeout=30)
+    return rc == 0
+
+
+def wait_for(cfg):
+    import contours
+    if not contours.secondary(cfg):
+        return wait_tun0()
+    for _ in range(30):
+        try:
+            with open("/sys/class/net/%s/carrier" % contours.TUN) as handle:
+                if handle.read().strip() == "1":
+                    contours.reconcile_network(cfg, _locked=True)
+                    return True
+        except OSError:
+            pass
+        time.sleep(1)
+    return False
+
+
+def verify_for(cfg):
+    import contours
+    return verify_egress(interface=contours.TUN) if contours.secondary(cfg) else verify_egress()
+
+
+def patch_boot_for(cfg, path, old_ip, new_ip):
+    import contours
+    if contours.secondary(cfg):
+        return False
+    if new_ip and not probe_mod.is_ipv4(new_ip):
+        from providers.zenxnet import public_addresses
+        new_ip = public_addresses(new_ip)[0]
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as handle:
+                match = _BOOT_UPHOST_RE.search(handle.read())
+                old_ip = match.group(2) if match else old_ip
+    return patch_boot_script(path, old_ip, new_ip)
+
+
 # ------------------------------------------------------------------ оркестрация
 def stage_candidate(server_cfg, proxy_row, probe_res):
     """Собрать конфиг-кандидат во временный файл (live не тронут).
@@ -425,16 +555,32 @@ def stage_candidate(server_cfg, proxy_row, probe_res):
     -> (stage_path, new_cfg, socks_out, http_tg, reject_quic)
     """
     host = proxy_row.get("host") or proxy_row.get("ip")
-    if not probe_mod.is_ipv4(host):
+    if not probe_mod.is_ipv4(host) and proxy_row.get("protocol") != "vless":
         raise ApplyError("host %r не IPv4 — отклонено валидацией (§15)" % host)
     for p in (probe_res.get("socks_port"), probe_res.get("http_port")):
         if p is not None and not (1 <= int(p) <= 65535):
             raise ApplyError("порт %r вне 1..65535 — отклонено валидацией (§15)" % p)
-    socks_out, http_tg, reject_quic = choose_outbounds(
-        host, proxy_row.get("user") or "", proxy_row.get("password") or "",
-        probe_res.get("socks_port"), probe_res.get("http_port"))
+    socks_out, http_tg, reject_quic = candidate_outbounds(proxy_row, probe_res, server_cfg)
     live = load_json(server_cfg["singbox_config"])
     new_cfg = patch_config(live, socks_out, http_tg, reject_quic)
+    if proxy_row.get("protocol") == "vless":
+        servers = new_cfg.setdefault("dns", {}).setdefault("servers", [])
+        # Adding bootstrap turns implicit single-DNS resolution into an
+        # ambiguous choice on 1.14. Preserve the previous resolver explicitly.
+        resolver = (new_cfg["dns"].get("final") or
+                    next((item["tag"] for item in servers if item.get("tag")), "redut-bootstrap"))
+        new_cfg.setdefault("route", {}).setdefault("default_domain_resolver", resolver)
+        if not any(x.get("tag") == "redut-bootstrap" for x in servers):
+            servers.append({"type": "udp", "tag": "redut-bootstrap", "server": "9.9.9.9",
+                            "detour": "redut-direct"})
+        if not any(x.get("tag") == "redut-direct" for x in new_cfg["outbounds"]):
+            direct = {"type": "direct", "tag": "redut-direct"}
+            if server_cfg.get("wan"):
+                direct["bind_interface"] = server_cfg["wan"]
+            new_cfg["outbounds"].append(direct)
+    import dns_policy
+    if dns_policy.managed(new_cfg):
+        new_cfg = dns_policy.prepare(server_cfg, new_cfg, dns_policy.mode(new_cfg))
     stage_base = server_cfg.get("stage_path") or (server_cfg["singbox_config"] + ".stage")
     stage = "%s.%s" % (stage_base, uuid.uuid4().hex)
     dump_json_replace(new_cfg, stage)
@@ -548,6 +694,11 @@ def apply_candidate(server_cfg, proxy_row, probe_res, log=print, _locked=False,
     mutation_may_have_started = False
 
     with _maybe_lock(server_cfg, _locked):
+        if pool is not None and proxy_row.get("protocol") == "vless":
+            latest = pool.get(proxy_row["uid"])
+            if (not latest or latest.get("gone")
+                    or latest.get("connection_digest") != proxy_row.get("connection_digest")):
+                raise ApplyError("Каталог подписки изменился после проверки; повторите выбор")
         live = load_json(cfg_path)
         old_ip = current_upstream(live)
         try:
@@ -559,9 +710,7 @@ def apply_candidate(server_cfg, proxy_row, probe_res, log=print, _locked=False,
                     "http_port": probe_res.get("http_port"),
                     "selection_source": selection_source,
                     "promote_role": proxy_row.get("role") == "off",
-                    "outbound_fingerprint": outbound_fingerprint(choose_outbounds(
-                        new_ip, proxy_row.get("user") or "", proxy_row.get("password") or "",
-                        probe_res.get("socks_port"), probe_res.get("http_port"))[:2]),
+                    "outbound_fingerprint": outbound_fingerprint(candidate_outbounds(proxy_row, probe_res, server_cfg)[:2]),
                 }
                 before_checksum = file_checksum(cfg_path)
                 key = (str(idempotency_key).strip() if idempotency_key else
@@ -586,7 +735,7 @@ def apply_candidate(server_cfg, proxy_row, probe_res, log=print, _locked=False,
                         if (outbound_fingerprint(load_json(cfg_path).get("outbounds", []))
                                 != desired["outbound_fingerprint"]):
                             raise ApplyError("повтор operation %s: целевое подключение не применено" % operation_id)
-                        verify = recovered.get("verify") or verify_egress()
+                        verify = recovered.get("verify") or verify_for(server_cfg)
                         if not verify.get("ok"):
                             raise ApplyError("повтор operation %s: свежая verify не прошла" % operation_id)
                         return {"ok": True, "old_ip": old_ip, "new_ip": new_ip,
@@ -624,19 +773,19 @@ def apply_candidate(server_cfg, proxy_row, probe_res, log=print, _locked=False,
                     pool.transition_operation(operation_id, "rolled_back", error=out)
                 raise ApplyError("sing-box check не прошёл после установки — конфиг возвращён:\n%s" % out)
 
-            log("  " + antiloop_replace(new_ip, old_ip, server_cfg.get("gw"), server_cfg.get("wan")))
-            if patch_boot_script(boot_script, old_ip, new_ip):
+            log("  " + antiloop_replace(new_ip, old_ip, server_cfg.get("gw"), server_cfg.get("wan"), server_cfg=server_cfg))
+            if patch_boot_for(server_cfg, boot_script, old_ip, new_ip):
                 log("  vpn-boot-setup.sh: %s -> %s" % (old_ip, new_ip))
 
             def rollback(why):
                 log("  ОТКАТ: %s" % why)
                 try:
                     atomic_copy_replace(backup, cfg_path)
-                    antiloop_replace(old_ip, new_ip, server_cfg.get("gw"), server_cfg.get("wan"))
-                    patch_boot_script(boot_script, new_ip, old_ip)
-                    ok = restart_singbox()
-                    carrier = wait_tun0()
-                    rollback_verify = verify_egress()
+                    antiloop_replace(old_ip, new_ip, server_cfg.get("gw"), server_cfg.get("wan"), server_cfg=server_cfg)
+                    patch_boot_for(server_cfg, boot_script, new_ip, old_ip)
+                    ok = restart_for(server_cfg)
+                    carrier = wait_for(server_cfg)
+                    rollback_verify = verify_for(server_cfg)
                     if ok and carrier and rollback_verify.get("ok") and pool is not None:
                         pool.transition_operation(operation_id, "rolled_back", error=why)
                 except Exception as rollback_error:
@@ -650,16 +799,16 @@ def apply_candidate(server_cfg, proxy_row, probe_res, log=print, _locked=False,
                                     "active" if ok else "НЕ ПОДНЯЛСЯ",
                                     rollback_verify.get("egress_ip")))
 
-            if not restart_singbox():
+            if not restart_for(server_cfg):
                 rc, jr = run_cmd(["journalctl", "-u", "sing-box", "-n", "15", "--no-pager"])
                 log(jr)
                 rollback("sing-box не поднялся после рестарта")
-            if not wait_tun0():
+            if not wait_for(server_cfg):
                 rollback("tun0 не получил carrier за 30 с")
 
             if pool is not None:
                 pool.transition_operation(operation_id, "verifying")
-            v = verify_egress()
+            v = verify_for(server_cfg)
             log("  verify: egress=%s cc=%s tg=%s" % (v["egress_ip"], v["exit_cc"], v["tg_code"]))
             if not v["ok"]:
                 rollback("verify: " + v["why"])
@@ -681,6 +830,9 @@ def compatible_backup(server_cfg, backup):
         return backup
     original = load_json(backup)
     candidate = migrate(original)
+    import dns_policy
+    if dns_policy.strict(live):
+        candidate = dns_policy.prepare(server_cfg, candidate, "provider_strict")
     if candidate == original:
         return backup
     encoded = json.dumps(candidate, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -744,7 +896,7 @@ def rollback_from_ring(server_cfg, backup_path=None, log=print, _locked=False,
                     if current.get("phase") in ("verifying", "committed") and recovered.get("ok"):
                         if file_checksum(cfg_path) != target_checksum:
                             raise ApplyError("повтор operation %s: целевой backup не применён" % operation_id)
-                        verify = recovered.get("verify") or verify_egress()
+                        verify = recovered.get("verify") or verify_for(server_cfg)
                         if not verify.get("ok"):
                             raise ApplyError("повтор operation %s: свежая verify не прошла" % operation_id)
                         return {"ok": True, "backup": backup, "bad_ip": bad_ip,
@@ -764,21 +916,23 @@ def rollback_from_ring(server_cfg, backup_path=None, log=print, _locked=False,
             release_provider_billing_before_switch(
                 server_cfg, pool, load_json(cfg_path), load_json(backup), log=log)
             mutation_may_have_started = True
+            import dns_policy
+            dns_policy.guard_transition(server_cfg, load_json(backup))
             atomic_copy_replace(backup, cfg_path)
             if pool is not None:
                 pool.transition_operation(operation_id, "applied")
             log("  config.json <- %s" % os.path.basename(backup))
             if probe_mod.is_ipv4(good_ip):
-                log("  " + antiloop_replace(good_ip, bad_ip, server_cfg.get("gw"), server_cfg.get("wan")))
-                if patch_boot_script(boot_script, bad_ip, good_ip):
+                log("  " + antiloop_replace(good_ip, bad_ip, server_cfg.get("gw"), server_cfg.get("wan"), server_cfg=server_cfg))
+                if patch_boot_for(server_cfg, boot_script, bad_ip, good_ip):
                     log("  vpn-boot-setup.sh: %s -> %s" % (bad_ip, good_ip))
-            if not restart_singbox():
+            if not restart_for(server_cfg):
                 raise ApplyError("sing-box не поднялся после отката — нужен ручной разбор")
-            if not wait_tun0():
+            if not wait_for(server_cfg):
                 raise ApplyError("tun0 не получил carrier после отката")
             if pool is not None:
                 pool.transition_operation(operation_id, "verifying")
-            v = verify_egress()
+            v = verify_for(server_cfg)
             log("  verify: egress=%s cc=%s tg=%s" % (v["egress_ip"], v["exit_cc"], v["tg_code"]))
             # caller сначала фиксирует MANUAL/egress/event, затем commit_operation.
             if not v["ok"]:
@@ -802,14 +956,19 @@ def _restore_before(server_cfg, pool, operation, live_host, log):
             error="recovery: в backup-кольце нет before_checksum")
         return {"ok": False, "action": "failed", "operation_id": operation["id"]}
     old_host = desired.get("from_host") or current_upstream(load_json(before))
+    import dns_policy
+    dns_policy.guard_transition(server_cfg, load_json(before))
     atomic_copy_replace(before, cfg_path)
     if probe_mod.is_ipv4(old_host):
-        antiloop_replace(old_host, live_host, server_cfg.get("gw"), server_cfg.get("wan"))
+        antiloop_replace(old_host, live_host, server_cfg.get("gw"), server_cfg.get("wan"), server_cfg=server_cfg)
         patch_boot_script(server_cfg.get("boot_script") or
                           "/usr/local/bin/vpn-boot-setup.sh", live_host, old_host)
-    restarted = restart_singbox()
-    carrier = wait_tun0()
-    verify = verify_egress()
+    restarted = restart_for(server_cfg)
+    if not restarted and dns_policy.strict(load_json(server_cfg["singbox_config"])):
+        return {"ok": False, "action": "deferred", "operation_id": operation["id"],
+                "verify": {"ok": False, "why": "Строгое ядро не запущено; контур закрыт"}}
+    carrier = wait_for(server_cfg)
+    verify = verify_for(server_cfg)
     detail = "recovery rollback: sing-box=%s; verify=%s" % (restarted, verify.get("why") or "ok")
     if restarted and carrier and verify.get("ok"):
         pool.transition_operation(operation["id"], "rolled_back", error=detail)
@@ -821,16 +980,21 @@ def _restore_before(server_cfg, pool, operation, live_host, log):
 
 def _converge_before_side_effects(server_cfg, pool, operation, live_host, log):
     """Live уже before, но kill мог оставить routes/boot/service в after."""
+    import dns_policy
+    dns_policy.guard_transition(server_cfg)
     desired = operation.get("desired_state") or {}
     old_host = desired.get("from_host")
     target_host = desired.get("to_host") or live_host
     if probe_mod.is_ipv4(old_host):
-        antiloop_replace(old_host, target_host, server_cfg.get("gw"), server_cfg.get("wan"))
+        antiloop_replace(old_host, target_host, server_cfg.get("gw"), server_cfg.get("wan"), server_cfg=server_cfg)
         patch_boot_script(server_cfg.get("boot_script") or
                           "/usr/local/bin/vpn-boot-setup.sh", target_host, old_host)
-    restarted = restart_singbox()
-    carrier = wait_tun0()
-    verify = verify_egress()
+    restarted = restart_for(server_cfg)
+    if not restarted and dns_policy.strict(load_json(server_cfg["singbox_config"])):
+        return {"ok": False, "action": "deferred", "operation_id": operation["id"],
+                "verify": {"ok": False, "why": "Строгое ядро не запущено; контур закрыт"}}
+    carrier = wait_for(server_cfg)
+    verify = verify_for(server_cfg)
     if restarted and carrier and verify.get("ok"):
         pool.transition_operation(operation["id"], "rolled_back",
                                   error="recovery: before-config и side effects подтверждены")
@@ -849,6 +1013,9 @@ def recover_operation(server_cfg, pool, operation, log=print, _locked=False,
     before/after checksum. Неизвестный третий конфиг оставляется нетронутым и
     фиксируется как failed/superseded — его будет разбирать desired reconciler.
     """
+    if operation.get("kind") == "dns-policy":
+        import dns_policy
+        return dns_policy.recover(server_cfg, pool, operation, _locked=_locked)
     operation_id = operation.get("id")
     phase = operation.get("phase")
     if phase in ("committed", "rolled_back", "failed"):
@@ -902,6 +1069,8 @@ def recover_operation(server_cfg, pool, operation, log=print, _locked=False,
             try:
                 if not target or file_checksum(target) != after:
                     raise OSError("target backup недоступен или checksum изменился")
+                import dns_policy
+                dns_policy.guard_transition(server_cfg, load_json(target))
                 atomic_copy_replace(target, cfg_path)
                 live_checksum = file_checksum(cfg_path)
                 live_host = current_upstream(load_json(cfg_path))
@@ -919,17 +1088,23 @@ def recover_operation(server_cfg, pool, operation, log=print, _locked=False,
         # маршруты/boot/service и verify, затем commit или точный rollback.
         if phase == "staged":
             pool.transition_operation(operation_id, "applied")
+        import dns_policy
+        strict_recovery = dns_policy.strict(load_json(cfg_path))
+        if strict_recovery:
+            dns_policy.guard_transition(server_cfg)
         desired = operation["desired_state"]
         target_host = desired.get("to_host") or live_host
         from_host = desired.get("from_host")
         if probe_mod.is_ipv4(target_host):
-            antiloop_replace(target_host, from_host, server_cfg.get("gw"), server_cfg.get("wan"))
+            antiloop_replace(target_host, from_host, server_cfg.get("gw"), server_cfg.get("wan"), server_cfg=server_cfg)
             patch_boot_script(server_cfg.get("boot_script") or
                               "/usr/local/bin/vpn-boot-setup.sh", from_host, target_host)
-        if phase == "verifying":
+        if phase == "verifying" and not strict_recovery:
+            # Strict retries must re-establish core and firewall together;
+            # a prior interruption can leave their effective policies apart.
             # До этой фазы restart+carrier уже подтверждены. При потере ответа
             # сначала повторяем только verify; успешный retry не дёргает сервис.
-            verify = verify_egress()
+            verify = verify_for(server_cfg)
             if verify.get("ok"):
                 if finalize_apply is None:
                     return {"ok": True, "action": "post-state-pending",
@@ -938,12 +1113,15 @@ def recover_operation(server_cfg, pool, operation, log=print, _locked=False,
                 pool.transition_operation(operation_id, "committed")
                 return {"ok": True, "action": "committed",
                         "operation_id": operation_id, "verify": verify}
-        restarted = restart_singbox()
-        carrier = wait_tun0()
+        restarted = restart_for(server_cfg)
+        if not restarted and strict_recovery:
+            return {"ok": False, "action": "deferred", "operation_id": operation_id,
+                    "verify": {"ok": False, "why": "Строгое ядро не запущено; контур закрыт"}}
+        carrier = wait_for(server_cfg)
         current = pool.get_operation(operation_id=operation_id)
         if current["phase"] == "applied":
             pool.transition_operation(operation_id, "verifying")
-        verify = verify_egress()
+        verify = verify_for(server_cfg)
         if restarted and carrier and verify.get("ok"):
             # Любой source имеет caller-state (как минимум event/mark_used).
             # Внутренний exact retry возвращает verifying; commit выполнит caller.

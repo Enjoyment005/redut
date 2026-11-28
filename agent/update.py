@@ -633,6 +633,54 @@ def _singbox_ok(cfg):
     return rc == 0, (err or out or "").strip()[:200]
 
 
+def _contour_update_state(cfg):
+    """Read-only snapshot; an absent second contour has no extra requirements."""
+    import contours
+    import hashlib
+    try:
+        registry = contours.read(cfg)
+        if not registry["secondary"]:
+            return None
+        if registry["secondary"] != "ready":
+            return {"error": "операция второго контура не завершена"}
+        child = contours.config(cfg)
+        p = contours.paths(cfg)
+        hashes = {}
+        for key in ("config", "singbox", "dnsmasq"):
+            with open(p[key], "rb") as handle:
+                hashes[key] = hashlib.sha256(handle.read()).hexdigest()
+        direct = os.path.exists(child["emergency_intent"])
+        return {"assignments": registry["assignments"], "files": hashes,
+                "direct": direct,
+                "units": {u: _is_active(u) for u in
+                          (contours.SERVICE, contours.DNS_SERVICE, contours.GUARD_SERVICE)},
+                "health": contours.health(child, direct=direct),
+                "dns": contours.verify_dns(child) if _is_active(contours.SERVICE) and not direct else None}
+    except (OSError, ValueError, KeyError):
+        return {"error": "состояние второго контура недоступно"}
+
+
+def _verify_contour(cfg, before):
+    now = _contour_update_state(cfg)
+    if before is None:
+        return (now is None, "состав контуров изменился после обновления" if now is not None else "")
+    if before.get("error") or not now or now.get("error"):
+        return False, "второй контур недоступен или его операция не завершена"
+    for key in ("assignments", "files", "direct"):
+        if now.get(key) != before.get(key):
+            return False, "настройки второго контура изменились: " + key
+    for unit, active in before["units"].items():
+        if active and not now["units"].get(unit):
+            return False, "служба второго контура остановлена: " + unit
+    if before["health"].get("ok") and not now["health"].get("ok"):
+        return False, "маршрут второго контура не восстановлен"
+    if before.get("dns") and not now.get("dns"):
+        return False, "DNS второго контура не восстановлен"
+    import contours
+    ok, _ = _singbox_ok(contours.config(cfg))
+    return ok, "" if ok else "конфигурация ядра второго контура не прошла проверку"
+
+
 def baseline_health(cfg):
     return {"units": {u: _is_active(u) for u in UNITS},
             "peers": _wg_peers(),
@@ -640,6 +688,7 @@ def baseline_health(cfg):
             "kernel_path": _kernel_path_state(),
             "dns": _dns_update_state(cfg),
             "intent": _network_intent_state(cfg),
+            "contour": _contour_update_state(cfg),
             "panel": _panel_ok((cfg or {}).get("panel_port") or 8443)}
 
 
@@ -656,9 +705,13 @@ def hard_ok(baseline):
         dns and dns.get("phase") == "idle" and not dns.get("rescue_unit")
         and (dns.get("dnsmasq") is not False)))
     peer_ok = "peer_map" not in baseline or baseline.get("peer_map") is not None
+    second = baseline.get("contour")
+    contour_ok = not second or (not second.get("error") and
+                  (not second.get("assignments") or
+                   (second["health"].get("ok") and (second.get("direct") or second.get("dns")))))
     return bool(baseline["units"].get("sing-box") and baseline["units"].get("vpn-panel")
                 and baseline["panel"] and peer_ok
-                and kernel_ok and dns_ok)
+                and kernel_ok and dns_ok and contour_ok)
 
 
 def _brief_health(b):
@@ -715,6 +768,10 @@ def _verify_once(cfg, baseline):
         now_intent = _network_intent_state(cfg)
         if now_intent != baseline["intent"]:
             return False, "network intent изменился: было %r, стало %r" % (baseline["intent"], now_intent)
+    if "contour" in baseline:
+        ok, why = _verify_contour(cfg, baseline["contour"])
+        if not ok:
+            return False, why
     if not _panel_ok((cfg or {}).get("panel_port") or 8443):
         return False, "панель не отвечает по HTTPS"
     return True, ""
@@ -938,6 +995,15 @@ def _apply_install(cfg, pool, alerter, log, target, manual, res, baseline,
     """Установка скачанного дерева + проверка + откат. Вызывается под ДВУМЯ локами
     (redut-update и vpn-agent)."""
     local = res["from"]
+    if (baseline.get("contour") or {}).get("error"):
+        res["why"] = "Восстановите незавершённую операцию второго контура перед обновлением"
+        status_write("error", why=res["why"], to=target)
+        return res
+    import contours
+    if contours.read(cfg)["secondary"] and not os.path.isfile(os.path.join(REDUT_NEW, "agent", "contours.py")):
+        res["why"] = "В загруженной версии нет поддержки второго контура; обновление отклонено"
+        status_write("error", why=res["why"], to=target)
+        return res
 
     status_write("backup", to=target, frm=local)
     src_ver = node_version(paths=[os.path.join(REDUT_SRC, "VERSION")]) \

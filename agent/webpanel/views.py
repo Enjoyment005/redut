@@ -397,6 +397,31 @@ _MAP_CC = {
 # ─────────────────────────── дашборд ────────────────────────────────────
 _DASH_HTML = """
 <div class="wrap">
+  <style>
+    .contour-tabs{display:flex;align-items:end;gap:5px;border-bottom:1px solid var(--bd,#34404e);margin-bottom:20px}
+    .contour-tab{border:1px solid #3b5360;border-radius:12px 12px 0 0;background:#142b30;color:#c8f4e6;padding:12px 20px;text-decoration:none;cursor:pointer;font:inherit}
+    .contour-tab.violet{background:#352349;border-color:#8056a6;color:#f1dfff}
+    .contour-tab[aria-selected="true"]{border-bottom:3px solid currentColor;font-weight:700}
+    .contour-plus{font-size:25px;padding:3px 13px;margin-bottom:5px}
+    #contour-create{color:inherit;background:#17222c;border:1px solid #8056a6;border-radius:14px;max-width:480px;width:calc(100% - 40px);padding:24px}
+    #contour-create::backdrop{background:#0009} .contour-actions{display:flex;gap:10px;margin-top:18px}
+    .client-contour{margin-right:8px;max-width:130px}
+  </style>
+  <div id="contour-tabs" class="contour-tabs" role="tablist" aria-label="Контуры"></div>
+  <dialog id="contour-create" aria-labelledby="contour-create-title">
+    <form onsubmit="createContour(event)">
+      <h2 id="contour-create-title">Добавить 2 контур</h2>
+      <p>ZenXNet · отдельный выход и своя автоматика.</p>
+      <label for="contour-url">Ссылка подписки</label>
+      <input id="contour-url" type="password" autocomplete="off" placeholder="Вставьте ссылку ZenXNet">
+      <p class="sub">Если подписка уже добавлена, оставьте поле пустым. При первом подключении РЕДУТ займёт один слот устройства подписки.</p>
+      <p class="sub">После создания выберите сервер или автоматику и назначьте устройства.</p>
+      <div class="contour-actions"><button id="contour-submit" class="btn g" type="submit">Создать контур</button>
+      <button class="btn s" type="button" onclick="closeContourForm()">Отмена</button></div>
+      <p id="contour-error" role="alert" class="bad"></p>
+    </form>
+  </dialog>
+
   <div class="top">
     <div class="brand">VPN&nbsp;PANEL · <span id="srv">__SRV__</span>
       <small><span id="subline">соединяюсь с сервером…</span><span class="cursor"></span></small>
@@ -425,6 +450,9 @@ _DASH_HTML = """
   <div id="beacon" class="beacon"><div class="dot"></div>
     <div><div class="ttl">Проверяю состояние…</div><div class="txt">Читаю данные с сервера.</div></div></div>
 
+  <div id="selected-channel" class="sub" style="margin:8px 0" aria-live="polite"></div>
+  <div id="selection-feedback" class="step" role="status" aria-live="polite" hidden></div>
+
   <div class="card fold geo" id="card_geo">
     <h2 onclick="foldClick(event,'geo')">Карта выхода<span class="sub" id="sum_geo"></span><span class="r"><span class="arr" id="fa_geo">▾</span></span></h2>
     <div class="fold-body">
@@ -433,7 +461,7 @@ _DASH_HTML = """
       переключиться, а пунктир между ними — эти самые запасные пути. Сама картинка нарисована прямо
       в панели по встроенным данным: браузер наружу ничего не запрашивает и точку ставит <b>по
       стране</b>, а не по адресу — точнее geoip всё равно не знает.
-      <b>Слева внизу — паспорт IP</b>: сервер один раз на адрес спрашивает публичные гео- и
+      <b>Слева внизу — паспорт IP</b>: сервер запрашивает публичные гео- и
       антифрод-базы и показывает, что о нём известно, — оператор и сеть (ASN), датацентр ли это,
       город, пояс, PTR, а ниже — <b>риск-разведка</b>: светится ли адрес как прокси/VPN/Tor
       (proxycheck, IPQS), баллы риска и жалобы (0–100, меньше — лучше), числится ли в
@@ -450,6 +478,7 @@ _DASH_HTML = """
       <div class="intel" id="geointel" style="display:none"></div>
       <div class="hud"><span id="geoxy">LAT — · LON —</span><span id="geowho"></span></div>
     </div>
+    <div class="sub geo-attribution">РЕДУТ использует <a href="https://www.ip2location.io" target="_blank" rel="noopener noreferrer">IP2Location.io — геолокация IP</a>. Резерв: ipwho.is.</div>
     </div>
   </div>
 
@@ -524,6 +553,7 @@ _DASH_HTML = """
       <b>Россия, Украина и Беларусь запрещены навсегда</b> — такие прокси не покупаются и не используются.
       Страны с плохой оценкой автоматика сама не покупает, но ты можешь выбрать любую вручную.</div>
     <div class="field"><label>Тип прокси</label><select id="poolfamily" onchange="loadPool()"><option value="">Все</option><option value="datacenter">ProxyWing · обычные Datacenter</option><option value="isp">ProxyWing · ISP</option></select></div>
+    <div id="pool-feedback" class="step" role="status" aria-live="polite" hidden></div>
     <div class="scroll"><table id="pool"><thead><tr>
       <th>прокси</th><th>страна<i class="q" tabindex="0" data-h="Фактическая страна выхода по geoip и её оценка. Если провайдер продал прокси как одну страну, а выход из другой — панель покажет обе.">?</i></th>
       <th>адрес</th>
@@ -560,6 +590,43 @@ _DASH_HTML = """
       <div class="sub" id="qrname" style="margin-top:6px"></div>
       <button class="btn s tiny" style="margin-top:8px" onclick="document.getElementById('qrpanel').style.display='none'">Скрыть QR</button>
     </div>
+    </div>
+  </div>
+
+  <div class="card fold folded" id="card_dns">
+    <h2 onclick="foldClick(event,'dns')">DNS контура<span class="sub" id="sum_dns"></span><span class="r"><span class="arr" id="fa_dns">▸</span></span></h2>
+    <div class="fold-body">
+      <div class="ex">DNS выбирается отдельно для этой вкладки и следует за выбранным сервером при ручном и автоматическом переключении.</div>
+      <label for="dns-mode">Как определять адреса сайтов</label>
+      <select id="dns-mode" aria-describedby="dns-mode-help" style="max-width:100%;margin:8px 8px 8px 0" onchange="updateDNSPolicyHelp()" disabled>
+        <option value="provider">DNS провайдера — на стороне прокси</option>
+        <option id="dns-strict-option" value="provider_strict" hidden disabled>Провайдер — строгий</option>
+        <option value="cloudflare">Cloudflare — через прокси</option>
+      </select>
+      <button class="btn g" id="dns-save" onclick="saveDNSPolicy(this)" disabled>Применить DNS</button>
+      <div class="sub" id="dns-state" role="status" aria-live="polite"></div>
+      <div class="sub" style="margin-top:8px">Выбор вступит в силу после нажатия «Применить DNS».</div>
+      <div class="sub" id="dns-mode-help" aria-live="polite" style="margin-top:10px">
+        <div id="dns-provider-help" style="display:none"><b>DNS провайдера:</b> адреса сайтов определяет сервер выхода; страна DNS зависит от провайдера.
+          Доменные исключения и служебные DNS-записи обрабатывает Cloudflare через этот контур.
+          Исключения по российским IP для остальных имён не действуют.</div>
+        <div id="dns-cloudflare-help" style="display:none"><b>Cloudflare:</b> адреса сайтов определяет Cloudflare по защищённому соединению через выбранный прокси.
+          Сохраняются обычные DNS-ответы и исключения по IP. Страна DNS может отличаться от страны выхода.</div>
+        <div id="dns-strict-help" style="display:none"><b>Провайдер — строгий:</b> адреса сайтов определяет выбранный провайдер; запасного DNS, российских исключений и аварийного прямого выхода нет.
+          Страна DNS зависит от провайдера. IPv6-ответы отключены; TXT, MX, SRV и другие служебные записи отклоняются — часть приложений может не работать.</div>
+      </div>
+      <div id="dns-proxy" style="display:none;margin-top:10px">
+        <label for="dns-proxy-endpoint">Прокси 2 контура для браузера — HTTP или SOCKS5</label>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:7px">
+          <input id="dns-proxy-endpoint" class="mono" readonly style="width:220px" aria-label="Адрес прокси второго контура">
+          <button class="btn s tiny" type="button" onclick="copyDNSProxy()">Скопировать адрес</button>
+        </div>
+        <div class="sub" style="margin-top:7px">Доступен только устройствам, подключённым к WireGuard 2 контура.
+          Укажите этот адрес в настройках прокси браузера или Windows: имена сайтов будут передаваться ZenXNet так же, как при прямом подключении к прокси.</div>
+      </div>
+      <div class="ex">Для DNS этого контура отключите Secure DNS в браузере и собственный DNS приложений:
+        WireGuard сам по себе не перехватывает произвольный DoH. IPv6 вне WireGuard сервер не контролирует — отключите его на устройстве, если он идёт мимо VPN.
+        При применении соединения этого контура кратковременно переподключатся.</div>
     </div>
   </div>
 
@@ -698,9 +765,53 @@ _DASH_HTML = """
 <div id="toast"></div>
 <script>
 const CSRF=__CSRFJS__;
+
+const CONTOUR=new URLSearchParams(window.location.search).get('contour')==='2'?'2':'1';
+let CONTOUR_DATA=null;
+async function loadContours(){
+  try{const r=await api('/api/contours',{headers:{'X-Redut-Contour':'1'}});CONTOUR_DATA=r;
+    if(CONTOUR==='2'&&!r.contours.some(c=>c.id==='2')){window.location.replace('/?contour=1');return}
+    const bar=document.getElementById('contour-tabs');bar.replaceChildren();
+    for(const c of r.contours){const tab=document.createElement('a');tab.className='contour-tab'+(c.id==='2'?' violet':'');
+      tab.setAttribute('role','tab');tab.setAttribute('aria-selected',String(c.id===CONTOUR));tab.href='/?contour='+c.id;tab.textContent=c.name;bar.appendChild(tab)}
+    if(r.can_create){const plus=document.createElement('button');plus.className='btn s contour-plus';plus.textContent='+';plus.title='Добавить контур';
+      plus.setAttribute('aria-label','Добавить контур');plus.onclick=()=>document.getElementById('contour-create').showModal();bar.appendChild(plus)}
+    if(CONTOUR==='2'){const del=document.createElement('button');del.className='btn s tiny';del.textContent='Удалить контур';del.onclick=deleteContour;bar.appendChild(del)}
+  }catch(e){toast('Контуры: '+e.message,'bad')}
+}
+function closeContourForm(){document.getElementById('contour-url').value='';document.getElementById('contour-error').textContent='';document.getElementById('contour-create').close()}
+async function createContour(event){event.preventDefault();const button=document.getElementById('contour-submit');if(button.disabled)return;
+  button.disabled=true;document.getElementById('contour-error').textContent='';
+  try{await api('/api/contours',{method:'POST',headers:{'Content-Type':'application/json','X-Redut-Contour':'1'},
+    body:JSON.stringify({url:document.getElementById('contour-url').value.trim()})});closeContourForm();window.location.assign('/?contour=2')}
+  catch(e){document.getElementById('contour-error').textContent=e.message}finally{button.disabled=false}}
+async function deleteContour(){if(!confirm('Удалить второй контур? Сначала перенесите его устройства в основной.'))return;
+  try{await api('/api/contours/delete',{method:'POST',headers:{'Content-Type':'application/json','X-Redut-Contour':'1'},body:'{}'});window.location.assign('/?contour=1')}
+  catch(e){toast(e.message,'bad')}}
+async function assignContour(pubkey,target){try{await api('/api/contours/assign',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({pubkey:pubkey,contour:target})});toast('Устройство переведено в '+(target==='2'?'2 контур':'основной контур'),'ok')}
+  catch(e){toast(e.message,'bad')}await loadClients()}
+document.getElementById('contour-create').addEventListener('cancel',()=>{document.getElementById('contour-url').value=''});
+
 function esc(s){return (s==null?'':''+s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function toast(t,cls){const d=document.createElement('div');d.className='msg '+(cls||'');d.textContent=t;
-  document.getElementById('toast').appendChild(d);setTimeout(()=>d.remove(),9000)}
+function toast(t,cls,ms=9000){const d=document.createElement('div');d.className='msg '+(cls||'');d.textContent=t;
+  document.getElementById('toast').appendChild(d);if(ms>0)setTimeout(()=>d.remove(),ms);return d}
+let __selectionBusy=false;
+const __poolRows=new Map();
+function selectionControls(){document.querySelectorAll('[data-select-channel]').forEach(b=>{
+  b.disabled=__selectionBusy||b.dataset.unavailable==='1';
+  b.setAttribute('aria-busy',__selectionBusy?'true':'false')})}
+function selectionFeedback(text,cls){for(const id of ['selection-feedback','pool-feedback']){
+  const el=document.getElementById(id);if(!el)continue;el.hidden=false;el.className='step '+(cls||'');el.textContent=text}}
+function channelName(p){return p?(p.label||((p.country?country(p.country)+' · ':'')+p.host)):'канал'}
+function channelGeo(p,cc){return p&&p.country&&cc&&p.country!==cc
+  ?' В каталоге: '+country(p.country)+'; GeoIP: '+country(cc)+'. Геолокация IP отличается от названия провайдера.':''}
+function renderSelectedChannel(s){const el=document.getElementById('selected-channel');if(!el)return;
+  const p=s.selected_channel;el.hidden=!p;if(!p){el.textContent='';return}
+  el.textContent=(s.selection_mode==='manual'?'Закреплён вручную: ':'Выбран автоматикой: ')+channelName(p)+
+    ' · '+p.host+'.'+channelGeo(p,s.egress_cc);
+  el.className=channelGeo(p,s.egress_cc)?'sub warn':'sub'}
+
 /* ── подсказки: одно облачко на всю страницу, позиционируем сами ──
    Делегирование, потому что «?» рождаются и в JS (плитки, строки пула).
    Кроме кружков .q облачко показывают и элементы с data-h (кнопки тулбара,
@@ -747,13 +858,14 @@ const FOLDS={
   money:{def:1,load:()=>loadMoney()},
   pool:{def:1,load:()=>loadPool()},
   clients:{def:1,always:1,load:()=>loadClients()},
+  dns:{def:1,load:()=>loadDNSPolicy()},
   settings:{def:1,load:()=>loadProviderAutoRenew()},
   strategy:{def:1,load:()=>loadStrategy()},
   keys:{def:1,load:()=>loadKeys()},
   upd:{def:1,load:()=>loadUpd()},
   events:{def:1,load:()=>loadEvents()},
   metrics:{def:1,load:()=>loadMetrics()}};
-const FOLD_ORDER=['status','money','pool','clients','settings','strategy','keys','upd','events','metrics'];
+const FOLD_ORDER=['status','money','pool','clients','dns','settings','strategy','keys','upd','events','metrics'];
 const FOLD_MEM={}; /* фолбэк на сессию, когда localStorage запрещён — иначе разделы не развернуть вовсе */
 function isFolded(id){try{const v=localStorage.getItem('vpnpanel-fold-'+id);
   if(v==='0')return false;if(v==='1')return true}catch(e){}
@@ -953,7 +1065,7 @@ function intelHtml(ip,d){
   else{const seen=[];
     if(d.pc_proxy)seen.push('proxycheck: '+esc(d.pc_type||'прокси'));
     if(d.ipqs_vpn)seen.push('IPQS: VPN');
-    if(d.proxy&&!seen.length)seen.push('ip-api: прокси');
+    if(d.proxy&&!seen.length)seen.push(esc(d.src||'GeoIP')+': прокси');
     px=seen.length?('<span class="warn">'+seen.join(' · ')+'</span>')
       :((d.pc_proxy===false||d.ipqs_vpn===false||d.proxy===false)?'<span class="ok">не светится</span>':'')}
   /* строка «риск»: баллы источников 0-100 (меньше = лучше) */
@@ -977,6 +1089,8 @@ function intelHtml(ip,d){
     intelRow('сеть',asn)+
     intelRow('оператор',op)+
     intelRow('город',place)+
+    intelRow('геолокация',d.geo_status==='unavailable'?'временно недоступна':(d.geo_status==='conflict'?'базы расходятся':''))+
+    intelRow('источник',d.src)+
     intelRow('пояс',d.tz?(d.tz+(time?(' · там '+time):'')):'')+
     intelRow('ptr',d.ptr)+
     intelRow('тип',typ)+
@@ -989,21 +1103,25 @@ async function geoIntel(s){const el=document.getElementById('geointel');if(!el)r
   const ip=(s&&s.egress_at&&s.egress)||'';
   if(!ip){el.style.display='none';window.__IPINTEL=null;return}
   if(isFolded('geo'))return;                                  /* свёрнутая карта запрос не тратит */
-  if(window.__IPINTEL&&window.__IPINTEL.ip===ip)return;       /* уже показан этот адрес */
+  if(window.__IPINTEL&&window.__IPINTEL.ip===ip&&Date.now()-window.__IPINTEL.at<300000)return;       /* уже показан этот адрес */
   if(window.__IPINTEL){window.__IPINTEL=null;el.style.display='none'} /* адрес сменился — чужой паспорт убрать */
   if(window.__IPINTEL_BUSY)return;
   const f=window.__IPINTEL_FAIL;
   if(f&&f.ip===ip&&Date.now()-f.at<300000)return;
   window.__IPINTEL_BUSY=1;
+  const requestedContour=CONTOUR;
   try{const r=await api('/api/ipinfo');
-    if(r.ok&&r.intel&&r.ip===ip){window.__IPINTEL={ip:ip,intel:r.intel};
-      el.innerHTML=intelHtml(ip,r.intel);el.style.display='block'}
-    else window.__IPINTEL_FAIL={ip:ip,at:Date.now()}}
+    if(CONTOUR!==requestedContour||(window.__S&&window.__S.egress!==ip))return;
+    if(r.ok&&r.intel&&r.ip===ip){window.__IPINTEL={ip:ip,intel:r.intel,at:Date.now()};
+      el.innerHTML=intelHtml(ip,r.intel);el.style.display='block';
+      if(window.__S&&r.intel.cc){window.__S.egress_cc=r.intel.cc;geoSync(window.__S);renderSelectedChannel(window.__S)}}
+    else{window.__IPINTEL_FAIL={ip:ip,at:Date.now()};
+      el.textContent='Геолокация временно недоступна';el.style.display='block'}}
   catch(e){window.__IPINTEL_FAIL={ip:ip,at:Date.now()}}
   finally{window.__IPINTEL_BUSY=0}}
 document.addEventListener('visibilitychange',()=>{document.hidden?geoStop():geoStart()});
 window.addEventListener('resize',()=>{GEO.W=0;if(!GEO.run)geoDraw(0)});
-async function api(path,opts){opts=opts||{};opts.headers=Object.assign({'X-CSRF-Token':CSRF},opts.headers||{});
+async function api(path,opts){opts=opts||{};opts.headers=Object.assign({'X-CSRF-Token':CSRF,'X-Redut-Contour':typeof CONTOUR==='undefined'?'1':CONTOUR},opts.headers||{});
   const r=await fetch(path,opts);const t=await r.text();let j;try{j=JSON.parse(t)}catch(e){j={error:t}}
   if(!r.ok){const err=new Error(j.error||('HTTP '+r.status));Object.assign(err,j);throw err}return j}
 function fl(v){return v===1?'<span class="ok">✓</span>':v===0?'<span class="bad">✕</span>':'<span class="mut">·</span>'}
@@ -1187,7 +1305,7 @@ function beacon(s,clients){
   b.className='beacon '+cls;
   b.innerHTML='<div class="dot"></div><div><div class="ttl">'+ttl+'</div><div class="txt">'+txt+'</div>'+hygieneLines(s)+'</div>'}
 
-async function loadStatus(){const s=await api('/api/status');window.__S=s;
+async function loadStatus(){const s=await api('/api/status');window.__S=s;renderSelectedChannel(s);
   document.getElementById('subline').textContent=
     'узел '+s.role+' · Редут '+(s.version||'?')+' · сеть '+s.subnet+' · sing-box '+s.singbox+' · прокси в пуле: '+s.pool_alive;
   /* заголовок свернутой карточки стратегий: название активной — из статуса,
@@ -1264,13 +1382,13 @@ function maybeRecheck(s){
 /* API ProxyWing использует составной технический id: family|order|proxy.
    В таблице оставляем только узнаваемый хвост proxy-id, полный uid доступен
    по наведению и по-прежнему передаётся кнопкам без сокращения. */
-function proxyLabel(p){
+function proxyLabel(p){if(p.protocol==='vless'&&p.label)return p.label;
   const raw=(p.uid||'').replace(/^proxy6:|^proxyline:|^proxywing:/,'');
   if(p.provider!=='proxywing')return raw;
   const a=raw.split('|'),family=a[0]==='datacenter'?'Datacenter':'ISP',leaf=a[2]||a[1]||raw;
   return family+' · …'+leaf.slice(-6)}
 
-async function loadPool(){const rows=(await api('/api/pool')).proxies;const tb=document.querySelector('#pool tbody');tb.innerHTML='';
+async function loadPool(){const rows=(await api('/api/pool')).proxies;__poolRows.clear();for(const p of rows)__poolRows.set(p.uid,p);const tb=document.querySelector('#pool tbody');tb.innerHTML='';
   /* П1: строки запрещённых стран не рендерим вовсе — только счётчик под таблицей,
      чтобы купленное не исчезало молча. Исключение: заблокированный боевой виден всегда. */
   const hidden=rows.filter(p=>p.blocked&&!p.is_current);
@@ -1284,10 +1402,10 @@ async function loadPool(){const rows=(await api('/api/pool')).proxies;const tb=d
     const inact=!p.provider_active;
     const cc=p.exit_cc||p.country;
     const id=esc(proxyLabel(p));
-    const sold=(p.exit_cc&&p.country&&p.exit_cc!=p.country)?'продан как '+esc(country(p.country)):'';
+    const sold=(p.exit_cc&&p.country&&p.exit_cc!=p.country)?'в каталоге: '+esc(country(p.country)):'';
     const argue=(p.geo_agree===false)?'спор: '+esc(country(p.exit_cc))+'/'+esc(country(p.exit_cc_alt)):'';
-    const note=sold||argue;
-    const ports=(p.port_socks5||'—')+(p.port_http&&p.port_http!=p.port_socks5?('/'+p.port_http):'');
+    const note=[sold,argue].filter(Boolean).join(' · ');
+    const ports=p.protocol==='vless'?String(p.endpoint_port||'—'):(p.port_socks5||'—')+(p.port_http&&p.port_http!=p.port_socks5?('/'+p.port_http):'');
     tr.innerHTML=
       '<td title="'+esc(p.uid)+'">'+id+(p.is_current?' <span class="pill ok">боевой</span>':'')+(p.gone?' <span class="pill bad" title="Провайдер больше не отдаёт этот прокси. Строка держится только потому, что на ней сейчас стоит боевой канал (или провайдер ответил пустым списком и мы ждём подтверждения) — остальные снятые прокси панель убирает сама.">пропал</span>':'')+
         (inact?' <span class="pill warn" title="Ключ провайдера удалён: панель этим прокси не управляет. Боевой канал будет переключён по стратегии автоматически.">без ключа</span>':'')+
@@ -1298,22 +1416,22 @@ async function loadPool(){const rows=(await api('/api/pool')).proxies;const tb=d
       '<td>'+(p.score==null?'—':p.score)+
         (p.latency!=null?'<div class="sub" style="font-size:10px">'+p.latency+' мс</div>':'')+
         '<div class="flags" style="font-size:11px">'+
-        fl(p.socks_ok)+fl(p.http_ok)+fl(p.tg_ok)+'</div></td>'+
+        (p.protocol==='vless'?('VLESS '+fl(p.probe_ok)+' · TG '+fl(p.tg_ok)):fl(p.socks_ok)+fl(p.http_ok)+fl(p.tg_ok))+'</div></td>'+
       '<td>'+(p.days==null?'—':p.days+' дн')+
         '<div class="sub" style="font-size:10px">'+(p.last_probe?('тест '+esc(p.last_probe)):'не проверялся')+'</div></td>'+
       '<td><select data-uid="'+esc(p.uid)+'" onchange="setRole(this)">'+
         roles.map(r=>'<option'+(r==p.role?' selected':'')+'>'+r+'</option>').join('')+'</select></td>'+
       '<td><button class="btn s tiny" onclick="probe(this,\\''+esc(p.uid)+'\\')" title="Проверить прокси — безопасно, ничего не меняет">Тест</button> '+
-        '<button class="btn g tiny" onclick="apply(this,\\''+esc(p.uid)+'\\')"'+(inact?' disabled':'')+
+        '<button class="btn g tiny" data-select-channel data-unavailable="'+(inact?'1':'0')+'" onclick="apply(this,\\''+esc(p.uid)+'\\')"'+(inact?' disabled':'')+
         ' title="'+(inact?'У провайдера нет ключа — панель не управляет этим прокси':'Сделать боевым и закрепить вручную: проверка → переключение → проверка → автооткат. При отказе вернётся AUTO(speed)')+'">В бой</button> '+
-        '<button class="btn a tiny" onclick="prolong(this,\\''+esc(p.uid)+'\\')"'+(inact?' disabled':'')+
-        ' title="'+(inact?'У провайдера нет ключа — продлить нечем':'Продлить аренду — тратит деньги')+'">Продлить</button> '+
+        '<button class="btn a tiny" onclick="prolong(this,\\''+esc(p.uid)+'\\')"'+((inact||p.provider==='zenxnet')?' disabled':'')+
+        ' title="'+(p.provider==='zenxnet'?'Подписка продлевается в кабинете ZenXNet':inact?'У провайдера нет ключа — продлить нечем':'Продлить аренду — тратит деньги')+'">Продлить</button> '+
         '<button class="btn r tiny" onclick="del(this,\\''+esc(p.uid)+'\\')"'+((p.provider!='proxy6'||inact)?' disabled':'')+
         ' title="Удалить навсегда">Удалить</button></td>';
     tb.appendChild(tr)}
   if(!rows.length)tb.innerHTML='<tr><td colspan="7" class="mut">пул пуст — панель ещё не знает ни одного прокси. '+
     'Если ключ провайдера уже введён, нажми «Обновить пул»; если нет — впиши его ниже, в разделе '+
-    '«Ключи провайдеров прокси».</td></tr>'}
+    '«Ключи провайдеров прокси».</td></tr>';selectionControls()}
 
 async function loadEvents(){const evs=(await api('/api/events?limit=40')).events;const tb=document.querySelector('#events tbody');tb.innerHTML='';
   for(const e of evs){const tr=document.createElement('tr');
@@ -1573,29 +1691,46 @@ async function loadStrategy(){try{const r=await api('/api/strategy');
       '<div class="sub" style="margin-top:7px;white-space:normal">'+esc(s.desc)+'</div>'+
       '<div class="sub" style="margin-top:7px;white-space:normal">Сейчас с ней: '+buy+
       '; из нынешнего пула выбрало бы <b>'+pick+'</b></div>'+
-      (s.current?'':'<div style="margin-top:9px"><button class="btn g" onclick="setStrategy(\\''+esc(s.id)+
+      (s.current?'':'<div style="margin-top:9px"><button class="btn g" data-select-channel onclick="setStrategy(\\''+esc(s.id)+
         '\\',\\''+esc(s.title)+'\\')">Включить</button></div>')+
-      '</div>'}).join('')}
+      '</div>'}).join('');selectionControls()}
   catch(e){document.getElementById('strategies').innerHTML='<span class="bad">'+esc(e.message)+'</span>'}}
 
-async function setStrategy(id,title){
-  if(!confirm('Включить стратегию «'+title+'»?\\n\\nПанель сразу выберет лучший канал по новому правилу. '+
-    'Если сейчас включён ручной режим, его фиксация снимется. Если лучший — не текущий прокси, панель безопасно '+
-    'проверит новый, переключит сервер и сама откатится при провале.'))return;
-  try{const r=await api('/api/strategy',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({strategy:id})});
-    if(r.switch_started)toast('Стратегия «'+title+'» включена — переключаю на '+
-      esc((r.target||{}).host||'лучший канал')+' по схеме проверка → смена → проверка','warn');
-    else if(r.switch_error)toast('Стратегия включена, но переключение не запустилось: '+r.switch_error,'bad');
-    else toast((r.changed||r.mode_changed)?('Стратегия «'+title+'» включена; текущий канал уже лучший по этому правилу'):
-      'Эта стратегия и так была включена','ok');
-    await loadStrategy();await loadStatus();await loadMoney();await loadPool();
-    if(r.switch_started)setTimeout(async()=>{try{await reloadAll()}catch(_){}},15000)}
-  catch(e){toast('стратегия: '+e.message,'bad')}}
+async function setStrategy(id,title){if(__selectionBusy)return;
+  if(!confirm('Включить стратегию «'+title+'»?\\n\\nФиксация ручного сервера снимется. Панель выберет и проверит канал по этому правилу.'))return;
+  __selectionBusy=true;selectionControls();const message='Включаю «'+title+'». Проверяю выбранный автоматикой канал…';
+  selectionFeedback(message,'warn');const progress=toast(message,'warn',0);
+  try{const r=await api('/api/strategy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({strategy:id})});
+    if(r.switch_error)throw new Error('Стратегия сохранена, но проверка не запустилась: '+r.switch_error);
+    if(r.persist_error)throw new Error('Не удалось сохранить стратегию: '+r.persist_error);
+    const wanted=(r.revision||{}).desired;let state=r;
+    const finished=s=>s.attempt&&s.attempt.revision===wanted&&s.attempt.state==='done';
+    for(let n=0;(state.revision||{}).pending&&!finished(state)&&n<60;n++){
+      await new Promise(resolve=>setTimeout(resolve,3000));state=await api('/api/strategy');
+      if(state.revision.desired!==wanted)throw new Error('Выбор изменён в другой вкладке. Обновляю состояние.')}
+    const held=finished(state)&&state.attempt.ok&&state.attempt.action==='held';
+    if((state.revision||{}).pending&&!held)throw new Error(finished(state)
+      ?'Стратегия сохранена, но проверка не подтвердила выбор канала. Автоматика повторит попытку; текущий выход указан выше.'
+      :'Проверка ещё идёт. Текущий результат появится после обновления состояния.');
+    if(state.mode!=='auto'||state.current!==id)throw new Error('Активный режим изменился. Обновляю состояние.');
+    const status=await api('/api/status'),p=status.selected_channel,revision=status.selection_revision||{};
+    if(status.selection_mode!=='auto'||status.strategy!==id||revision.desired!==wanted)
+      throw new Error('Выбор изменён в другой вкладке. Обновляю состояние.');
+    if(revision.pending&&!(held&&status.selection_attempt&&status.selection_attempt.revision===wanted&&
+       status.selection_attempt.state==='done'&&status.selection_attempt.action==='held'&&status.selection_attempt.ok))
+      throw new Error('Проверка продолжается. Текущий результат появится после обновления состояния.');
+    const finalHeld=revision.pending===true;
+    const done='Автоматика «'+title+'» включена. '+(finalHeld?'Сохранён текущий канал по правилу стабильности: ':'Выбран ')+channelName(p)+
+      (status.egress?'. IP выхода: '+status.egress:'')+'.'+channelGeo(p,status.egress_cc);
+    selectionFeedback(done,finalHeld||channelGeo(p,status.egress_cc)?'warn':'ok');toast(done,finalHeld?'warn':'ok',20000)}
+  catch(e){selectionFeedback(e.message,'bad');toast('стратегия: '+e.message,'bad',20000)}
+  finally{if(progress)progress.remove();__selectionBusy=false;selectionControls();
+    try{await reloadAll()}catch(e){toast('Обновление состояния: '+e.message,'bad')}}}
 
 /* ── ключи провайдеров: вписать или заменить прямо здесь ──
    Сам ключ панель обратно не отдаёт: показываем только хвост, который приходит с сервера. */
 const PROV={
+  zenxnet:{t:'ZenXNet',h:'Подписка общая для обоих контуров. Добавьте свою ссылку подписки. При первом подключении РЕДУТ занимает один слот устройства. После загрузки выберите сервер вручную или разрешите нужные серверы для автоматики.'},
   proxy6:{t:'PROXY6',h:'Основной провайдер: панель умеет у него всё — купить, продлить, удалить; цены в рублях. '+
     'Ключ: кабинет proxy6.net → раздел «API». Если в кабинете включено ограничение API по IP, впиши туда адрес '+
     'этого сервера, иначе провайдер ответит «доступ с неверного IP».'},
@@ -1611,10 +1746,11 @@ async function loadKeys(){try{const r=await api('/api/key/status');
             :('<span class="pill warn">ключ не задан</span>'))+
       ' <span class="pill">прокси в пуле: '+p.alive+'</span>'+
       (p.balance?(' <span class="pill">баланс '+esc(p.balance)+'</span>'):'')+
+      (p.subscription&&p.subscription.expire?(' <span class="pill">до '+esc(new Date(p.subscription.expire*1000).toLocaleDateString('ru-RU'))+'</span>'):'')+
       '<div class="sub" style="margin-top:7px;white-space:normal">'+esc(m.h||'')+'</div>'+
       '<div class="field" style="margin-top:9px">'+
         '<div style="flex:1;min-width:230px"><label>'+(p.set?'заменить ключ':'вписать ключ')+'</label>'+
-        '<input id="k_'+esc(p.provider)+'" autocomplete="off" placeholder="вставь ключ из кабинета"></div>'+
+        '<input type="password" id="k_'+esc(p.provider)+'" autocomplete="off" placeholder="вставь ключ из кабинета"></div>'+
         '<button class="btn g" onclick="saveKey(\\''+esc(p.provider)+'\\')">Сохранить</button>'+
         (p.set?('<button class="btn s" onclick="checkKey(\\''+esc(p.provider)+'\\')" '+
                  'title="Спросить у провайдера баланс этим ключом — безопасно, ничего не меняет">Проверить</button>'+
@@ -1624,7 +1760,7 @@ async function loadKeys(){try{const r=await api('/api/key/status');
 
 async function saveKey(p){const el=document.getElementById('k_'+p);const k=(el.value||'').trim();
   if(!k)return toast('вставь ключ в поле слева от кнопки','bad');
-  if(!confirm('Сохранить новый ключ '+p+'?\\n\\nПанель сразу проверит его у провайдера. Дальше все покупки '+
+  if(p!=='zenxnet'&&!confirm('Сохранить новый ключ '+p+'?\\n\\nПанель сразу проверит его у провайдера. Дальше все покупки '+
     'и продления — и твои, и автоматики — пойдут через этот кабинет.'))return;
   const body=JSON.stringify({provider:p,key:k});
   toast('Проверяю ключ у провайдера…');
@@ -1636,15 +1772,15 @@ async function saveKey(p){const el=document.getElementById('k_'+p);const k=(el.v
       r=await api('/api/key',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({provider:p,key:k,force:true})})}
     el.value='';
-    toast(r.verified?('Ключ '+p+' сохранён и проверен — баланс '+r.balance+' '+(r.currency||''))
+    toast(p==='zenxnet'?('Подписка сохранена: серверов '+r.nodes):r.verified?('Ключ '+p+' сохранён и проверен — баланс '+r.balance+' '+(r.currency||''))
                     :('Ключ '+p+' сохранён без проверки: '+(r.error||'провайдер недоступен')),r.verified?'ok':'warn');
-    await loadKeys();await loadStatus()}
+    await loadKeys();await loadPool();await loadStatus()}
   catch(e){toast('ключ: '+e.message,'bad')}}
 
-async function checkKey(p){toast('Спрашиваю у '+p+' баланс этим ключом…');
+async function checkKey(p){toast(p==='zenxnet'?'Проверяю подписку ZenXNet…':'Спрашиваю у '+p+' баланс этим ключом…');
   try{const r=await api('/api/key/check',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({provider:p})});
-    toast(r.ok?('Ключ '+p+' рабочий — баланс '+r.balance+' '+(r.currency||''))
+    toast(r.ok?(p==='zenxnet'?('Подписка работает: серверов '+r.nodes):('Ключ '+p+' рабочий — баланс '+r.balance+' '+(r.currency||'')))
               :('Ключ '+p+' не сработал: '+(r.error||'')+
                 (r.network?' Похоже на недоступность сервиса с сервера, а не на плохой ключ.':'')),r.ok?'ok':'bad');
     await loadKeys();if(r.ok)await loadStatus()}catch(e){toast(e.message,'bad')}}
@@ -1686,7 +1822,7 @@ function updBar(live){const ph=live.phase||'check';
     (bad?('<span class="bad">'+esc(live.why||'проверка не прошла')+'</span> — узел возвращается на прежнюю версию, карточка покажет итог')
         :'панель может ненадолго перезапуститься — карточка сама дочитает итог')+
     '</div></div>'}
-async function loadUpd(){let r;try{r=await api('/api/update/status')}
+async function loadUpd(){if(CONTOUR==='2'){document.getElementById('upd').textContent='Обновление всего узла доступно во вкладке «Основной».';document.getElementById('updact').innerHTML='';return}let r;try{r=await api('/api/update/status')}
   catch(e){ /* панель могла перезапускаться посреди обновления — тихо пробуем ещё */
     if(window.__UPDBUSY&&!window.__UPDPOLL){window.__UPDPOLL=1;
       setTimeout(async()=>{window.__UPDPOLL=0;try{await loadUpd()}catch(_){}},3000);return}
@@ -1758,6 +1894,50 @@ async function toggleAuto(){const r0=window.__UPD||{};const to=!r0.auto;
     await loadUpd()}
   catch(e){toast('настройка: '+e.message,'bad')}}
 
+let DNS_BUSY=false;
+function updateDNSPolicyHelp(){
+  const mode=document.getElementById('dns-mode').value;
+  document.getElementById('dns-provider-help').style.display=mode==='provider'?'':'none';
+  document.getElementById('dns-cloudflare-help').style.display=mode==='cloudflare'?'':'none';
+  document.getElementById('dns-strict-help').style.display=CONTOUR==='2'&&mode==='provider_strict'?'':'none';
+}
+async function copyDNSProxy(){
+  const field=document.getElementById('dns-proxy-endpoint');
+  if(!field.value)return;
+  try{await navigator.clipboard.writeText(field.value);toast('Адрес прокси скопирован','ok')}
+  catch(_){field.focus();field.select();toast('Адрес выделен — скопируйте его вручную','warn')}
+}
+async function loadDNSPolicy(){
+  const r=await api('/api/dns-policy');
+  if(DNS_BUSY)return;
+  const title=r.mode==='provider_strict'?'Провайдер — строгий':r.mode==='provider'?'DNS провайдера':r.mode==='legacy'?'DNS сервера (старый режим)':'Cloudflare через прокси';
+  document.getElementById('sum_dns').textContent=' · '+title;
+  const strictOption=document.getElementById('dns-strict-option');
+  strictOption.hidden=CONTOUR!=='2';strictOption.disabled=CONTOUR!=='2';
+  document.getElementById('dns-mode').value=r.mode==='provider_strict'&&CONTOUR==='2'?'provider_strict':r.mode==='provider'?'provider':'cloudflare';
+  updateDNSPolicyHelp();
+  const endpoint=CONTOUR==='2'&&r.strict&&r.proxy_endpoint?r.proxy_endpoint:'';
+  document.getElementById('dns-proxy').style.display=endpoint?'':'none';
+  document.getElementById('dns-proxy-endpoint').value=endpoint;
+  const blocked=!r.available||r.emergency||r.pending;
+  document.getElementById('dns-mode').disabled=blocked;
+  document.getElementById('dns-save').disabled=blocked;
+  document.getElementById('dns-state').textContent=r.pending?'Идёт восстановление настройки DNS…':r.emergency?
+    'Включён аварийный прямой выход. Сначала отключите его, чтобы настроить DNS прокси.':!r.available?
+    'Сначала выберите работающий прокси в этом контуре.':r.mode==='legacy'?
+    'Сейчас используется DNS самого сервера (старый режим). Он сохранится, пока вы не примените другой режим для этого контура.':'Сейчас: '+title+'.';
+}
+async function saveDNSPolicy(button){
+  if(DNS_BUSY)return;
+  const selected=document.getElementById('dns-mode').value;
+  DNS_BUSY=true;button.disabled=true;document.getElementById('dns-mode').disabled=true;
+  document.getElementById('dns-state').textContent='Применяем DNS и проверяем соединение…';
+  try{await api('/api/dns-policy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:selected})});
+    toast('DNS этого контура применён и проверен','ok');}
+  catch(e){toast(e.message,'bad')}
+  finally{DNS_BUSY=false;await loadDNSPolicy()}
+}
+
 async function reloadAll(){try{for(const id of FOLD_ORDER)await loadFold(id)}
   catch(e){toast(e.message,'bad')}}
 
@@ -1770,6 +1950,7 @@ function fbytes(n){n=n||0;if(n<1024)return n+' Б';if(n<1048576)return (n/1024).
   if(n<1073741824)return (n/1048576).toFixed(1)+' МБ';return (n/1073741824).toFixed(2)+' ГБ'}
 
 async function loadClients(){const r=await api('/api/clients');const tb=document.querySelector('#clients tbody');tb.innerHTML='';
+  if(window.__QRCONF&&!r.clients.some(c=>c.conf_name===window.__QRCONF)){document.getElementById('qrpanel').style.display='none';document.getElementById('qrimg').replaceChildren();window.__QRCONF=null}
   for(const c of r.clients){const tr=document.createElement('tr');const nm=esc(c.name);
     const unsupported=c.unsupported?('<br><span class="warn" title="'+esc(c.unsupported_reason||'legacy-конфигурация')+'">⚠ legacy: создание заблокировано; отзыв по ключу доступен</span>'):'';
     tr.innerHTML='<td>'+nm+unsupported+'</td><td>'+esc(c.ip)+'</td><td class="mut">'+ago(c.handshake)+'</td>'+
@@ -1782,6 +1963,9 @@ async function loadClients(){const r=await api('/api/clients');const tb=document
     if(download)download.addEventListener('click',()=>dlClient(c.conf_name));
     if(qr)qr.addEventListener('click',()=>qrClient(c.conf_name));
     tr.querySelector('.client-revoke').addEventListener('click',()=>delClient(c.name,c.pubkey));
+    if(r.contours&&r.contours.length>1){const pick=document.createElement('select');pick.className='client-contour';pick.setAttribute('aria-label','Контур устройства '+c.name);
+      for(const contour of r.contours){const option=document.createElement('option');option.value=contour.id;option.textContent=contour.name;pick.appendChild(option)}
+      pick.value=c.contour||'1';pick.addEventListener('change',()=>assignContour(c.pubkey,pick.value));tr.lastElementChild.prepend(pick)}
     tb.appendChild(tr)}
   window.__CN=r.clients.length;
   const rec=((window.__S||{}).sys||{}).rec_clients;
@@ -1792,7 +1976,7 @@ async function loadClients(){const r=await api('/api/clients');const tb=document
       (r.can_add?'':(' · добавление недоступно: '+esc(r.add_error||'проверь конфигурацию'))));
   vitals();clientRec();
   document.getElementById('qstart').style.display=r.clients.length?'none':'grid';
-  if(!r.clients.length)tb.innerHTML='<tr><td colspan="5" class="mut">доступ пока никому не выдан — начни с шагов выше</td></tr>';
+  if(!r.clients.length)tb.innerHTML='<tr><td colspan="5" class="mut">в этом контуре доступ пока никому не выдан — начни с шагов выше</td></tr>';
   if(window.__S)beacon(window.__S,window.__CN)}
 
 async function addClient(){const n=document.getElementById('cname').value.trim();if(!n)return toast('впиши имя устройства','bad');
@@ -1805,11 +1989,15 @@ async function delClient(n,pubkey){if(!confirm('Отозвать доступ у
   toast('Отзываю доступ '+n+'…');try{await api('/api/clients/'+encodeURIComponent(n)+'/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pubkey:pubkey})});
     toast('Доступ «'+n+'» отозван','ok');await loadClients()}catch(e){toast(e.message,'bad')}}
 
-function dlClient(n){window.location='/api/clients/'+encodeURIComponent(n)+'/config'}
+async function dlClient(n){try{const r=await fetch('/api/clients/'+encodeURIComponent(n)+'/config',
+  {headers:{'X-CSRF-Token':CSRF,'X-Redut-Contour':CONTOUR}});
+  if(!r.ok){const j=await r.json();throw new Error(j.error||'Не удалось скачать профиль')}
+  const url=URL.createObjectURL(await r.blob()),link=document.createElement('a');link.href=url;link.download=n+'.conf';
+  document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000)}catch(e){toast(e.message,'bad')}}
 
-async function qrClient(n){try{const r=await fetch('/api/clients/'+encodeURIComponent(n)+'/qr',{headers:{'X-CSRF-Token':CSRF}});
+async function qrClient(n){try{const r=await fetch('/api/clients/'+encodeURIComponent(n)+'/qr',{headers:{'X-CSRF-Token':CSRF,'X-Redut-Contour':CONTOUR}});
   const svg=await r.text();if(!r.ok){toast('QR: '+svg,'bad');return}
-  document.getElementById('qrimg').innerHTML=svg;
+  window.__QRCONF=n;document.getElementById('qrimg').innerHTML=svg;
   document.getElementById('qrname').textContent='Профиль «'+n+'» — открой WireGuard на телефоне, нажми «+» → «Сканировать QR-код»';
   document.getElementById('qrpanel').style.display='block';document.getElementById('qrpanel').scrollIntoView({behavior:'smooth'})}catch(e){toast(e.message,'bad')}}
 
@@ -1842,14 +2030,23 @@ async function probe(btn,uid){btn.disabled=true;toast('Проверяю '+uid+'�
   toast(uid+': '+(r.ok?'годен, оценка '+r.score:'не прошёл ('+(r.disqualified||'')+')')+', выход '+(r.exit_ip||'—')+
     (r.exit_cc?(' из '+country(r.exit_cc)):''),r.ok?'ok':'bad');await loadPool()}catch(e){toast(e.message,'bad')}btn.disabled=false}
 
-async function apply(btn,uid){if(!confirm('Сделать '+uid+' боевым и закрепить вручную?\\n\\nПорядок: проверка прокси → переключение сервера → повторная проверка. '+
-    'Если после переключения станет хуже, панель вернёт прежний прокси сама. После успеха стратегии отключатся: Redut будет держать этот канал, '+
-    'а при его подтверждённом отказе вернётся к «Скорость и отклик». Клиенты в этот момент могут на пару секунд потерять связь.'))return;
-  btn.disabled=true;toast('Переключаю на '+uid+'…');
+async function apply(btn,uid){if(__selectionBusy)return;
+  const selected=__poolRows.get(uid),label=channelName(selected);
+  if(!confirm('Закрепить вручную «'+label+'»?\\n\\nПанель проверит сервер, переключит этот контур и проверит выход. '+
+    'При неудаче сработает откат. После успеха сервер останется выбранным до вашего следующего выбора или подтверждённого отказа.'))return;
+  __selectionBusy=true;selectionControls();const oldText=btn.textContent;btn.disabled=true;btn.textContent='Переключаю…';
+  const message='Переключаю на «'+label+'». Проверяю сервер и выход в интернет. Дождитесь результата.';
+  selectionFeedback(message,'warn');const progress=toast(message,'warn',0);
   try{const r=await api('/api/proxy/'+encodeURIComponent(uid)+'/apply',{method:'POST'});
-    toast('Готово: было '+r.old_ip+', стало '+r.new_ip+'. Ручной режим включён; сайты видят '+r.egress+
-      ' ('+country(r.egress_cc)+'). При отказе включится «Скорость и отклик».','ok');await reloadAll()}
-  catch(e){toast('переключение: '+e.message,'bad');await reloadAll()}btn.disabled=false}
+    if(!r.ok)throw new Error(r.error||'Сервер не подтвердил переключение');
+    const p=r.selected||selected,mismatch=channelGeo(p,r.egress_cc);
+    const done='Закреплён вручную: '+channelName(p)+'. IP выхода: '+r.egress+
+      (r.egress_cc?' · '+country(r.egress_cc):'')+'.'+mismatch;
+    selectionFeedback(done,mismatch?'warn':'ok');toast(done,mismatch?'warn':'ok',20000)}
+  catch(e){const message='Не удалось подтвердить переключение на «'+label+'»: '+e.message;
+    selectionFeedback(message,'bad');toast(message,'bad',20000)}
+  finally{if(progress)progress.remove();__selectionBusy=false;btn.textContent=oldText;selectionControls();
+    try{await reloadAll()}catch(e){toast('Обновление состояния: '+e.message,'bad')}}}
 
 async function rollback(){if(!confirm('Вернуть предыдущий конфиг из резервной копии?\\n\\nПригодится, если после смены прокси стало хуже.'))return;toast('Откатываю…');
   try{const r=await api('/api/rollback',{method:'POST'});toast('Откат: '+r.bad_ip+' → '+r.good_ip+' → '+(r.ok?'связь восстановлена':'проверка не прошла'),r.ok?'ok':'bad');await reloadAll()}catch(e){toast(e.message,'bad')}}
@@ -1886,7 +2083,7 @@ async function doEmergency(){let cur=false;try{cur=(await api('/api/status')).em
     toast('Аварийный режим: '+(r.on?'ВКЛЮЧЁН':'выключен')+' (состояние '+r.state+')',r.on?'bad':'ok');await reloadAll()}
   catch(e){toast('авария: '+e.message,'bad')}}
 
-reloadAll();setInterval(loadStatus,30000);
+loadContours().then(()=>reloadAll());setInterval(loadStatus,30000);
 </script>
 """
 
@@ -1981,27 +2178,12 @@ _SETUP_HTML = """
 
   <div class="card" id="s4" style="display:none">
     <h2>Шаг 4 · Почта для тревожных писем</h2>
-    <div class="ex">Куда писать, если VPN сломался, прокси умер или деньги на исходе. Нужны данные
-      почтового ящика, от имени которого слать письма (те же, что вбиваются в почтовый клиент:
-      сервер, порт, логин, пароль). Письма приходят с адреса логина — отдельно его указывать не нужно.
-      Заполни и нажми <b>«Проверить связь»</b>: узел отправит на этот ящик код, впиши его обратно —
-      только так почта включится, чтобы «сохранено» не означало «письма молча не ходят».
-      <b>Не знаешь — жми «Пропустить»</b>, панель будет работать без писем, настроишь потом.</div>
-    <label>Почтовый сервер (SMTP)</label><input id="sm_host" autocomplete="off" placeholder="mail.example.com">
-    <div class="field">
-      <div style="flex:1;min-width:90px"><label>порт</label><input id="sm_port" placeholder="587"></div>
-      <div style="flex:2;min-width:160px"><label>логин</label><input id="sm_user" autocomplete="off"></div>
-    </div>
-    <label>пароль от ящика</label><input id="sm_password" type="password" autocomplete="new-password">
-    <div id="sm_from_row" style="display:none">
-      <label>адрес отправителя</label><input id="sm_from" autocomplete="off" placeholder="vpn@example.com">
-      <div class="sub">Логин не похож на почтовый адрес — впишите, с какого адреса слать письма.</div>
-    </div>
-    <label>кому слать</label><input id="sm_to" autocomplete="off" placeholder="you@example.com">
-    <div style="margin-top:11px"><button class="btn g" onclick="testSmtp()">Проверить связь</button>
+    __MAIL_FIELDS__
+    <label>Ваш e-mail для уведомлений</label><input id="sm_to" type="email" autocomplete="email" placeholder="you@example.com">
+    <div style="margin-top:11px"><button class="btn g" id="sm_test" onclick="testSmtp()">Отправить PIN-код</button>
       <button class="btn s" onclick="skipSmtp()">Пропустить</button></div>
     <div id="sm_code_row" style="display:none;margin-top:11px">
-      <label>код из письма</label><input id="sm_code" autocomplete="off" placeholder="6 цифр">
+      <label>PIN-код из письма</label><input id="sm_code" autocomplete="one-time-code" inputmode="numeric" maxlength="6" placeholder="6 цифр">
       <button class="btn g" style="margin-top:9px" onclick="saveSmtp()">Подтвердить и включить почту</button>
     </div>
     <div id="smtpbox" class="sub" style="margin-top:9px"></div>
@@ -2049,7 +2231,8 @@ function stepper(){document.getElementById('stepper').innerHTML=
    (i==CUR?';border-color:var(--cyan);color:var(--cyan)':'')+'">'+i+(DONE[i]?' ✓':'')+'</span>').join('')+
    ' <span class="mut">'+NAMES[CUR]+'</span>'}
 function go(n){for(let i=1;i<=5;i++)document.getElementById('s'+i).style.display=(i==n?'block':'none');
-  CUR=n;stepper();window.scrollTo({top:0,behavior:'smooth'})}
+  CUR=n;stepper();window.scrollTo({top:0,behavior:'smooth'});
+  if(n===4&&MAIL_TRANSPORT==='atomicmail'&&!MAIL_READY)prepareMail()}
 function done(n){DONE[n]=true;const b=document.getElementById('n'+n);if(b)b.disabled=false;stepper()}
 async function genPw(){try{const r=await sapi('/api/setup/password',{});const o=document.getElementById('pwout');
   o.style.display='block';o.className='msg ok';
@@ -2074,24 +2257,38 @@ async function saveProv(){const b={proxy6:document.getElementById('proxy6').valu
     ('<span class="bad">'+esc(v.error)+'</span>'))).join('<br>');
   done(3)}catch(e){document.getElementById('provbox').innerHTML='<span class="bad">'+esc(e.message)+'</span>';toast(e.message,'bad')}}
 const SM_FIELDS=['sm_host','sm_port','sm_user','sm_password','sm_from','sm_to'];
-function smBody(){return {host:v('sm_host'),port:v('sm_port'),user:v('sm_user'),
+function smBody(){if(MAIL_TRANSPORT==='atomicmail')return {to:v('sm_to')};return {host:v('sm_host'),port:v('sm_port'),user:v('sm_user'),
   password:v('sm_password'),from:v('sm_from'),to:v('sm_to')}}
 function smBox(cls,txt){document.getElementById('smtpbox').innerHTML='<span class="'+cls+'">'+esc(txt)+'</span>'}
 // правку полей после отправки кода прячем обратно за проверку: сохраняем только проверенное
-function smReset(){document.getElementById('sm_code_row').style.display='none'}
-async function testSmtp(){const b=smBody();smBox('mut','отправляю письмо с кодом…');
-  try{const r=await sapi('/api/setup/smtp/test',b);
+function smReset(){document.getElementById('sm_code_row').style.display='none';
+  delete DONE[4];document.getElementById('n4').disabled=true;stepper()}
+async function testSmtp(){const b=smBody();smReset();const btn=document.getElementById('sm_test');btn.disabled=true;smBox('mut','отправляю письмо с кодом…');
+  try{const r=await sapi('/api/setup/mail/test',b);
     document.getElementById('sm_code_row').style.display='block';
     document.getElementById('sm_code').focus();
-    smBox('ok','письмо с кодом отправлено на '+r.to+' — впиши код из письма (идёт до пары минут)')}
+    smBox(r.warning?'warn':'ok',r.warning||('Письмо с кодом принято сервисом для '+r.to+'. Дождитесь письма и введите PIN-код.'))}
   catch(e){if(e.need_from)document.getElementById('sm_from_row').style.display='block';
-    smBox('bad',e.message);toast(e.message,'bad')}}
+    smBox('bad',e.message);toast(e.message,'bad')}
+  finally{btn.disabled=MAIL_TRANSPORT==='atomicmail'&&!MAIL_READY}}
 async function saveSmtp(){const b=smBody();b.code=v('sm_code');
-  try{await sapi('/api/setup/smtp',b);smBox('ok','почта проверена и включена');done(4)}
+  try{await sapi('/api/setup/mail',b);smBox('ok','почта проверена и включена');done(4)}
   catch(e){if(e.need_test)smReset();if(e.need_from)document.getElementById('sm_from_row').style.display='block';
     smBox('bad',e.message);toast(e.message,'bad')}}
-async function skipSmtp(){try{await sapi('/api/setup/smtp',{skip:true});
+async function skipSmtp(){try{await sapi('/api/setup/mail',{skip:true});
   document.getElementById('smtpbox').innerHTML='<span class="mut">почта пропущена — настроишь позже</span>';done(4)}catch(e){toast(e.message,'bad')}}
+let MAIL_READY=false,MAIL_PREPARING=false;
+async function prepareMail(){
+  if(MAIL_TRANSPORT!=='atomicmail'||MAIL_PREPARING)return;
+  MAIL_PREPARING=true;const btn=document.getElementById('mail_prepare');btn.disabled=true;
+  document.getElementById('sm_test').disabled=true;
+  document.getElementById('mail_status').textContent='Подготавливаем AtomicMail. Это может занять несколько минут…';
+  try{const r=await sapi('/api/setup/mail/prepare',{});MAIL_READY=!!r.ready;
+    document.getElementById('mail_status').textContent=MAIL_READY?'AtomicMail готова. Укажите ваш e-mail и подтвердите его кодом.':'AtomicMail пока недоступна.';
+    btn.style.display=MAIL_READY?'none':''}
+  catch(e){document.getElementById('mail_status').textContent=e.message;btn.style.display=''}
+  finally{MAIL_PREPARING=false;btn.disabled=false;document.getElementById('sm_test').disabled=!MAIL_READY}
+}
 function v(id){return document.getElementById(id).value.trim()}
 async function finish(){try{const r=await sapi('/api/setup/finish',{});toast('Готово! Открываю вход…','ok');
   setTimeout(()=>location.href=r.next||'/login',1200)}catch(e){toast(e.message,'bad')}}
@@ -2100,8 +2297,19 @@ SM_FIELDS.forEach(function(id){var el=document.getElementById(id);
 """
 
 
-def setup_page():
-    body = _SETUP_HTML + "<script>" + _SETUP_JS + "</script>"
+_SMTP_SETUP_FIELDS = '    <div class="ex">Куда писать, если VPN сломался, прокси умер или деньги на исходе. Нужны данные\n      почтового ящика, от имени которого слать письма (те же, что вбиваются в почтовый клиент:\n      сервер, порт, логин, пароль). Письма приходят с адреса логина — отдельно его указывать не нужно.\n      Заполни и нажми <b>«Отправить PIN-код»</b>: узел отправит на этот ящик код, впиши его обратно —\n      только так почта включится, чтобы «сохранено» не означало «письма молча не ходят».\n      <b>Не знаешь — жми «Пропустить»</b>, панель будет работать без писем, настроишь потом.</div>\n    <label>Почтовый сервер (SMTP)</label><input id="sm_host" autocomplete="off" placeholder="mail.example.com">\n    <div class="field">\n      <div style="flex:1;min-width:90px"><label>порт</label><input id="sm_port" placeholder="587"></div>\n      <div style="flex:2;min-width:160px"><label>логин</label><input id="sm_user" autocomplete="off"></div>\n    </div>\n    <label>пароль от ящика</label><input id="sm_password" type="password" autocomplete="new-password">\n    <div id="sm_from_row" style="display:none">\n      <label>адрес отправителя</label><input id="sm_from" autocomplete="off" placeholder="vpn@example.com">\n      <div class="sub">Логин не похож на почтовый адрес — впишите, с какого адреса слать письма.</div>\n    </div>\n'
+_ATOMICMAIL_SETUP_FIELDS = """<div class="sub">РЕДУТ отправляет уведомления через AtomicMail.
+    Нужен только ваш адрес — пароль от почты не требуется. Подтвердите адрес PIN-кодом из письма.
+    Если пропустить этот шаг, уведомления по почте будут выключены.</div>
+    <div id="mail_status" class="sub" role="status" aria-live="polite" style="margin-top:9px"></div>
+    <button class="btn s tiny" id="mail_prepare" style="margin-top:9px" onclick="prepareMail()">Повторить подготовку почты</button>"""
+
+
+def setup_page(mail_transport="smtp"):
+    transport = "atomicmail" if mail_transport == "atomicmail" else "smtp"
+    fields = _ATOMICMAIL_SETUP_FIELDS if transport == "atomicmail" else _SMTP_SETUP_FIELDS
+    body = _SETUP_HTML.replace("__MAIL_FIELDS__", fields)
+    body += '<script>const MAIL_TRANSPORT="' + transport + '";' + _SETUP_JS + "</script>"
     return _doc("Настройка — vpn-panel", body)
 
 

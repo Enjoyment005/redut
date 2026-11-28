@@ -197,11 +197,12 @@ class TestProviderConformance(unittest.TestCase):
     def test_every_registered_adapter_has_common_contract(self):
         self.assertGreaterEqual(len(PROVIDER_CLASSES), 3)
         for name, cls in PROVIDER_CLASSES.items():
-            adapter = cls("fixture-key")
+            adapter = (cls("https://key.zenx.zone/EXAMPLE_SUBSCRIPTION", hwid="fixture-device")
+                       if name == "zenxnet" else cls("fixture-key"))
             self.assertEqual(adapter.name, name)
             self.assertIsInstance(adapter.caps, ProviderCapabilities)
             self.assertTrue(adapter.caps[Capability.LIST])
-            self.assertTrue(adapter.caps[Capability.BALANCE])
+            self.assertEqual(adapter.caps[Capability.BALANCE], name != "zenxnet")
             for capability in adapter.caps.enabled:
                 self.assertTrue(callable(getattr(adapter, capability.value, None)),
                                 "%s advertises missing %s" % (name, capability.value))

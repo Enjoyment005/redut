@@ -365,7 +365,7 @@ put_tpl "$TPL/server_cleanup.sh"    /usr/local/bin/server_cleanup.sh          07
 log "7/12 vpn-boot-setup.sh (§11 RETURN + wg0 fallback)"
 cat > /usr/local/bin/vpn-boot-setup.sh <<BOOT
 #!/bin/bash
-# REDUT_BASE_CONTRACT=2
+# REDUT_BASE_CONTRACT=3
 set -euo pipefail
 # VPN boot setup — subnet $SUBNET, upstream $UP_HOST_EFF (сгенерирован install.sh).
 # Идемпотентно, переживает ребут. §11: RETURN для трафика ВНУТРИ VPN и К самому серверу
@@ -397,6 +397,10 @@ if [ -f /var/lib/vpn-panel/ru-whitelist-update.pending ]; then
 fi
 
 # 0) фолбэк — поднять wg0, если systemd не поднял его на буте (случалось на живом узле)
+if [ -f /opt/vpn-panel/contours.py ]; then
+    python3 /opt/vpn-panel/contours.py --guard-only
+fi
+
 if ! ip link show wg0 >/dev/null 2>&1; then
     systemctl start wg-quick@wg0 2>/dev/null || wg-quick up wg0 2>/dev/null || true
 fi
@@ -459,6 +463,12 @@ ip rule del fwmark 0x64 2>/dev/null || true
 ip rule add fwmark 0x64 lookup middleman priority 100
 sysctl -q net.ipv4.ip_forward=1
 echo "[\$(date)] vpn-boot-setup completed (upstream: \${UP_HOST:-не выбран, прямой выход})"
+
+# Keep optional contour assignments after every boot/install/self-heal rebuild.
+if [ -f /opt/vpn-panel/contours.py ]; then
+    python3 /opt/vpn-panel/contours.py
+fi
+
 BOOT
 chmod 755 /usr/local/bin/vpn-boot-setup.sh
 
@@ -544,6 +554,11 @@ fi
 log "10/12 запуск базовых сервисов"
 systemctl daemon-reload
 systemctl enable wg-quick@wg0 sing-box vpn-boot-setup microsocks >/dev/null 2>&1 || true
+
+# systemd cannot inherit the install lock: establish the source guard first.
+if [ -f /opt/vpn-panel/contours.py ]; then
+    python3 /opt/vpn-panel/contours.py --guard-only
+fi
 
 # wg0: идемпотентно (без разрыва интерфейса при повторном прогоне с живым клиентом)
 if systemctl is-active --quiet wg-quick@wg0; then

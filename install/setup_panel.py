@@ -43,7 +43,8 @@ BOOTSTRAP_TTL = 24 * 3600
 
 # update.py — ПЕРВЫМ: agent.py его импортирует, и на живом узле между копиями
 # файлов есть окно, где тик крона (pool-refresh/heartbeat) поймал бы ImportError.
-AGENT_FILES = ["singbox_config.py", "update.py", "config_store.py", "config_schema.py", "health.py", "learning.py",
+AGENT_FILES = ["webpanel/__init__.py", "webpanel/auth.py", "atomicmail.py",
+               "dns_policy.py", "geoip.py", "contours.py", "vless.py", "providers/zenxnet.py", "singbox_config.py", "update.py", "config_store.py", "config_schema.py", "health.py", "learning.py",
                "metrics.py", "replay.py",
                "dns_probe.py", "dns_evidence.py", "dns_runtime.py", "dns_rescue.py",
                "providers/base.py", "providers/proxywing.py", "proxywing_autopay.py",
@@ -53,8 +54,8 @@ AGENT_FILES = ["singbox_config.py", "update.py", "config_store.py", "config_sche
                "providers/proxyline.py", "providers/proxy6.py"]
 # server.py импортирует sysinfo и hygiene — класть ДО server.py, чтобы окно между
 # копиями на живом узле не ловило ImportError при рестарте панели (случай node1 19.08)
-PANEL_FILES = ["webpanel/__init__.py", "webpanel/auth.py", "webpanel/sysinfo.py",
-               "webpanel/hygiene.py",
+PANEL_FILES = ["webpanel/sysinfo.py",
+               "webpanel/hygiene.py", "webpanel/contour_ui.py",
                "webpanel/server.py", "webpanel/views.py", "webpanel/setup_admin.py",
                "webpanel/clients.py", "webpanel/qrcode.py"]
 
@@ -117,6 +118,7 @@ DEFAULTS = {
 # раз в 2 ч (было */6 МИНУТ — молотилка, перекрывавшая сама себя); лёгкая метка
 # egress (*/5) держит дашборд свежим.
 CRONS = [
+    "* * * * * /usr/local/bin/vpn-agent contours-tick",
     "*/2 * * * * /usr/local/bin/singbox-watchdog.sh",
     "*/30 * * * * /usr/local/bin/vpn-agent pool-refresh",
     "17 */2 * * * /usr/local/bin/vpn-agent pool-refresh --probe",
@@ -130,7 +132,7 @@ CRONS = [
 # Маркер 'vpn-agent pool-refresh' НАМЕРЕННО шире 'pool-refresh --probe': накрывает
 # и старую строку */6 с --probe (самообновление 1.2.0→1.3.0 обязано её убрать,
 # иначе молотилка удвоится — 🟠 ревью E2), и новую без проб.
-CRON_MARK = ("singbox-watchdog", "vpn-agent pool-refresh", "vpn-agent egress-mark",
+CRON_MARK = ("vpn-agent contours-tick", "singbox-watchdog", "vpn-agent pool-refresh", "vpn-agent egress-mark",
              "vpn-agent heartbeat-check", "vpn-agent auto-prolong", "vpn-agent self-update")
 
 
@@ -208,7 +210,7 @@ def copy_version(src):
         return f.read().strip() or None
 
 
-def write_config(name, net, port, subnet, wg_port, dnsmasq):
+def write_config(name, net, port, subnet, wg_port, dnsmasq, mail_transport=None):
     """Конфиг агента. Блоки, настроенные владельцем, сохраняем как есть."""
     cfg = {
         "singbox_config": "/etc/sing-box/config.json",
@@ -225,7 +227,10 @@ def write_config(name, net, port, subnet, wg_port, dnsmasq):
         "panel_port": port,
     }
     cfg.update(DEFAULTS)
+    if mail_transport not in (None, "atomicmail", "smtp"):
+        raise ValueError("unknown mail transport")
     path = os.path.join(ETC, "config.json")
+    existed = os.path.isfile(path)
     store_path = os.path.join(OPT, "config_store.py")
     spec = importlib.util.spec_from_file_location("redut_installer_config_store", store_path)
     if spec is None or spec.loader is None:
@@ -241,6 +246,13 @@ def write_config(name, net, port, subnet, wg_port, dnsmasq):
             if isinstance(old.get(key), dict) and old[key]:
                 result[key] = old[key]
                 preserved.append(key)
+        if mail_transport is not None:
+            result["mail_transport"] = mail_transport
+        elif "mail_transport" in old:
+            result["mail_transport"] = old["mail_transport"]
+        elif not existed:
+            result["mail_transport"] = "atomicmail"
+        # An existing config without this field retains its implicit SMTP mode.
         return result
 
     store.update({"_source": path}, merge_owner_settings, create=True)
@@ -316,6 +328,32 @@ def ensure_secrets():
                 return True
         atomic_json(path, {})
         return True
+
+
+def prepare_mail():
+    """Prepare one persistent sender; mail failure must not abort VPN install."""
+    path = os.path.join(ETC, "secrets.json")
+    try:
+        with open(os.path.join(ETC, "config.json"), encoding="utf-8") as source:
+            cfg = json.load(source)
+        if cfg.get("mail_transport", "smtp") != "atomicmail":
+            return False
+        old_path = list(sys.path)
+        try:
+            sys.path.insert(0, OPT)
+            module = importlib.import_module("atomicmail")
+            ready = bool(module.ensure_ready(path).get("ready"))
+        finally:
+            sys.path[:] = old_path
+        if ready:
+            print("  AtomicMail: отправитель готов")
+            return True
+    except Exception:
+        # Do not print provider exceptions: they can contain credentials or
+        # response bodies. The wizard retries using the durable sender state.
+        pass
+    print("  AtomicMail: подготовка почты не завершена; повторите её в мастере панели.")
+    return False
 
 
 def create_bootstrap_secret(enabled):
@@ -428,6 +466,8 @@ def main():
     ap.add_argument("--dnsmasq", action="store_true")
     ap.add_argument("--no-panel", action="store_true", help="только агент, без веб-панели")
     ap.add_argument("--regen-cert", action="store_true")
+    ap.add_argument("--mail-transport", choices=("atomicmail", "smtp"), default=None,
+                    help="почта нового узла: AtomicMail; при повторе сохранить прежний выбор")
     a = ap.parse_args()
 
     if os.geteuid() != 0:
@@ -477,8 +517,9 @@ def main():
     # after a prior interrupted upgrade.  Quiesce/restart it for the merge;
     # the preflight above already rejects incompatible dormant payloads.
     with panel_config_upgrade_barrier(True):
-        write_config(a.name, net, a.port, a.subnet, a.wg_port, a.dnsmasq)
+        write_config(a.name, net, a.port, a.subnet, a.wg_port, a.dnsmasq, a.mail_transport)
     fresh = ensure_secrets()
+    prepare_mail()
     bootstrap_secret = create_bootstrap_secret(fresh)
 
     # СЕРТИФИКАТ — ДО старта панели (исправлено 15.08, снос №6). Раньше cert выпускался ПОСЛЕ

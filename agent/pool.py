@@ -54,7 +54,7 @@ _OPERATION_TRANSITIONS = {
     "failed": set(),
 }
 
-DEFAULT_ROLE = {"proxyline": "auto", "proxy6": "auto", "proxywing": "auto"}
+DEFAULT_ROLE = {"proxyline": "auto", "proxy6": "auto", "proxywing": "auto", "zenxnet": "off"}
 DECISION_ACTIONS = frozenset({
     "strategy-apply", "rotate", "replenish", "retune", "provider-switch",
     "switch-provider", "emergency", "panel-emergency", "panel-rotate",
@@ -343,11 +343,12 @@ EVENT_KEEP_DAYS = 180
 # дальше уже не воскрешение мигнувшей выдачи, а новая покупка того же id.
 MEMO_KEEP_DAYS = 30
 
-SCHEMA_VERSION = "12"
+SCHEMA_VERSION = "13"
 
 # Поля, которые обновляет refresh (остальные — роль/проба/счётчики — сохраняются)
 _REFRESH_FIELDS = ("ip", "host", "port_http", "port_socks5", "user", "password",
-                   "country", "ip_version", "kind", "date_end", "descr", "order_id")
+                   "country", "ip_version", "kind", "date_end", "descr", "order_id",
+                   "protocol", "endpoint_port", "connection_json", "connection_digest")
 
 
 def now_iso():
@@ -357,6 +358,10 @@ def now_iso():
 # Колонки, добавленные после первого релиза. CREATE TABLE IF NOT EXISTS их в живую
 # базу не принесёт, поэтому досыпаем ALTER'ом (сверяясь с pragma — идемпотентно).
 _ADD_COLUMNS = (
+    ('proxy', 'protocol', 'TEXT'),
+    ('proxy', 'endpoint_port', 'INTEGER'),
+    ('proxy', 'connection_json', 'TEXT'),
+    ('proxy', 'connection_digest', 'TEXT'),
     ('proxy', 'order_id', 'TEXT'),
     ('money', 'price_source', "TEXT NOT NULL DEFAULT 'provider'"),
     ("proxy", "exit_cc_alt", "TEXT"),     # страна по второй geoip-базе (2026-08-15)
@@ -1059,8 +1064,10 @@ class Pool:
         for it in items:
             uid = "%s:%s" % (it["provider"], it["ext_id"])
             seen.append(uid)
-            row = self.conn.execute("SELECT uid FROM proxy WHERE uid=?", (uid,)).fetchone()
+            row = self.conn.execute("SELECT uid,connection_digest FROM proxy WHERE uid=?", (uid,)).fetchone()
             if row:
+                if row["connection_digest"] != it.get("connection_digest"):
+                    self.conn.execute("UPDATE proxy SET probe_ok=NULL,score=NULL,last_probe_at=NULL WHERE uid=?", (uid,))
                 sets = ", ".join("%s=?" % f for f in _REFRESH_FIELDS)
                 self.conn.execute(
                     "UPDATE proxy SET %s, gone=0 WHERE uid=?" % sets,
@@ -1223,6 +1230,8 @@ class Pool:
             if stored is None:
                 return False
             row = dict(stored)
+            if row.get("protocol") == "vless" and res.get("connection_digest") != row.get("connection_digest"):
+                return False
             if res.get("ok"):
                 fail_count = 0
             elif background and row.get("probe_ok") != 0:
@@ -1307,6 +1316,8 @@ class Pool:
     def _initial_proxy_role(self, norm):
         """Keep newly purchased order members off, including imports during a lost reply."""
         name = norm['provider']
+        if name == 'zenxnet' and self.get_setting('zenxnet_auto_admit') == '1':
+            return 'auto'
         if name == 'proxy6':
             pending = self.conn.execute(
                 "SELECT 1 FROM spend_operation WHERE provider='proxy6' AND kind='buy' "
@@ -1342,8 +1353,10 @@ class Pool:
         Роль ставится только при INSERT (или если задана явно) — у существующей
         записи роль/проба/счётчики не трогаются (как в refresh)."""
         uid = "%s:%s" % (norm["provider"], norm["ext_id"])
-        row = self.conn.execute("SELECT uid FROM proxy WHERE uid=?", (uid,)).fetchone()
+        row = self.conn.execute("SELECT uid,connection_digest FROM proxy WHERE uid=?", (uid,)).fetchone()
         if row:
+            if row["connection_digest"] != norm.get("connection_digest"):
+                self.conn.execute("UPDATE proxy SET probe_ok=0,score=0,last_probe_at=NULL WHERE uid=?", (uid,))
             sets = ", ".join("%s=?" % f for f in _REFRESH_FIELDS)
             self.conn.execute("UPDATE proxy SET %s, gone=0 WHERE uid=?" % sets,
                               tuple(norm.get(f) for f in _REFRESH_FIELDS) + (uid,))

@@ -29,6 +29,7 @@ import apply as apply_mod           # noqa: E402
 import country as country_mod       # noqa: E402
 import health as health_mod         # noqa: E402
 import money as money_mod           # noqa: E402
+import contours
 import config_schema                # noqa: E402
 import learning as learning_mod     # noqa: E402
 import replay as replay_mod         # noqa: E402
@@ -109,11 +110,14 @@ def load_config(path=None):
     return cfg
 
 
-def load_secrets():
+def load_secrets(cfg=None):
     for candidate in (ETC_SECRETS, os.path.join(PANEL_DIR, ".secrets.local.json")):
         if os.path.isfile(candidate):
             with open(candidate, encoding="utf-8") as f:
-                return json.load(f), candidate
+                data = json.load(f)
+                if cfg is not None:
+                    data = contours.scoped_secrets(cfg, data)
+                return data, candidate
     return {}, None
 
 
@@ -186,7 +190,7 @@ def cmd_status(cfg, args):
     if os.name == "posix":
         rc, act = apply_mod.run_cmd(["systemctl", "is-active", "sing-box"])
         print("  sing-box: %s" % (act or "?"))
-        v = apply_mod.verify_egress()
+        v = apply_mod.verify_for(cfg)
         print("  egress tun0: ip=%s cc=%s tg=%s -> %s"
               % (v["egress_ip"], v["exit_cc"], v["tg_code"], "OK" if v["ok"] else "ПЛОХО: " + v["why"]))
     p = open_pool(cfg)
@@ -229,7 +233,10 @@ def cmd_status(cfg, args):
 
 def cmd_list(cfg, args):
     p = open_pool(cfg)
+    secrets, _ = load_secrets(cfg)
     rows = p.list(include_gone=args.all)
+    allowed = contours.allowed_providers(cfg, {row["provider"]: True for row in rows}, secrets)
+    rows = [row for row in rows if row["provider"] in allowed]
     if not rows:
         print("Пул пуст — сначала: agent.py pool-refresh")
         p.close()
@@ -251,7 +258,7 @@ def cmd_list(cfg, args):
 
 
 def cmd_pool_refresh(cfg, args):
-    secrets, src = load_secrets()
+    secrets, src = load_secrets(cfg)
     providers = make_providers(secrets)
     if not providers:
         print("Нет ключей провайдеров (secrets: %s)" % (src or "не найден"))
@@ -279,7 +286,7 @@ def cmd_pool_refresh(cfg, args):
         print("исчезли с неистёкшей арендой: %d — письмо владельцу отправлено"
               % told["notified"])
     for name, prov in providers.items():
-        if name in summary["errors"]:
+        if name in summary["errors"] or not prov.caps.get("balance"):
             continue
         try:
             b = prov.balance()
@@ -296,7 +303,7 @@ def cmd_pool_refresh(cfg, args):
     # продолжала висеть СТАРАЯ ошибка (случай 15.08: авария снята в 09:56, а панель
     # ещё полчаса показывала «цепочка нарушена» с меткой 09:30).
     try:
-        v = apply_mod.verify_egress()
+        v = apply_mod.verify_for(cfg)
         p.set_egress(v)
         # DEGRADED от автоматики + снятие залипших SUSPECT/DEGRADED: сторож в этих
         # сценариях rotate не зовёт (его проверка — ipify), синхронизируем здесь
@@ -307,7 +314,7 @@ def cmd_pool_refresh(cfg, args):
     # П7-2: боевой канал сидит на провайдере без ключа (ключ удалили, а переключение
     # тогда не удалось или было на паузе) — пробуем увести его по стратегии каждым
     # тиком, пока не получится. При живом канале rotate этого не сделает никогда.
-    row = next((r for r in p.list(include_gone=True) if r["host"] == current_host),
+    row = next((r for r in p.list(include_gone=True) if apply_mod.matches_current(r, current_host, cfg)),
                None) if current_host else None
     if row is not None and row["provider"] not in providers:
         r = states_mod.switch_from_provider(cfg, providers, p, _make_alerter(cfg, secrets),
@@ -363,7 +370,7 @@ def cmd_egress_mark(cfg, args):
         print("egress-mark доступен только на сервере (tun0)")
         return 1
     p = open_pool(cfg)
-    rc, ip = apply_mod.run_cmd(["curl", "-s", "--max-time", "10", "--interface", "tun0",
+    rc, ip = apply_mod.run_cmd(["curl", "-s", "--max-time", "10", "--interface", contours.TUN if contours.secondary(cfg) else "tun0",
                                 probe_mod.IPIFY_URL], timeout=20)
     ip = (ip or "").strip()
     v = {"egress_ip": ip if probe_mod.looks_like_ip(ip) else None,
@@ -383,7 +390,7 @@ def cmd_egress_mark(cfg, args):
         # F8: время «в бою» пары боевого канала — приращением от прошлой живой метки
         # (cap 10 мин: перерывы связи и простои узла временем боя не считаются)
         host = apply_mod.current_upstream(read_singbox(cfg) or {})
-        row = next((r for r in p.list(include_gone=True) if r["host"] == host), None) if host else None
+        row = next((r for r in p.list(include_gone=True) if apply_mod.matches_current(r, host, cfg)), None) if host else None
         delta = states_mod.age_seconds(p.get_setting("battle_mark_at"))
         if row is not None and delta is not None:
             p.learning_record_battle(row, min(int(delta), 600))
@@ -393,7 +400,7 @@ def cmd_egress_mark(cfg, args):
     requested = (cfg.get('auto_prolong') or {}).get('proxywing_provider_auto_renew') is True
     owned = p.get_setting('proxywing_autopay:v1')
     if requested or (isinstance(owned, str) and owned):
-        secrets, _ = load_secrets()
+        secrets, _ = load_secrets(cfg)
         states_mod.sync_provider_auto_renew(cfg, make_providers(secrets), p, log=print, actor='cron')
     p.close()
     return 0
@@ -410,7 +417,7 @@ def _probe_one(p, cfg, providers, row, current_host, background=False):
     if prov is not None and prov.caps.get("check"):
         check_cb = lambda: prov.check(row["ext_id"])  # noqa: E731
     res = probe_mod.probe(row, provider_check=check_cb)
-    is_cur = row["host"] == current_host
+    is_cur = apply_mod.matches_current(row, current_host, cfg)
     res["score"] = probe_mod.score(row, res, is_current=is_cur, cfg=cfg)
     classification = health_mod.classify_probe_result(res, cfg=cfg)
     res["persistence_outcome"] = classification["outcome"]
@@ -446,18 +453,20 @@ def probe_new_channels(p, cfg, providers, current_host, log=print):
 
 def cmd_probe(cfg, args):
     p = open_pool(cfg)
-    secrets, _ = load_secrets()
+    secrets, _ = load_secrets(cfg)
     providers = make_providers(secrets)
     current_host = apply_mod.current_upstream(read_singbox(cfg) or {})
     if args.uid:
         row = p.get(args.uid)
-        if not row:
-            print("uid %s не найден в пуле (agent.py pool-refresh?)" % args.uid)
+        if not row or not contours.allowed_providers(cfg, {row["provider"]: True}, secrets):
+            print("uid %s не найден в пуле этого контура (agent.py pool-refresh?)" % args.uid)
             p.close()
             return 1
         rows = [row]
     else:
         rows = p.candidates()
+        allowed = contours.allowed_providers(cfg, {row["provider"]: True for row in rows}, secrets)
+        rows = [row for row in rows if row["provider"] in allowed]
         if not rows:
             print("Кандидатов нет (пул пуст или все off/gone)")
             p.close()
@@ -487,7 +496,11 @@ def cmd_apply(cfg, args):
         print("uid %s не найден в пуле" % args.uid)
         p.close()
         return 1
-    secrets, _ = load_secrets()
+    secrets, _ = load_secrets(cfg)
+    if not contours.allowed_providers(cfg, {row["provider"]: True}, secrets):
+        print("Прокси не принадлежит выбранному контуру")
+        p.close()
+        return 1
     providers = make_providers(secrets)
     sb = read_singbox(cfg)
     if sb is None:
@@ -498,9 +511,8 @@ def cmd_apply(cfg, args):
 
     print("=== Проба кандидата %s (%s) ===" % (row["uid"], row["host"]))
     res = _probe_one(p, cfg, providers, row, current_host)
-    for (pp, proto) in sorted((k.split("/")[0], k.split("/")[1]) for k in res["matrix"]):
-        v = res["matrix"]["%s/%s" % (pp, proto)]
-        print("  порт %-6s %-6s -> %s" % (pp, proto.upper(), v or "нет"))
+    for key, value in sorted(res.get("matrix", {}).items()):
+        print("  %s -> %s" % (key.upper(), value or "нет"))
     if res["disqualified"] or not res["ok"]:
         print("❌ Кандидат дисквалифицирован: %s — ничего не применяю"
               % (res["disqualified"] or "проба не прошла"))
@@ -509,16 +521,14 @@ def cmd_apply(cfg, args):
     print("  exit=%s cc=%s tg=%s latency=%sms score=%s"
           % (res["exit_ip"], res["exit_cc"], fmt_flag(res["tg_ok"]), res["latency_ms"], res["score"]))
 
-    socks_out, http_tg, reject_quic = apply_mod.choose_outbounds(
-        row["host"], row["user"] or "", row["password"] or "",
-        res["socks_port"], res["http_port"])
+    socks_out, http_tg, reject_quic = apply_mod.candidate_outbounds(row, res, cfg)
     def mode(o):
-        return ("SOCKS5" if o["type"] == "socks" else "HTTP") + " :%s" % o["server_port"]
+        return {"socks": "SOCKS5", "http": "HTTP", "vless": "VLESS"}[o["type"]] + " :%s" % o["server_port"]
     print("  socks-out (весь трафик) -> %s%s" % (mode(socks_out),
           "   (фолбэк по типу: SOCKS5 мёртв)" if socks_out["type"] == "http" else ""))
     print("  http-tg   (Telegram)    -> %s%s" % (mode(http_tg),
           "   (фолбэк по типу: HTTP мёртв)" if http_tg["type"] == "socks" else ""))
-    print("  UDP 443 -> reject: %s" % ("ДА (HTTP-режим)" if reject_quic else "нет (SOCKS5-режим)"))
+    print("  UDP 443 -> reject: %s" % ("ДА (HTTP-режим)" if reject_quic else "нет (UDP поддерживается)"))
 
     if args.dry_run:
         stage, new_cfg, *_ = apply_mod.stage_candidate(cfg, row, res)
@@ -528,7 +538,7 @@ def cmd_apply(cfg, args):
             if rc != 0:
                 os.unlink(stage)
                 credentials = {str(o[key]) for o in new_cfg.get("outbounds", [])
-                               for key in ("username", "password") if o.get(key)}
+                               for key in ("username", "password", "uuid") if o.get(key)}
                 for credential in sorted(credentials, key=len, reverse=True):
                     out = out.replace(credential, "****")
                 print("❌ sing-box check забраковал кандидата:\n%s" % out)
@@ -604,7 +614,7 @@ def cmd_rollback(cfg, args):
         p.close()
         return 1
     if r["ok"]:
-        row = next((x for x in p.list(include_gone=True) if x["host"] == r["good_ip"]), None)
+        row = next((x for x in p.list(include_gone=True) if apply_mod.matches_current(x, r["good_ip"], cfg)), None)
         post = states_mod.finish_explicit_apply(
             cfg, p, (row or {}).get("uid") or ("live:%s" % r["good_ip"]), r["good_ip"],
             r.get("verify"), source="manual", actor="user", log=print)
@@ -635,7 +645,7 @@ def cmd_strategy_apply(cfg, args):
     if os.name != "posix":
         print("Живое применение стратегии доступно только на сервере (Linux)")
         return 1
-    secrets, _ = load_secrets()
+    secrets, _ = load_secrets(cfg)
     providers = make_providers(secrets)
     p = open_pool(cfg)
     try:
@@ -650,7 +660,7 @@ def cmd_strategy_apply(cfg, args):
 
 # ------------------------------------------------------------- деньги (§6, фаза 2)
 def _providers_and_pool(cfg):
-    secrets, _ = load_secrets()
+    secrets, _ = load_secrets(cfg)
     pool = open_pool(cfg)
     providers = make_providers(secrets)
     pool.observe_provider_errors(providers, actor="user")
@@ -956,7 +966,7 @@ def cmd_drop(cfg, args):
         # Приёмочный эксперимент §6.4: намеренно удаляем ЗДОРОВЫЙ свежекупленный
         # прокси, чтобы измерить возврат средств. Health-гейты §6.4 п.1–2 не
         # применяем (на то он и эксперимент), но «текущий upstream» защищён.
-        if current_host and row["host"] == current_host:
+        if current_host and apply_mod.matches_current(row, current_host, cfg):
             print("Это ТЕКУЩИЙ upstream — эксперимент на нём запрещён")
             p.close()
             return 1
@@ -1023,7 +1033,7 @@ def _make_alerter(cfg, secrets):
 
 
 def cmd_rotate(cfg, args):
-    secrets, _ = load_secrets()
+    secrets, _ = load_secrets(cfg)
     providers = make_providers(secrets)
     p = open_pool(cfg)
     alerter = _make_alerter(cfg, secrets)
@@ -1062,7 +1072,7 @@ def cmd_provider_auto_renew(cfg, args):
                     latest = config_store.update(cfg, change)
                     # Keep config metadata and runtime paths; only normalized policy changes.
                     cfg['auto_prolong'] = config_schema.normalize(latest)['auto_prolong']
-                secrets, _ = load_secrets()
+                secrets, _ = load_secrets(cfg)
                 result = proxywing_autopay.reconcile(
                     cfg, make_providers(secrets), p, log=lambda *_: None, actor='user', _locked=True)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
@@ -1076,7 +1086,7 @@ def cmd_provider_auto_renew(cfg, args):
 
 def cmd_auto_prolong(cfg, args):
     """Продлить боевой прокси до истечения (§6.3). Крон раз в сутки."""
-    secrets, _ = load_secrets()
+    secrets, _ = load_secrets(cfg)
     providers = make_providers(secrets)
     p = open_pool(cfg)
     alerter = _make_alerter(cfg, secrets)
@@ -1101,7 +1111,7 @@ def cmd_auto_prolong(cfg, args):
 
 
 def cmd_emergency(cfg, args):
-    secrets, _ = load_secrets()
+    secrets, _ = load_secrets(cfg)
     p = open_pool(cfg)
     alerter = _make_alerter(cfg, secrets)
     if os.name != "posix":
@@ -1116,6 +1126,26 @@ def cmd_emergency(cfg, args):
               % (r.get("error") or "операция не подтверждена", r["state"]))
     p.close()
     return 0 if r.get("ok") else 1
+
+
+def cmd_dns_policy(cfg, args):
+    import dns_policy
+    if args.action == "status":
+        print(json.dumps(dns_policy.status(cfg), ensure_ascii=False))
+        return 0
+    database = pool_mod.Pool(cfg["db"])
+    try:
+        result = dns_policy.change(cfg, database, args.mode, dry_run=args.dry_run)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    except (apply_mod.ApplyError, contours.ContourError) as error:
+        print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False))
+        return 1
+    except Exception:
+        print(json.dumps({"ok": False, "error": "Операция DNS прервана; проверьте журнал восстановления"}, ensure_ascii=False))
+        return 1
+    finally:
+        database.close()
 
 
 def cmd_dns_rescue(cfg, args):
@@ -1201,7 +1231,7 @@ def cmd_switch_provider(cfg, args):
     Зовёт панель транзиентным юнитом сразу после удаления ключа (redut-switch);
     ретраи — pool-refresh. Канал живой, поэтому rotate не годится («делать нечего») —
     здесь путь «В бой»: кандидаты по стратегии, проба, apply с verify и автооткатом."""
-    secrets, _ = load_secrets()
+    secrets, _ = load_secrets(cfg)
     providers = make_providers(secrets)
     p = open_pool(cfg)
     name = args.from_provider
@@ -1227,7 +1257,7 @@ def cmd_self_update(cfg, args):
         print("Применение обновления меняет живой узел — только на сервере (Linux). "
               "На dev-машине доступна только проверка: self-update --check.")
         return 1
-    secrets, _ = load_secrets()
+    secrets, _ = load_secrets(cfg)
     p = open_pool(cfg)
     alerter = _make_alerter(cfg, secrets)
     log = lambda m: print("  %s" % m)   # noqa: E731 — стиль лога агента
@@ -1275,7 +1305,7 @@ def cmd_self_update(cfg, args):
 
 
 def cmd_heartbeat_check(cfg, args):
-    secrets, _ = load_secrets()
+    secrets, _ = load_secrets(cfg)
     providers = make_providers(secrets)
     p = open_pool(cfg)
     alerter = _make_alerter(cfg, secrets)
@@ -1322,7 +1352,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="vpn-agent", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", help="путь к config.json (дефолт: %s)" % ETC_CONFIG)
+    ap.add_argument("--contour", choices=("1", "2"), default="1")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("contours-tick", help="восстановить и проверить дополнительный контур")
     sub.add_parser("status", help="состояние сервера и пула")
     sp = sub.add_parser("list", help="пул из кэша")
     sp.add_argument("--all", action="store_true", help="включая gone")
@@ -1373,6 +1405,10 @@ def main(argv=None):
     sp.add_argument("--force", action="store_true", help="игнорировать паузу FROZEN и тайминг аварии")
     sp = sub.add_parser("emergency", help="аварийный режим вкл/выкл (прямой выход через WAN §8)")
     sp.add_argument("state", choices=["on", "off"])
+    sp = sub.add_parser("dns-policy", help="DNS выбранного контура")
+    sp.add_argument("action", choices=("status", "set"))
+    sp.add_argument("--mode", choices=("provider", "cloudflare", "provider_strict"))
+    sp.add_argument("--dry-run", action="store_true")
     sp = sub.add_parser("dns-rescue", help="изолированный DNS Rescue (по умолчанию выключен)")
     dns_sub = sp.add_subparsers(dest="dns_action", required=True)
     dns_sub.add_parser("status", help="режим, фаза, охват и незавершённые операции")
@@ -1418,13 +1454,23 @@ def main(argv=None):
     if args.cmd == "learning-replay":
         return cmd_learning_replay(replay_config(args.config), args)
     cfg = load_config(args.config)
+    if args.cmd == "contours-tick":
+        contours.runtime_tick(cfg, load_secrets()[0])
+        return 0
+    if args.contour == "2" and not contours.secondary(cfg):
+        cfg = contours.config(cfg)
+    if contours.secondary(cfg):
+        contours.ensure_ready(cfg)
+    if contours.secondary(cfg) and args.cmd in ("self-update", "buy", "prolong", "drop", "provider-auto-renew", "auto-prolong", "dns-rescue", "heartbeat-check"):
+        print("Эта операция недоступна для подписки второго контура")
+        return 1
     handlers = {"status": cmd_status, "list": cmd_list, "pool-refresh": cmd_pool_refresh,
                 "probe": cmd_probe, "apply": cmd_apply, "strategy-apply": cmd_strategy_apply,
                 "rollback": cmd_rollback,
                 "buy": cmd_buy, "prolong": cmd_prolong,
                 "spend-resume": cmd_spend_resume, "drop": cmd_drop,
                 "rotate": cmd_rotate, "emergency": cmd_emergency,
-                "dns-rescue": cmd_dns_rescue,
+                "dns-rescue": cmd_dns_rescue, "dns-policy": cmd_dns_policy,
                 "switch-provider": cmd_switch_provider,
                 "heartbeat-check": cmd_heartbeat_check, "learning-replay": cmd_learning_replay,
                 "auto-prolong": cmd_auto_prolong, "provider-auto-renew": cmd_provider_auto_renew,

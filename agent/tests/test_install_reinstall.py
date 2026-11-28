@@ -37,10 +37,15 @@ class TestCleanInstallAndReinstall(unittest.TestCase):
         self.installer.OPT = os.path.join(self.tmp.name, "opt", "vpn-panel")
         self.installer.ETC = os.path.join(self.tmp.name, "etc", "vpn-panel")
         self.installer.VAR = os.path.join(self.tmp.name, "var", "lib", "vpn-panel")
+        self.installer.NETWORK_LOCK = os.path.join(self.tmp.name, "network.lock")
+        env = mock.patch.dict(os.environ, {"VPN_PANEL_LOCK_DIR": os.path.join(self.tmp.name, "locks")})
+        env.start()
+        self.addCleanup(env.stop)
         self.installer.detect_net = lambda: {
             "gw": "192.0.2.1", "wan": "eth-test", "server_ip": "192.0.2.10"}
         self.installer.install_units = lambda with_panel: None
         self.installer.install_crons = lambda: None
+        self.installer.prepare_mail = lambda: False
         self.installer._panel_https_ok = lambda port, tries=6: True
         self.installer.sh = lambda cmd, check=False: "active" if "is-active" in cmd else ""
 

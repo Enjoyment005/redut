@@ -31,6 +31,7 @@
 #                        CLIENTS игнорируются), клиенты не добавляются, решение о
 #                        чистке следов — по текущему крону. Этим путём ходит и
 #                        самообновление (vpn-agent self-update, план vpn/UPDATE-PLAN.md)
+# Флаг --smtp: прежний мастер SMTP вместо AtomicMail для новой установки.
 set -euo pipefail
 
 # Полный PATH: при запуске из крона (самообновление) PATH урезан до /usr/bin:/bin,
@@ -59,6 +60,14 @@ trap cleanup_source_candidate EXIT
 say()  { printf '\n\033[1;36m▸ %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[1;32m✔\033[0m %s\n' "$*"; }
 die()  { printf '\n\033[1;31m✖ %s\033[0m\n' "$*" >&2; exit 1; }
+
+MAIL_ARGS=()
+for setup_arg in "$@"; do
+    case "$setup_arg" in
+        --smtp) MAIL_ARGS=(--mail-transport smtp) ;;
+        *) die "неизвестный параметр: $setup_arg (доступен --smtp)" ;;
+    esac
+done
 
 # ── 0a. UPDATE=1 — обновление УЖЕ установленного узла ────────────────────────
 # Повторный прогон установки корректно обновляет узел только при ТОЧНОМ повторе
@@ -548,7 +557,7 @@ WG_PORT_ARG=""
 wgp="$(sed -n "s/^WG_PORT='\{0,1\}\([0-9]*\)'\{0,1\}$/\1/p" "$WORKDIR/install/params.sh" 2>/dev/null | head -1 || true)"
 [ -n "$wgp" ] && WG_PORT_ARG="--wg-port $wgp"
 out="$(python3 "$WORKDIR/install/setup_panel.py" --src "$WORKDIR/agent" \
-        --name "$NAME" --port "$PANEL_PORT" --subnet "$SUBNET" $DNSMASQ_FLAG $WG_PORT_ARG)"
+        --name "$NAME" --port "$PANEL_PORT" --subnet "$SUBNET" $DNSMASQ_FLAG $WG_PORT_ARG "${MAIL_ARGS[@]}")"
 echo "$out" | grep -v '^{' | sed 's/^/  /' || true
 json="$(echo "$out" | tail -1)"
 SERVER_IP="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('server_ip',''))" "$json")"

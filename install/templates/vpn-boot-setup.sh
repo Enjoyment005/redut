@@ -1,6 +1,6 @@
 #!/bin/bash
 # Generic reference boot reconciler. install.sh renders the same policy with
-# REDUT_BASE_CONTRACT=2
+# REDUT_BASE_CONTRACT=3
 # node-specific values; this template reads /etc/vpn-panel/node.env.
 set -euo pipefail
 . /etc/vpn-panel/node.env
@@ -28,6 +28,10 @@ export REDUT_LOCK_HELD=1 REDUT_LOCK_FD="$LOCK_FD"
 if [ -f /var/lib/vpn-panel/ru-whitelist-update.pending ]; then
     REDUT_PARENT_LOCK_FD="$LOCK_FD" \
         /usr/local/bin/update-ru-whitelist.sh --recover-only
+fi
+
+if [ -f /opt/vpn-panel/contours.py ]; then
+    python3 /opt/vpn-panel/contours.py --guard-only
 fi
 
 if ! /usr/sbin/ip link show wg0 >/dev/null 2>&1; then
@@ -71,3 +75,8 @@ fi
 /usr/sbin/ip rule del fwmark 0x64 2>/dev/null || true
 /usr/sbin/ip rule add fwmark 0x64 lookup middleman priority 100
 sysctl -q net.ipv4.ip_forward=1
+
+# Keep optional contour assignments after every boot/install/self-heal rebuild.
+if [ -f /opt/vpn-panel/contours.py ]; then
+    python3 /opt/vpn-panel/contours.py
+fi

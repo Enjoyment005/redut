@@ -147,7 +147,8 @@ MONEY_CONFIG = {
 OPT = "/opt/vpn-panel"
 # update.py — ПЕРВЫМ: agent.py его импортирует, и на живом узле между заливкой
 # файлов есть окно, где тик крона (pool-refresh/heartbeat) поймал бы ImportError.
-AGENT_FILES = ["singbox_config.py", "update.py", "config_store.py", "config_schema.py", "health.py", "learning.py",
+AGENT_FILES = ["webpanel/__init__.py", "webpanel/auth.py", "atomicmail.py",
+               "dns_policy.py", "geoip.py", "contours.py", "vless.py", "providers/zenxnet.py", "singbox_config.py", "update.py", "config_store.py", "config_schema.py", "health.py", "learning.py",
                "metrics.py", "replay.py",
                "dns_probe.py", "dns_evidence.py", "dns_runtime.py", "dns_rescue.py",
                "providers/base.py", "providers/proxywing.py", "proxywing_autopay.py",
@@ -157,8 +158,8 @@ AGENT_FILES = ["singbox_config.py", "update.py", "config_store.py", "config_sche
                "providers/proxyline.py", "providers/proxy6.py"]
 # sysinfo.py — ДО server.py: тот его импортирует, окно между копиями на живом
 # узле не должно ловить ImportError при рестарте панели (случай node1 19.08)
-PANEL_FILES = ["webpanel/__init__.py", "webpanel/auth.py", "webpanel/sysinfo.py",
-               "webpanel/hygiene.py",
+PANEL_FILES = ["webpanel/sysinfo.py",
+               "webpanel/hygiene.py", "webpanel/contour_ui.py",
                "webpanel/server.py", "webpanel/views.py", "webpanel/setup_admin.py",
                "webpanel/clients.py", "webpanel/qrcode.py"]
 DNS_SERVICE_FILES = ("redut-dns-rescue.service", "redut-dns-rescue-watchdog.service",
@@ -326,6 +327,10 @@ if keep_admin == "1":
     new["admin"] = cur["admin"] if cur.get("admin") else new.get("admin")
     if new.get("admin") is None:
         new.pop("admin", None)
+    # A code deploy must not rotate the sender or erase owner mail settings.
+    for key in ("atomicmail", "mail", "smtp"):
+        if key in cur:
+            new[key] = cur[key]
 directory = os.path.dirname(p) or "."
 merge_prefix = "." + os.path.basename(p) + ".redut-secrets-merge-"
 fd, out = tempfile.mkstemp(prefix=merge_prefix, dir=directory)
@@ -412,7 +417,9 @@ if not isinstance(incoming, dict):
 def merge(current):
     result = dict(incoming)
     for key in preserve:
-        if isinstance(current.get(key), dict) and current[key]:
+        if key == "mail_transport" and key in current:
+            result[key] = current[key]
+        elif isinstance(current.get(key), dict) and current[key]:
             result[key] = current[key]
     return result
 written = config_store.update({"_source": p}, merge, create=True)
@@ -535,6 +542,47 @@ def local_deploy_preflight(files, secrets_path):
     return local_secrets
 
 
+MAIL_PREPARE_PROGRAM = """import json, sys
+sys.path.insert(0, sys.argv[1])
+try:
+    with open('/etc/vpn-panel/config.json', encoding='utf-8') as source:
+        cfg = json.load(source)
+    if cfg.get('mail_transport', 'smtp') != 'atomicmail':
+        print('REDUT_MAIL_SKIPPED')
+    else:
+        import atomicmail
+        result = atomicmail.ensure_ready('/etc/vpn-panel/secrets.json')
+        print('REDUT_MAIL_READY' if result.get('ready') else 'REDUT_MAIL_DEFERRED')
+except Exception:
+    print('REDUT_MAIL_DEFERRED')
+"""
+
+
+def remote_config_present(c):
+    """Only a truly new clean node gets the new default transport."""
+    rc, _ = run_result(c, "test -e /etc/vpn-panel/config.json || test -L /etc/vpn-panel/config.json")
+    if rc not in (0, 1):
+        raise SystemExit("не удалось определить наличие config.json; деплой отложен")
+    return rc == 0
+
+
+def prepare_remote_mail(c):
+    """Mail preparation is optional; never expose provider bodies or secrets."""
+    try:
+        command = "python3 -c %s %s" % (shlex.quote(MAIL_PREPARE_PROGRAM), shlex.quote(OPT))
+        rc, output = run_result(c, command, t=300)
+        marker = output.strip().splitlines()[-1:] if rc == 0 else []
+        if marker == ["REDUT_MAIL_SKIPPED"]:
+            return False
+        if marker == ["REDUT_MAIL_READY"]:
+            print("  AtomicMail: отправитель готов")
+            return True
+    except Exception:
+        pass
+    print("  AtomicMail: подготовка почты не завершена; повторите её в мастере панели.")
+    return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -550,8 +598,12 @@ def main(argv=None):
                          "поставленных setup.sh со своим профилем (node2: server=node2, "
                          "role=vpn-node2): запись SERVERS здесь сбила бы им имя и роль, "
                          "а роль — это привязка прокси в пуле")
+    ap.add_argument("--mail-transport", choices=("atomicmail", "smtp"), default=None,
+                    help="явно выбрать почтовый транспорт; новый --clean узел использует AtomicMail")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
+    if a.keep_config and a.mail_transport is not None:
+        ap.error("--mail-transport несовместим с --keep-config: конфигурация должна остаться прежней")
 
     secrets_path = os.path.join(PANEL_DIR, ".secrets.local.json")
     if not a.clean and not os.path.isfile(secrets_path):
@@ -584,6 +636,8 @@ def _deploy(a, cfg, files, resources, local_secrets):
     resources.callback(deploy_lock.close)
     remote_dns_preflight(c)
     require_remote_base_contract(c)
+    new_clean_node = (a.clean and not a.keep_config and a.mail_transport is None
+                      and not remote_config_present(c))
 
     # --keep-config means the live file owns the panel port. Resolve and
     # validate it while the network lock is held and before the first upload
@@ -638,7 +692,12 @@ def _deploy(a, cfg, files, resources, local_secrets):
     else:
         final_cfg = {**cfg, "panel_port": a.panel_port}
         preserve = ("money", "countries", "auto_prolong", "update", "stability", "learning",
-                    "dns_rescue")
+                    "dns_rescue", "mail_transport")
+        if a.mail_transport is not None:
+            final_cfg["mail_transport"] = a.mail_transport
+            preserve = tuple(key for key in preserve if key != "mail_transport")
+        elif new_clean_node:
+            final_cfg["mail_transport"] = "atomicmail"
         # A prior interrupted deploy may have replaced server.py while the old
         # process kept running.  Always restart an active compatible payload.
         with remote_panel_config_upgrade_barrier(c, True):
@@ -698,6 +757,7 @@ def _deploy(a, cfg, files, resources, local_secrets):
                           json.dumps(merged_secrets, ensure_ascii=False, indent=2) + "\n",
                           preserve_admin=True)
         print("  secrets.json: SMTP-алерты %s" % ("настроены" if merged_secrets.get("smtp") else "НЕ заданы"))
+    prepare_remote_mail(c)
     with sftp.open("/usr/local/bin/vpn-agent", "w") as f:
         f.write(WRAPPER)
     sftp.chmod("/usr/local/bin/vpn-agent", 0o755)
@@ -723,7 +783,8 @@ def _deploy(a, cfg, files, resources, local_secrets):
     # (без проб); ПОЛНЫЙ прогон проб — раз в 2 ч (было */6 МИНУТ: молотилка 240
     # прогонов/сутки, перекрывавшихся сами с собой, — дока при этом обещала «раз в
     # 6 часов»); лёгкая метка egress для дашборда — */5; пульс ежечасно (§6.3/§6.5)
-    crons = ["*/2 * * * * /usr/local/bin/singbox-watchdog.sh",
+    crons = ["* * * * * /usr/local/bin/vpn-agent contours-tick",
+             "*/2 * * * * /usr/local/bin/singbox-watchdog.sh",
              "*/30 * * * * /usr/local/bin/vpn-agent pool-refresh",
              "17 */2 * * * /usr/local/bin/vpn-agent pool-refresh --probe",
              "*/5 * * * * /usr/local/bin/vpn-agent egress-mark",
@@ -740,6 +801,7 @@ def _deploy(a, cfg, files, resources, local_secrets):
     # самообновления 1.2.0→1.3.0 старая шестиминутная молотилка осталась бы рядом
     # с новой (🟠 ревью E2).
     strip = ("crontab -l 2>/dev/null | grep -v singbox-watchdog "
+             "| grep -v 'vpn-agent contours-tick' "
              "| grep -v 'vpn-agent pool-refresh' | grep -v 'vpn-agent egress-mark' "
              "| grep -v 'vpn-agent heartbeat-check' "
              "| grep -v 'vpn-agent auto-prolong' | grep -v 'vpn-agent self-update'")

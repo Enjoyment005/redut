@@ -87,6 +87,37 @@ class TestCleanup(unittest.TestCase):
             self.assertEqual(hygiene.cleanup_stat(p, now=2000),
                              {"on": True, "last_at": 1000, "freed_24h": 25, "runs_24h": 4})
 
+    def test_previous_redut_collector_is_only_a_lower_bound(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "c.json")
+            with open(path, "w", encoding="utf-8") as target:
+                json.dump({"last_at": 2000, "runs": [
+                    {"at": 1000, "freed": 0, "scope": "redut-owned"},
+                    {"at": 2000, "freed": 4096, "files": 1024, "tmp": 3072,
+                     "scope": "redut-owned", "accounting_version": 2},
+                ]}, target)
+            result = hygiene.cleanup_stat(path, now=2000)
+            self.assertEqual(result["freed_24h"], 4096)
+            self.assertEqual(result["runs_24h"], 2)
+            self.assertEqual(result["measured_runs_24h"], 1)
+            self.assertFalse(result["complete_24h"])
+            result = hygiene.cleanup_stat(path, now=87401)
+            self.assertTrue(result["complete_24h"])
+            self.assertEqual(result["freed_24h"], 4096)
+
+    def test_invalid_measurements_cannot_break_status(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "c.json")
+            with open(path, "w", encoding="utf-8") as target:
+                json.dump({"runs": [
+                    {"at": 1000, "freed": float("nan")},
+                    {"at": 1000, "freed": float("inf")},
+                    {"at": 1000, "freed": -1},
+                    {"at": 1000, "freed": True},
+                    {"at": 1000, "freed": 12},
+                ]}, target)
+            self.assertEqual(hygiene.cleanup_stat(path, now=2000)["freed_24h"], 12)
+
     def test_bad_json_off(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "c.json")

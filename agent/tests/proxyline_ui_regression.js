@@ -8,7 +8,7 @@ function fixture(customApi,storage=new Map()){
   const market={countries:[{code:'us'}],periods:[5,10,30],balance:{balance:100,currency:'USD'}};
   const context=vm.createContext({window:{},document:{getElementById:element,
     querySelector:()=>({innerHTML:'',appendChild:row=>poolRows.push(row)}),createElement:()=>({innerHTML:''})},URLSearchParams,
-    esc:String,country:String,proxyLabel:p=>p.uid,ccBadge:()=>'',fl:()=>'',reloadAll:async()=>{},toast:m=>messages.push(m),
+    __poolRows:new Map(),selectionControls:()=>{},esc:String,country:String,proxyLabel:p=>p.uid,ccBadge:()=>'',fl:()=>'',reloadAll:async()=>{},toast:m=>messages.push(m),
     confirm:()=>{throw Error('extra confirmation')},prompt:()=>{prompts++;return prompted},
     crypto:{randomUUID:()=> 'pl-test-request-'+calls.length},
     sessionStorage:{getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v),removeItem:k=>storage.delete(k)},

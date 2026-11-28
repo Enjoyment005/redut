@@ -364,6 +364,10 @@ def _clear_client_operation():
 
 def _dns_membership_guard(cfg, dns_pool=None, allow_existing_resume=False):
     """Do not change the peer cohort while DNS Rescue owns that cohort."""
+    import contours
+    if contours.secondary(cfg):
+        cfg = contours.main_config(cfg)
+        dns_pool = None
     owned_pool = None
     try:
         if dns_pool is None:
@@ -423,6 +427,8 @@ def _load_client_operation(cfg):
             or not valid_name(operation.get("name"))):
         raise ClientError("pending WireGuard client operation имеет неверную форму")
     if operation["kind"] == "add":
+        if operation.get("contour", "1") not in ("1", "2"):
+            raise ClientError("pending WireGuard client contour неверен")
         try:
             address = ipaddress.ip_address(operation.get("address") or "")
             subnet = ipaddress.ip_network(cfg.get("subnet") or "10.8.0.0/24",
@@ -457,6 +463,19 @@ def _load_client_operation(cfg):
     if resolution == "rollback" and not operation.get("rollback_wg_config"):
         raise ClientError("pending WireGuard rollback не содержит server config")
     return operation
+
+
+def _assign_new_client(cfg, operation):
+    """Persist the requested contour before exposing a new WireGuard profile."""
+    if operation.get("contour", "1") != "2":
+        return
+    import contours
+    try:
+        result = contours.assign(cfg, operation["pubkey"], "2", _locked=True)
+        if result.get("existing"):
+            contours.reconcile_network(cfg, _locked=True)
+    except (contours.ContourError, apply_mod.ApplyError) as error:
+        raise ClientError(str(error)) from error
 
 
 def reconcile_client_operation(cfg, _locked=False, dns_pool=None):
@@ -495,6 +514,13 @@ def reconcile_client_operation(cfg, _locked=False, dns_pool=None):
                         or os.path.exists(client_path)):
                     raise ClientError("pending durable add rollback не подтверждён")
             else:
+                import contours
+                main = contours.main_config(cfg)
+                if contours.read(main)["assignments"].get(pubkey) == "2":
+                    try:
+                        contours.reconcile_network(main, _locked=True)
+                    except (contours.ContourError, apply_mod.ApplyError) as error:
+                        raise ClientError(str(error)) from error
                 rollback_allowed = operation.get("rollback_allowed_ips") or [address + "/32"]
                 _set_live_peer_allowed_ips(
                     pubkey, operation.get("rollback_psk"), rollback_allowed)
@@ -512,6 +538,7 @@ def reconcile_client_operation(cfg, _locked=False, dns_pool=None):
                     raise ClientError("pending durable delete rollback не подтверждён")
         elif operation["kind"] == "add":
             _atomic_write(WG_CONF, operation["wg_config"], 0o600)
+            _assign_new_client(cfg, operation)
             _set_live_peer(pubkey, operation.get("psk"), address)
             if not _live_peer_matches(pubkey, address):
                 raise ClientError("pending live peer add не подтверждён")
@@ -538,6 +565,14 @@ def reconcile_client_operation(cfg, _locked=False, dns_pool=None):
         # The target is already proven.  Keeping an idempotent marker cannot
         # change the externally reported outcome on the next reconciliation.
         pending = True
+    import contours
+    main = contours.main_config(cfg)
+    registry = contours.read(main)
+    if registry["secondary"]:
+        _, _, known = contours.peer_addresses(main, registry)
+        registry["assignments"] = {key: value for key, value in registry["assignments"].items() if key in known}
+        contours.write(main, registry)
+        contours.reconcile_network(main, _locked=True)
     return {"ok": True, "action": "client-operation-reconciled",
             "recovery_pending": pending}
 
@@ -554,9 +589,49 @@ def next_free_ip(cfg, params=None):
     raise ClientError("свободных адресов в подсети нет")
 
 
-def client_inventory(cfg):
-    """Return readable peers even when strict allocation is currently unavailable."""
+def contour_clients(cfg, rows, contour):
+    """Return only explicitly assigned peers; unassigned peers belong to primary."""
+    if contour is None:
+        return rows
+    if contour not in ("1", "2"):
+        raise ClientError("Неизвестный контур")
+    import contours
+    main = contours.main_config(cfg)
+    assignments = contours.read(main)["assignments"]
+    pending = _load_client_operation(main)
+    if pending and pending["kind"] == "add":
+        if pending.get("resolution") == "rollback":
+            rows = [row for row in rows if row.get("pubkey") != pending["pubkey"]]
+        else:
+            assignments[pending["pubkey"]] = pending.get("contour", "1")
+    return [dict(row, contour=contour) for row in rows
+            if assignments.get(row.get("pubkey"), "1") == contour]
+
+
+def require_contour_client(cfg, contour, name=None, pubkey=None, conf_name=None):
+    """Resolve one live peer before exporting, moving or revoking its access."""
     rows = list_clients(cfg)
+    if pubkey is not None:
+        matches = [row for row in rows if row["pubkey"] == pubkey]
+    elif conf_name is not None:
+        matches = [row for row in rows if row.get("conf_name") == conf_name]
+    else:
+        matches = [row for row in rows
+                   if name in (row.get("name"), row.get("conf_name"))]
+    if len(matches) != 1 or not contour_clients(cfg, matches, contour):
+        raise ClientError("Устройство не относится к выбранному контуру")
+    return matches[0]
+
+
+def client_inventory(cfg, contour=None, _locked=False):
+    """Read peers, assignment and pending intent as one consistent snapshot."""
+    if contour is not None and not _locked:
+        try:
+            with apply_mod.Flock(cfg.get("lock") or "/run/vpn-agent.lock"):
+                return client_inventory(cfg, contour=contour, _locked=True)
+        except apply_mod.ApplyError as error:
+            raise ClientError(str(error)) from error
+    rows = contour_clients(cfg, list_clients(cfg), contour)
     try:
         next_ip = next_free_ip(cfg)
     except ClientError as error:
@@ -566,15 +641,23 @@ def client_inventory(cfg):
 
 
 # ─────────────────────────── создать / удалить ──────────────────────────
-def add_client(cfg, name, _locked=False, dns_pool=None):
+def add_client(cfg, name, _locked=False, dns_pool=None, contour="1"):
     if not _locked:
         try:
             with apply_mod.Flock(cfg.get("lock") or "/run/vpn-agent.lock"):
-                return add_client(cfg, name, _locked=True, dns_pool=dns_pool)
+                return add_client(cfg, name, _locked=True, dns_pool=dns_pool, contour=contour)
         except apply_mod.ApplyError as error:
             raise ClientError(str(error))
-    reconcile_client_operation(cfg, _locked=True, dns_pool=dns_pool)
+    recovered = reconcile_client_operation(cfg, _locked=True, dns_pool=dns_pool)
+    if recovered.get("recovery_pending"):
+        raise ClientError("Выдача или отзыв доступа ещё восстанавливается; повторите позже")
+    import contours
+    contours.sync_membership(cfg)
     _dns_membership_guard(cfg, dns_pool=dns_pool)
+    if contour not in ("1", "2"):
+        raise ClientError("Неизвестный контур")
+    if contour == "2" and contours.read(cfg)["secondary"] != "ready":
+        raise ClientError("Второй контур недоступен")
     if not valid_name(name):
         raise ClientError("имя: латиница/цифры/._- до 32 символов")
     p = server_params(cfg)
@@ -597,12 +680,13 @@ def add_client(cfg, name, _locked=False, dns_pool=None):
     conf = client_conf_build(p, name, priv, psk, ip)
     client_path = os.path.join(CLIENTS_DIR, name + ".conf")
     operation = {
-        "kind": "add", "name": name, "pubkey": pub, "psk": psk,
+        "kind": "add", "name": name, "pubkey": pub, "psk": psk, "contour": contour,
         "address": ip, "wg_config": text, "client_conf": conf,
         "rollback_wg_config": original}
     _write_client_operation(operation)
     try:
         _atomic_write(WG_CONF, text, 0o600)
+        _assign_new_client(cfg, operation)
         _set_live_peer(pub, psk, ip)
         if not _live_peer_matches(pub, ip):
             raise ClientError("live WireGuard peer не подтверждён")
@@ -633,7 +717,7 @@ def add_client(cfg, name, _locked=False, dns_pool=None):
         pending = False
     except OSError:
         pending = True
-    return {"name": name, "ip": ip, "pubkey": pub,
+    return {"name": name, "ip": ip, "pubkey": pub, "contour": contour,
             "recovery_pending": pending}
 
 
@@ -655,15 +739,23 @@ def _stored_conf_for_peer(target):
     return matches[0] if matches else None
 
 
-def delete_client(cfg, name, pubkey=None, _locked=False, dns_pool=None):
+def delete_client(cfg, name, pubkey=None, _locked=False, dns_pool=None, contour=None):
     if not _locked:
         try:
             with apply_mod.Flock(cfg.get("lock") or "/run/vpn-agent.lock"):
                 return delete_client(
-                    cfg, name, pubkey=pubkey, _locked=True, dns_pool=dns_pool)
+                    cfg, name, pubkey=pubkey, _locked=True, dns_pool=dns_pool, contour=contour)
         except apply_mod.ApplyError as error:
             raise ClientError(str(error))
-    reconcile_client_operation(cfg, _locked=True, dns_pool=dns_pool)
+    if contour is not None:
+        require_contour_client(cfg, contour, name=name, pubkey=pubkey)
+    recovered = reconcile_client_operation(cfg, _locked=True, dns_pool=dns_pool)
+    if recovered.get("recovery_pending"):
+        raise ClientError("Выдача или отзыв доступа ещё восстанавливается; повторите позже")
+    if contour is not None:
+        require_contour_client(cfg, contour, name=name, pubkey=pubkey)
+    import contours
+    contours.sync_membership(cfg)
     _dns_membership_guard(cfg, dns_pool=dns_pool)
     if pubkey is None and not valid_name(name):
         raise ClientError("плохое имя")
@@ -752,6 +844,7 @@ def delete_client(cfg, name, pubkey=None, _locked=False, dns_pool=None):
             _clear_client_operation()
         except OSError:
             pending = True
+    contours.sync_membership(cfg)
     return {"name": name or operation_name, "pubkey": pub,
             "removed_peer": bool(pub), "removed_conf": had_conf,
             "recovery_pending": pending}
@@ -798,7 +891,14 @@ def client_conf_build(p, name, priv, psk, ip):
             % (priv, ip, p["dns"], p["server_pub"], psk, p["host"], p["port"]))
 
 
-def client_conf_text(name):
+def client_conf_text(name, cfg=None, contour=None):
+    if contour is not None:
+        try:
+            with apply_mod.Flock(cfg.get("lock") or "/run/vpn-agent.lock"):
+                require_contour_client(cfg, contour, conf_name=name)
+                return client_conf_text(name)
+        except apply_mod.ApplyError as error:
+            raise ClientError(str(error)) from error
     if not valid_name(name):
         raise ClientError("плохое имя")
     path = os.path.join(CLIENTS_DIR, name + ".conf")

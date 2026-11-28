@@ -11,6 +11,7 @@ import json
 import os
 import random
 import time
+import contours
 import uuid
 
 import apply as apply_mod
@@ -440,7 +441,7 @@ def status(cfg, pool):
     raw = pool.dns_state()
     state = dict(raw)
     state["configured_mode"] = (cfg.get("dns_rescue") or {}).get("mode", "disabled")
-    state["effective_active"] = _physical(cfg, raw)
+    state["effective_active"] = False if contours.secondary(cfg) else _physical(cfg, raw)
     current_slot = next((item for item in _slots(cfg)
                          if item.get("id") == raw.get("active_slot")), None)
     state["proof_fresh"] = bool(
@@ -509,6 +510,8 @@ probe_listener = probe_backend
 
 
 def observe(cfg, pool):
+    if contours.secondary(cfg):
+        raise DNSRescueError("DNS Rescue доступен только в основном контуре")
     block = cfg.get("dns_rescue") or {}
     if not block.get("owner_approved") or not block.get("active_probes"):
         return {"ok": False, "skipped": "active probes are not approved"}
@@ -581,6 +584,9 @@ def observe(cfg, pool):
 
 def _validate_scope_locked(cfg, pool, scope, automatic, continuation=False,
                            profile_class=None, deadline_monotonic=None):
+    import contours
+    if contours.scope_conflicts(cfg, str(scope)):
+        raise DNSRescueError("DNS Rescue scope overlaps the second contour")
     _allowed(cfg, automatic=automatic, continuation=continuation)
     block = cfg.get("dns_rescue") or {}
     if os.name != "posix":
@@ -953,6 +959,8 @@ def _activate_locked(cfg, pool, scope="all", slot_id=None, actor="user",
 
 def activate(cfg, pool, scope="all", slot_id=None, actor="user", automatic=False,
              log=print, _locked=False, incident_id=None, profile_class=None):
+    if contours.secondary(cfg):
+        raise DNSRescueError("DNS Rescue доступен только в основном контуре")
     def run():
         return _activate_locked(cfg, pool, scope, slot_id, actor, automatic, log,
                                 incident_id, profile_class=profile_class)
@@ -1235,6 +1243,8 @@ def _deactivate_locked(cfg, pool, actor="user", reason="manual",
 
 
 def deactivate(cfg, pool, actor="user", reason="manual", _locked=False):
+    if contours.secondary(cfg):
+        raise DNSRescueError("DNS Rescue доступен только в основном контуре")
     if os.name != "posix":
         return {"ok": False, "action": "unsupported", "state": pool.dns_state()}
     if _locked:
@@ -1813,6 +1823,8 @@ def _reconcile_locked(cfg, pool, actor):
 
 
 def reconcile(cfg, pool, actor="recovery", _locked=False):
+    if contours.secondary(cfg):
+        return pool.dns_state()
     if os.name != "posix":
         return pool.set_dns_state(phase="failed", active_scope=None, active_slot=None,
                                   active_kind=None, last_error="recovery-requires-linux")
@@ -2517,6 +2529,8 @@ def _automatic_tick_locked(cfg, pool, automat_state, manual_emergency, log):
 
 def automatic_tick(cfg, pool, automat_state, manual_emergency=False, log=print,
                    _locked=False):
+    if contours.secondary(cfg):
+        return {"ok": True, "action": "disabled", "state": pool.dns_state()}
     def run():
         current_automat = pool.get_setting("automat_state") or automat_state
         current_manual = pool.get_setting("emergency_manual") == "1"
@@ -2533,6 +2547,8 @@ def automatic_tick(cfg, pool, automat_state, manual_emergency=False, log=print,
 
 
 def prepare_for_emergency_exit(cfg, pool, actor="auto", log=print, _locked=False):
+    if contours.secondary(cfg):
+        return {"ok": True, "action": "disabled", "state": pool.dns_state()}
     """Remove every DNS interception before the data-plane may leave EMERGENCY."""
     def run():
         state = pool.dns_state()
@@ -2778,6 +2794,8 @@ def _resume_after_exit_failure_locked(cfg, pool, actor="recovery", log=print):
 
 def resume_after_emergency_exit_failure(cfg, pool, actor="recovery", log=print,
                                         _locked=False):
+    if contours.secondary(cfg):
+        return {"ok": True, "action": "disabled", "state": pool.dns_state()}
     if os.name != "posix":
         return {"ok": False, "action": "unsupported", "state": pool.dns_state()}
     if _locked:

@@ -289,6 +289,8 @@ def deploy_panel(p, net, args):
     argv = [p["name"], "--with-panel", "--panel-port", str(p["panel_port"])]
     if clean:
         argv.append("--clean")
+    if getattr(args, "smtp", False):
+        argv.extend(("--mail-transport", "smtp"))
     if args.regen_cert:
         argv.append("--regen-cert")
     print("\n=== ПАНЕЛЬ/АГЕНТ (panel/deploy.py %s) ===" % " ".join(argv))
@@ -422,6 +424,8 @@ def main(argv=None):
     ap.add_argument("--no-panel", action="store_true", help="только база, без веб-панели/агента")
     ap.add_argument("--skip-base", action="store_true", help="пропустить install.sh (только панель/verify)")
     ap.add_argument("--regen-cert", action="store_true", help="перевыпустить cert панели")
+    ap.add_argument("--smtp", action="store_true",
+                    help="прежний SMTP-мастер вместо AtomicMail для новой чистой установки")
     ap.add_argument("--seed-secrets", action="store_true",
                     help="пре-сид секретов из panel/.secrets.local.json + setup_admin (авто-режим). "
                          "По умолчанию — ЧИСТАЯ установка: провайдер/2FA/пароль/почту вводит владелец "

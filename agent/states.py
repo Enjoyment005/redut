@@ -32,6 +32,7 @@ import time
 import urllib.parse
 import uuid
 
+import contours
 import apply as apply_mod
 import config_store
 import country as country_mod
@@ -93,6 +94,10 @@ IPTABLES = "/usr/sbin/iptables"
 
 # Прямые проверки живости сети (мимо прокси). -k: 1.1.1.1/8.8.8.8 по IP без валид. cert.
 NET_CHECK_URLS = ("https://api.ipify.org", "https://1.1.1.1", "https://8.8.8.8")
+
+
+def _emergency_flag(cfg=None):
+    return (cfg or {}).get("emergency_flag") or EMERGENCY_FLAG
 
 
 def _emergency_intent(cfg=None):
@@ -167,6 +172,18 @@ def selection_state(pool, cfg=None, current_host=None):
         mode = SELECTION_AUTO
     host = pool.get_setting("manual_host") if mode == SELECTION_MANUAL else None
     uid = pool.get_setting("manual_uid") if mode == SELECTION_MANUAL else None
+    is_current = bool(mode == SELECTION_MANUAL and host and current_host and host == current_host)
+    if is_current and cfg and uid:
+        row = pool.get(uid)
+        fingerprint = pool.get_setting("manual_outbound_fingerprint")
+        if fingerprint:
+            try:
+                live = apply_mod.load_json(cfg["singbox_config"])
+                is_current = fingerprint == apply_mod.outbound_fingerprint(live.get("outbounds", []))
+            except (OSError, ValueError, KeyError):
+                is_current = False
+        elif row and row.get("protocol") == "vless":
+            is_current = apply_mod.matches_current(row, current_host, cfg)
     return {
         "mode": mode,
         "strategy": country_mod.strategy(cfg),
@@ -174,8 +191,7 @@ def selection_state(pool, cfg=None, current_host=None):
         "manual_host": host,
         "manual_since": (pool.get_setting("manual_since")
                          if mode == SELECTION_MANUAL else None),
-        "is_current": bool(mode == SELECTION_MANUAL and host and current_host
-                           and host == current_host),
+        "is_current": is_current,
     }
 
 
@@ -203,6 +219,22 @@ def selection_revision_state(pool, cfg=None):
             "kind": kind, "payload": payload}
 
 
+def selection_attempt_state(pool, revision):
+    """Latest worker result for exactly this request; a policy hold stays retryable."""
+    try:
+        value = json.loads(pool.get_setting("selection_attempt") or "null")
+    except (TypeError, ValueError):
+        return None
+    if (not isinstance(value, dict) or type(value.get("revision")) is not int
+            or value["revision"] != revision["desired"]
+            or revision["kind"] != "strategy"
+            or value.get("state") not in ("running", "done")):
+        return None
+    return {"revision": value["revision"], "state": value["state"],
+            "ok": value.get("ok") is True,
+            "action": str(value.get("action") or "")[:64]}
+
+
 def request_strategy_selection(pool, cfg, strategy, actor="user", reason="strategy",
                                pending_config=False):
     """Новое AUTO(strategy) намерение; applied догонит только после convergence."""
@@ -211,7 +243,7 @@ def request_strategy_selection(pool, cfg, strategy, actor="user", reason="strate
     revision = pool.request_selection_intent(
         "strategy", {"strategy": strategy},
         {"selection_mode": SELECTION_AUTO, "manual_uid": None,
-         "manual_host": None, "manual_since": None,
+         "manual_host": None, "manual_since": None, "manual_outbound_fingerprint": None,
          "selection_strategy_override": strategy if pending_config else None},
         actor=actor, applied=False, detail=reason)
     return revision
@@ -221,16 +253,22 @@ def mark_selection_applied(pool, revision, actor="auto", detail=""):
     return pool.mark_selection_applied(revision, actor=actor, detail=detail)
 
 
-def set_manual_selection(pool, uid, host, actor="user", reason="manual-apply"):
+def set_manual_selection(pool, uid, host, actor="user", reason="manual-apply", cfg=None):
     """Атомарно закрепить успешно применённый человеком канал."""
     if not host:
         raise ValueError("ручной канал нельзя закрепить без host")
     was = selection_state(pool)
     manual_uid = uid or ("live:%s" % host)
+    fingerprint = None
+    row = pool.get(uid) if uid else None
+    if cfg and row and row.get("protocol") == "vless":
+        live = apply_mod.load_json(cfg["singbox_config"])
+        fingerprint = apply_mod.outbound_fingerprint(live.get("outbounds", []))
     pool.request_selection_intent(
         "manual", {"uid": manual_uid, "host": host},
         {"selection_mode": SELECTION_MANUAL, "manual_uid": manual_uid,
          "manual_host": host, "manual_since": _now_iso(),
+         "manual_outbound_fingerprint": fingerprint,
          "selection_strategy_override": None},
         actor=actor, applied=True, detail=reason)
     pool.log_event("selection-mode", actor=actor, to_uid=uid,
@@ -249,6 +287,7 @@ def set_auto_selection(pool, cfg=None, strategy=None, actor="user", reason="stra
         "manual_uid": None,
         "manual_host": None,
         "manual_since": None,
+        "manual_outbound_fingerprint": None,
     })
     if was["mode"] != SELECTION_AUTO or log_unchanged:
         pool.log_event("selection-mode", actor=actor, result=SELECTION_AUTO,
@@ -317,10 +356,25 @@ def reconcile_strategy_override(cfg, pool, log=print):
 
 def release_manual_on_fault(cfg, pool, actor="auto", reason="confirmed-proxy-fault",
                             log=print):
-    """MANUAL -> AUTO(speed) только после подтверждённого отказа самого прокси."""
+    """Release a failed manual pin only when the contour permits failover."""
     st = selection_state(pool, cfg)
     if st["mode"] != SELECTION_MANUAL:
         return {"released": False, "strategy": country_mod.strategy(cfg)}
+    if contours.secondary(cfg):
+        import dns_policy
+        try:
+            strict = dns_policy.strict(apply_mod.load_json(cfg["singbox_config"]))
+            blocked_detail = ("Строгий режим: ручной сервер недоступен или изменён; "
+                              "фиксация сохранена, автоматическая замена запрещена") if strict else None
+        except (OSError, ValueError, KeyError):
+            # An unreadable policy is not permission to discard the owner's pin.
+            blocked_detail = "Не удалось проверить DNS-политику; ручная фиксация сохранена"
+        if blocked_detail:
+            pool.log_event("manual-failover", actor=actor, from_uid=st.get("manual_uid"),
+                           result="strict-blocked", detail=reason + "; " + blocked_detail)
+            log("  " + blocked_detail)
+            return {"released": False, "blocked": True,
+                    "strategy": country_mod.strategy(cfg), "detail": blocked_detail}
     revision = selection_revision_state(pool, cfg)["desired"]
     detail = ("%s; ручной %s (%s) отказал — включаю Скорость и отклик"
               % (reason, st.get("manual_uid") or "?", st.get("manual_host") or "?"))
@@ -409,7 +463,7 @@ def finish_explicit_apply(cfg, pool, uid, host, verify=None, source="manual",
     def finish():
         state_before = pool.get_setting("automat_state") or OK
         in_direct = (state_before in (EMERGENCY, ROTATING)
-                     or os.path.exists(EMERGENCY_FLAG)
+                     or os.path.exists(_emergency_flag(cfg))
                      or os.path.exists(_emergency_intent(cfg)))
         if in_direct:
             prepared = _prepare_dns_emergency_exit(cfg, pool, actor=actor, log=log)
@@ -455,7 +509,7 @@ def finish_explicit_apply(cfg, pool, uid, host, verify=None, source="manual",
             pool.set_egress(verify)
         if source == "manual":
             return set_manual_selection(pool, uid, host, actor=actor,
-                                        reason="ручное «В бой»")
+                                        reason="ручное «В бой»", cfg=cfg)
         return set_auto_selection(pool, cfg, actor=actor,
                                   reason="apply source=%s" % source)
 
@@ -582,6 +636,8 @@ def _marked_middleman_route_matches(dev):
 
 def singbox_health(cfg, direct=False):
     """Prove service, TUN and the effective marked client path end to end."""
+    if contours.secondary(cfg):
+        return contours.health(cfg, direct=direct)
     rc, act = apply_mod.run_cmd(["systemctl", "is-active", "sing-box"])
     active = rc == 0 and act.strip() == "active"
     tun0 = False
@@ -609,6 +665,13 @@ def try_self_heal(cfg, log, keep_direct=False):
     раньше каждый ретрай безусловно возвращал default в мёртвый tun0 на всё
     время попытки, и клиенты моргали минутами (node1/README §12.6). Маршрут
     вернёт _leave_direct после подтверждённого живого egress."""
+    if contours.secondary(cfg):
+        if not contours.health(cfg, direct=keep_direct)["active"]:
+            apply_mod.restart_for(cfg)
+            apply_mod.wait_for(cfg)
+        contours.reconcile_network(cfg, _locked=True)
+        return contours.health(cfg, direct=keep_direct)["ok"]
+
     def restore_route():
         rc, out = apply_mod.run_cmd(
             ["ip", "route", "replace", "default", "dev", "tun0",
@@ -674,8 +737,8 @@ def try_self_heal(cfg, log, keep_direct=False):
 
     log("  self-heal: рестарт sing-box%s"
         % ("" if keep_direct else " + маршрут middleman после tun0"))
-    apply_mod.restart_singbox()
-    apply_mod.wait_tun0()
+    apply_mod.restart_for(cfg)
+    apply_mod.wait_for(cfg)
     # Restart recreates tun0 and the kernel removes routes bound to the old
     # interface.  Re-read first, then publish/verify the full path.
     return repair_path(singbox_health(cfg, direct=keep_direct))
@@ -694,11 +757,11 @@ def _mode(type_port):
     return "%s :%s" % ("SOCKS5" if t == "socks" else "HTTP" if t == "http" else t, p)
 
 
-def _pool_row_by_host(pool, host):
+def _pool_row_by_host(pool, host, cfg=None):
     if not host:
         return None
     for r in pool.list(include_gone=True):
-        if r["host"] == host:
+        if apply_mod.matches_current(r, host, cfg):
             return r
     return None
 
@@ -858,7 +921,7 @@ def rank_candidates(rows, cfg=None, current_host=None):
         # панель дёргала IP ради мизерной разницы. Ротация передаёт список без
         # текущего host, поэтому аварийный failover бонусом не затрагивается.
         full, base = probe_mod.score_from_row(
-            r, cfg, is_current=bool(current_host and probe_mod._rget(r, "host") == current_host))
+            r, cfg, is_current=apply_mod.matches_current(dict(r), current_host, cfg))
         if full is None and probe_mod._rget(r, "last_probe_at"):
             weight = probe_mod.freshness_weight(r, cfg)
             unknown_base = FAILED_SCORE * weight + UNPROBED_SCORE * (1.0 - weight)
@@ -918,7 +981,14 @@ def selectable_candidates(pool, cfg, current_host, providers=None):
     providers (П7): активные адаптеры — строки провайдера без ключа не кандидаты
     (второй пояс поверх gone: продлить/проверить их всё равно нечем). Заодно
     честными становятся ensure_reserve и try_replenish."""
-    rows = pool.rotation_candidates(exclude_host=current_host)
+    try:
+        live = apply_mod.load_json(cfg["singbox_config"])
+    except (OSError, ValueError, KeyError):
+        live = {}
+    is_vless = any(o.get("tag") == "socks-out" and o.get("type") == "vless" for o in live.get("outbounds", []))
+    rows = pool.rotation_candidates(exclude_host=None if is_vless else current_host)
+    if is_vless:
+        rows = [r for r in rows if not apply_mod.matches_current(r, current_host, cfg, live)]
     if providers is not None:
         rows = [r for r in rows if r["provider"] in providers]
     return rank_candidates(rows, cfg)
@@ -926,6 +996,15 @@ def selectable_candidates(pool, cfg, current_host, providers=None):
 
 def _row_from_sb(sb, host):
     """Синтетическая запись из live-конфига, если upstream не из пула (ручной)."""
+    for outbound in sb.get("outbounds", []):
+        if outbound.get("tag") == "socks-out" and outbound.get("type") == "vless":
+            import hashlib
+            value = {k: v for k, v in outbound.items() if k not in ("tag", "domain_resolver", "bind_interface")}
+            encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
+            return {"uid": "live:" + host, "provider": "live", "ext_id": host, "host": host,
+                    "ip": host, "protocol": "vless", "endpoint_port": outbound["server_port"], "connection_json": encoded,
+                    "connection_digest": hashlib.sha256(encoded.encode()).hexdigest(),
+                    "role": "auto", "kind": "subscription", "ip_version": 4, "fail_count": 0}
     socks = http = None
     user = pw = ""
     for o in sb.get("outbounds", []):
@@ -952,7 +1031,7 @@ def _check_cb(providers, row):
 def _probe(pool, providers, row, current_host, cfg=None, persist=True):
     pool.observe_provider_errors(providers, actor="auto")
     res = probe_mod.probe(row, provider_check=_check_cb(providers, row))
-    is_cur = (row.get("host") == current_host)
+    is_cur = apply_mod.matches_current(row, current_host, cfg)
     res["score"] = probe_mod.score(row, res, is_current=is_cur, cfg=cfg)
     classification = health_mod.classify_probe_result(res, cfg=cfg)
     res["persistence_outcome"] = classification["outcome"]
@@ -1049,7 +1128,7 @@ def _converge_strategy_locked(cfg, providers, pool, log=print, actor="user"):
     # До любого проактивного сравнения измеряем stale боевой канал напрямую через
     # его proxy credentials — без переключения и разрыва текущих соединений.
     current_row = next((row for row in pool.list(include_gone=True)
-                        if current_host and row["host"] == current_host), None)
+                        if apply_mod.matches_current(row, current_host, cfg)), None)
     synthetic_current = current_row is None and bool(current_host)
     if synthetic_current:
         current_row = _row_from_sb(sb, current_host)
@@ -1086,7 +1165,7 @@ def _converge_strategy_locked(cfg, providers, pool, log=print, actor="user"):
             return {"ok": False, "action": "empty", "detail": detail,
                     "strategy": desired, "tried": tried}
         top = ranked[0]
-        if current_host and top["host"] == current_host:
+        if apply_mod.matches_current(top, current_host, cfg):
             if (probe_mod.freshness_weight(top, cfg) < 1.0
                     or not bool(probe_mod._rget(top, "probe_ok"))):
                 tried.append(top["uid"])
@@ -1142,7 +1221,7 @@ def _converge_strategy_locked(cfg, providers, pool, log=print, actor="user"):
             cfg, providers, pool, current_host,
             extra_rows=[current_extra] if current_extra else None,
             include_stickiness=False)
-        if not reranked or (current_host and reranked[0]["host"] == current_host):
+        if not reranked or (apply_mod.matches_current(reranked[0], current_host, cfg)):
             detail = "после свежей пробы текущий канал сохранил преимущество"
             emit_strategy("stable-after-probe", detail, reranked or ranked)
             revision_done(detail)
@@ -1155,7 +1234,7 @@ def _converge_strategy_locked(cfg, providers, pool, log=print, actor="user"):
             continue
         decision = None
         current_live = next((item for item in reranked
-                             if current_host and item["host"] == current_host), None)
+                             if apply_mod.matches_current(item, current_host, cfg)), None)
         if current_live is not None:
             current_score = probe_mod.score_from_row(current_live, cfg, is_current=False)[0]
             candidate_score = probe_mod.score_from_row(reranked[0], cfg,
@@ -1234,7 +1313,14 @@ def converge_strategy(cfg, providers, pool, log=print, actor="user", wait_second
     while True:
         try:
             with apply_mod.Flock(cfg.get("lock") or "/run/vpn-agent.lock"):
-                return _converge_strategy_locked(cfg, providers, pool, log=log, actor=actor)
+                revision = selection_revision_state(pool, cfg)
+                attempt = {"revision": revision["desired"], "state": "running"}
+                pool.set_setting("selection_attempt", json.dumps(attempt))
+                result = _converge_strategy_locked(cfg, providers, pool, log=log, actor=actor)
+                attempt.update(state="done", ok=result.get("ok") is True,
+                               action=result.get("action"))
+                pool.set_setting("selection_attempt", json.dumps(attempt))
+                return result
         except apply_mod.ApplyError as e:
             if "flock" not in str(e).lower() or time.monotonic() >= deadline:
                 detail = "agent занят: %s" % e
@@ -1331,6 +1417,7 @@ def rotate(cfg, providers, pool, alerter, reason="manual", actor="auto",
 
 
 def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, state_before):
+    contours.ensure_ready(cfg)
     reconcile_strategy_override(cfg, pool, log)
     try:
         current_host = apply_mod.current_upstream(apply_mod.load_json(cfg["singbox_config"]))
@@ -1342,13 +1429,15 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
         return _transition_failed(pool, result, state_before, "config-unavailable", detail)
     selection = selection_state(pool, cfg, current_host)
     if (selection["mode"] == SELECTION_MANUAL
-            and selection.get("manual_host") != current_host):
+            and not selection["is_current"]):
         # Конфиг сменился в обход штатного explicit-apply (ручная правка/rollback
         # старой версии). Закреплять уже несуществующий host опаснее, чем честно
         # вернуться к измеряемому дефолту.
-        release_manual_on_fault(cfg, pool, actor=actor,
-                                reason="manual-pin-drift: live=%s" % (current_host or "none"),
-                                log=log)
+        manual_release = release_manual_on_fault(
+            cfg, pool, actor=actor,
+            reason="manual-pin-drift: live=%s" % (current_host or "none"), log=log)
+        if manual_release.get("blocked"):
+            return _state(pool, result, DEGRADED, "strict-manual-blocked", manual_release["detail"])
         selection = selection_state(pool, cfg, current_host)
     if state_before == EMERGENCY:
         pool.set_setting("emergency_last_retry", _now_iso())
@@ -1360,10 +1449,10 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
     alive, via = net_result[:2]
     net_evidence = (net_result[2] if len(net_result) > 2 else [health_mod.evidence(
         "server_network", alive, target=via or "direct", via_proxy=False)])
-    egress = apply_mod.verify_egress()
+    egress = apply_mod.verify_for(cfg)
     pool.set_egress(egress)          # дашборд показывает эту метку, сам пробу не гоняет
     in_direct = (state_before in (EMERGENCY, ROTATING)
-                 or os.path.exists(EMERGENCY_FLAG) or os.path.exists(_emergency_intent(cfg)))
+                 or os.path.exists(_emergency_flag(cfg)) or os.path.exists(_emergency_intent(cfg)))
     # In direct mode the expected marked path is the owned WAN route, not tun0.
     sb_h = singbox_health(cfg, direct=in_direct)
     sb_ok = sb_h["ok"]
@@ -1407,11 +1496,11 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
 
     if d == "self_heal":
         if (try_self_heal(cfg, log, keep_direct=in_direct)
-                and apply_mod.verify_egress()["ok"]):
+                and apply_mod.verify_for(cfg)["ok"]):
             pool.log_event("self-heal", actor=actor, result="ok", detail="sing-box/tun0 восстановлены")
             _reset_streaks(pool)
             if in_direct and not _leave_direct(
-                    cfg, pool, alerter, apply_mod.verify_egress(), log, actor, state_before):
+                    cfg, pool, alerter, apply_mod.verify_for(cfg), log, actor, state_before):
                     return _direct_exit_failed(pool, result, state_before)
             return _state(pool, result, OK, "self-heal", "sing-box восстановлен")
         if egress.get("ok"):
@@ -1434,7 +1523,7 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
     if rt.get("ok"):
         _reset_streaks(pool)
         if in_direct and not _leave_direct(
-                cfg, pool, alerter, rt.get("verify") or apply_mod.verify_egress(),
+                cfg, pool, alerter, rt.get("verify") or apply_mod.verify_for(cfg),
                 log, actor, state_before):
             return _direct_exit_failed(pool, result, state_before)
         return _state(pool, result, OK, "retune", rt.get("detail", "RETUNE ок"))
@@ -1480,7 +1569,7 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
         pool.set_setting("automat_state", SUSPECT)
         log("  SUSPECT: первый провал verify — подтверждаю повтором через %d с (F1)" % RECHECK_DELAY_SEC)
         time.sleep(RECHECK_DELAY_SEC)
-        egress2 = apply_mod.verify_egress()
+        egress2 = apply_mod.verify_for(cfg)
         pool.set_egress(egress2)
         if egress2["ok"]:
             _reset_streaks(pool)
@@ -1505,6 +1594,8 @@ def _rotate_locked(cfg, providers, pool, alerter, reason, actor, log, result, st
                        detail="health quorum and repeat verification confirmed proxy fault")
     manual_release = release_manual_on_fault(
         cfg, pool, actor=actor, reason="подтверждённый отказ перед ROTATING", log=log)
+    if manual_release.get("blocked"):
+        return _state(pool, result, DEGRADED, "strict-manual-blocked", manual_release["detail"])
     if manual_release.get("released"):
         result["manual_released"] = True
         result["fallback_strategy"] = MANUAL_FALLBACK_STRATEGY
@@ -1658,7 +1749,7 @@ def try_retune(cfg, providers, pool, alerter, log, actor, prior_evidence=None):
         return {"ok": False, "why": "нет текущего upstream"}
     cur_socks = _outbound_of(sb, "socks-out")
     cur_tg = _outbound_of(sb, "http-tg")
-    row = _pool_row_by_host(pool, host) or _row_from_sb(sb, host)
+    row = _pool_row_by_host(pool, host, cfg) or _row_from_sb(sb, host)
     res = _probe(pool, providers, row, host, cfg, persist=False)
     if res.get("disqualified") or not res.get("ok"):
         if res.get("disqualified") in ("no-combo", "provider-check-dead+no-combo"):
@@ -1684,9 +1775,7 @@ def try_retune(cfg, providers, pool, alerter, log, actor, prior_evidence=None):
         pool.record_probe(row["uid"], res, is_current=True,
                           strategy=country_mod.strategy(cfg))
     try:
-        socks_out, http_tg, _ = apply_mod.choose_outbounds(
-            host, row.get("user") or "", row.get("password") or "",
-            res.get("socks_port"), res.get("http_port"))
+        socks_out, http_tg, _ = apply_mod.candidate_outbounds(row, res, cfg)
     except apply_mod.ApplyError:
         return {"ok": False, "why": "нет рабочей комбинации порт×протокол"}
     changed = (apply_mod.outbound_fingerprint([socks_out, http_tg])
@@ -1698,9 +1787,9 @@ def try_retune(cfg, providers, pool, alerter, log, actor, prior_evidence=None):
         # рестарт sing-box, verify — успех цикла без ротации. Не помогло —
         # calm_failed: предохранитель в rotate() эскалирует после 3 подряд.
         log("  RETUNE: прокси жив, конфиг оптимален — рестарт sing-box без ротации (F2)")
-        apply_mod.restart_singbox()
-        apply_mod.wait_tun0()
-        v = apply_mod.verify_egress()
+        apply_mod.restart_for(cfg)
+        apply_mod.wait_for(cfg)
+        v = apply_mod.verify_for(cfg)
         pool.set_egress(v)
         if v["ok"]:
             pool.log_event("retune", actor=actor, to_uid=row["uid"], result="calm",
@@ -1747,7 +1836,7 @@ def try_rotating(cfg, providers, pool, alerter, log, actor):
     for item in pool.list(include_gone=True):
         if item["uid"] in candidate_uids:
             continue
-        if host and item.get("host") == host:
+        if apply_mod.matches_current(item, host, cfg):
             why = "current"
         elif item.get("gone"):
             why = "gone"
@@ -1814,7 +1903,7 @@ def try_rotating(cfg, providers, pool, alerter, log, actor):
         pool.clear_cooldown(row["uid"])
         # F8: уходящий канал этой пары считается «оборвавшимся в бою» — ротация
         # запускается только по мёртвому каналу (ручной apply сюда не попадает)
-        old_row = _pool_row_by_host(pool, host)
+        old_row = _pool_row_by_host(pool, host, cfg)
         if old_row is not None:
             pool.learning_record_drop(old_row)
         detail = "%s -> %s egress=%s cc=%s (перебрано %d)" % (
@@ -1869,7 +1958,7 @@ def switch_from_provider(cfg, providers, pool, alerter, from_provider,
     except (OSError, ValueError):
         sb = {}
     host = apply_mod.current_upstream(sb)
-    cur = _pool_row_by_host(pool, host) if host else None
+    cur = _pool_row_by_host(pool, host, cfg) if host else None
     if cur is None or cur.get("provider") != from_provider:
         res.update(ok=True, detail="боевой канал не у %s — переключать нечего" % from_provider)
         return res
@@ -2075,7 +2164,7 @@ def try_replenish(cfg, providers, pool, alerter, log, actor):
             continue
         pool.mark_used(uid)
         # F8: докупка = уходящий канал пары тоже оборвался в бою
-        old_row = _pool_row_by_host(pool, dead_host)
+        old_row = _pool_row_by_host(pool, dead_host, cfg)
         if old_row is not None:
             pool.learning_record_drop(old_row)
         pool.log_event("replenish", actor=actor, to_uid=uid, result="ok",
@@ -2231,6 +2320,8 @@ def auto_prolong(cfg, providers, pool, alerter, log=print, actor="auto"):
 
     done, errors = [], []
     for row in targets:
+        if row['provider'] == 'zenxnet':
+            continue  # Subscription renewal belongs to the provider's account.
         if row['provider'] == 'proxyline':
             result = _auto_prolong_proxyline(cfg, providers, pool, alerter, row, ap, log, actor, errors=errors)
             if result:
@@ -2341,6 +2432,10 @@ def _current_proxy_uid(pool, sb):
     if len(outbounds) != 1:
         return None
     outbound = outbounds[0]
+    if outbound.get('type') == 'vless':
+        matches = [r for r in pool.list(include_gone=True)
+                   if r.get('protocol') == 'vless' and apply_mod.matches_current(r, outbound.get('server'), sb=sb)]
+        return matches[0]['uid'] if len(matches) == 1 else None
     port_field = {'socks': 'port_socks5', 'http': 'port_http'}.get(outbound.get('type'))
     port = outbound.get('server_port')
     if not port_field or type(port) is not int or not 1 <= port <= 65535:
@@ -2622,10 +2717,22 @@ def _remove_intent(path):
     return True
 
 
+def _sync_contour_emergency_dns(cfg, direct, log):
+    try:
+        import dns_policy
+        dns_policy.sync_emergency(cfg, direct)
+        return True
+    except Exception:
+        log("  emergency: DNS контура не переключён; переход не подтверждён")
+        return False
+
+
 def emergency_on(cfg, log=print):
     """default таблицы middleman -> прямой выход через WAN (§8): вместо чёрной
     дыры в мёртвый tun0 клиенты выходят напрямую через ens3 (с masquerade).
     Это НЕ обход блокировок (выход с российского IP), а «последний рубеж» связи."""
+    if contours.secondary(cfg):
+        return contours.emergency(cfg, True, log=log)
     if os.name != "posix":
         return False
     gw = cfg.get("gw")
@@ -2647,12 +2754,12 @@ def emergency_on(cfg, log=print):
         if rc != 0:
             log("  emergency: MASQUERADE %s -> %s не подтверждён: %s" % (subnet, wan, out))
             return False
-    flag_existed = os.path.exists(EMERGENCY_FLAG)
+    flag_existed = os.path.exists(_emergency_flag(cfg))
     try:
-        with open(EMERGENCY_FLAG, "w") as f:
+        with open(_emergency_flag(cfg), "w") as f:
             f.write(_now_iso() + "\n")   # сторож не должен вмешаться во время cutover
     except OSError as e:
-        log("  emergency: не удалось записать runtime-флаг %s: %s" % (EMERGENCY_FLAG, e))
+        log("  emergency: не удалось записать runtime-флаг %s: %s" % (_emergency_flag(cfg), e))
         return False
     if gw:
         cmd = ["ip", "route", "replace", "default", "via", gw, "dev", wan,
@@ -2664,7 +2771,7 @@ def emergency_on(cfg, log=print):
         log("  emergency: middleman default НЕ переключён на %s: %s" % (wan, out))
         if not flag_existed:
             try:
-                os.unlink(EMERGENCY_FLAG)
+                os.unlink(_emergency_flag(cfg))
             except OSError:
                 log("  emergency: временный runtime-флаг не удалён; требуется reconcile")
         return False
@@ -2675,7 +2782,7 @@ def emergency_on(cfg, log=print):
                 ["ip", "route", "replace", "default", "dev", "tun0", "table", "middleman"])
             if rb_rc == 0 and _middleman_default_matches("tun0"):
                 try:
-                    os.unlink(EMERGENCY_FLAG)
+                    os.unlink(_emergency_flag(cfg))
                 except OSError:
                     log("  emergency: rollback выполнен, но runtime-флаг не удалён; требуется reconcile")
             else:
@@ -2692,7 +2799,10 @@ def emergency_on(cfg, log=print):
             rb_rc, _rb_out = apply_mod.run_cmd(
                 ["ip", "route", "replace", "default", "dev", "tun0", "table", "middleman"])
             if rb_rc == 0 and _middleman_default_matches("tun0"):
-                _remove_intent(EMERGENCY_FLAG)
+                _remove_intent(_emergency_flag(cfg))
+        return False
+    if not _sync_contour_emergency_dns(cfg, True, log):
+        # Keep the durable direct intent for the existing recovery path.
         return False
     if gw:
         log("  emergency: middleman default -> via %s dev %s (прямой выход)" % (gw, wan))
@@ -2704,6 +2814,8 @@ def emergency_on(cfg, log=print):
 def emergency_off(cfg, log=print):
     """Вернуть middleman default -> tun0 (обычный режим). MASQUERADE не снимаем —
     в норме клиентский трафик в ens3 не идёт, правило безвредно."""
+    if contours.secondary(cfg):
+        return contours.emergency(cfg, False, log=log)
     if os.name != "posix":
         return False
     rc, out = apply_mod.run_cmd(
@@ -2714,11 +2826,16 @@ def emergency_off(cfg, log=print):
     if not _middleman_default_matches("tun0"):
         log("  emergency off: фактический middleman default не совпал с tun0")
         return False
+    # Return DNS to the proxy before acknowledging normal mode. On failure,
+    # retain the intent and compensate with the explicitly requested WAN mode.
+    if not _sync_contour_emergency_dns(cfg, False, log):
+        emergency_on(cfg, log)
+        return False
     if not _remove_intent(_emergency_intent(cfg)):
         log("  emergency off: durable intent не удалён; возвращаю прямой маршрут")
         emergency_on(cfg, log)
         return False
-    if not _remove_intent(EMERGENCY_FLAG):
+    if not _remove_intent(_emergency_flag(cfg)):
         log("  emergency off: runtime-флаг не удалён; возвращаю прямой маршрут")
         emergency_on(cfg, log)
         return False
@@ -2767,7 +2884,10 @@ def restore_emergency_routes(cfg, pool, log=print, actor="auto"):
       • переустановка/ручной запуск boot-скрипта при живом флаге: маршрут снова tun0.
     emergency_on идемпотентен; попытка выйти из аварии остаётся по расписанию.
     Возвращает True, если восстанавливали."""
-    if not os.path.exists(EMERGENCY_FLAG) and not os.path.exists(_emergency_intent(cfg)):
+    if contours.secondary(cfg):
+        contours.reconcile_network(cfg, _locked=True)
+        return contours.health(cfg, direct=True)["route_ok"]
+    if not os.path.exists(_emergency_flag(cfg)) and not os.path.exists(_emergency_intent(cfg)):
         why = "после перезагрузки (флага в /run не было)"
     elif _middleman_default_matches(cfg.get("wan") or "ens3", cfg.get("gw")):
         return False
@@ -2936,7 +3056,7 @@ def set_emergency(cfg, pool, alerter, on, log=print, actor="user", _locked=False
                     "error": "маршрут tun0/runtime-флаг не подтверждены"}
         v = None
         if os.name == "posix":
-            v = apply_mod.verify_egress()
+            v = apply_mod.verify_for(cfg)
             pool.set_egress(v)
             if not v.get("ok"):
                 compensation = _compensate_failed_emergency_exit(

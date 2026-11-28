@@ -437,7 +437,7 @@ def ensure_admin_credential_epoch(secrets_path, store):
 
 
 def write_admin_credentials_atomic(secrets_path, payload, store, force=False,
-                                   replace_all=False):
+                                   replace_all=False, preserve_keys=()):
     """Rotate the DB epoch before installing new factors; failures remain fail-closed."""
     if not isinstance(payload, dict) or not isinstance(payload.get("admin"), dict):
         raise ValueError("admin credential payload is invalid")
@@ -446,6 +446,9 @@ def write_admin_credentials_atomic(secrets_path, payload, store, force=False,
         if current.get("admin") and not force:
             raise SystemExit("Админ уже настроен в %s. Перезаписать: --force" % secrets_path)
         replacement = dict(payload) if replace_all else dict(current)
+        for key in preserve_keys:
+            if key != "admin" and key in current and key not in replacement:
+                replacement[key] = current[key]
         admin = dict(payload["admin"])
         epoch = new_credential_epoch()
         admin["credential_epoch"] = epoch
